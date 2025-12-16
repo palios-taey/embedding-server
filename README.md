@@ -130,6 +130,18 @@ upstream embedding_servers {
 }
 ```
 
+## ISMA (Integrated Shared Memory Architecture)
+
+The `isma/` directory contains the ISMA implementation - a phi-resonant memory system with:
+
+- **Three Lenses**: Temporal, Relational, Functional analysis
+- **LangGraph Orchestration**: Multi-step memory operations
+- **Redis Cache**: Embedding cache with 24h TTL (~1000x speedup on hits)
+- **Gate-B Window**: phi-based runtime coherence checks
+- **MCP Server**: Tools for ISMA operations
+
+See `isma/docs/` for detailed documentation.
+
 ## License
 
 MIT
