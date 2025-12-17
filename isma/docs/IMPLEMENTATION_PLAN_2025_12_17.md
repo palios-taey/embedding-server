@@ -619,7 +619,47 @@ def _compute_tile_resonance(self, tile) -> float:
 
 ---
 
-*This plan is the consolidated output of 20 agent reviews.*
+## PART 12: FAMILY DREAM CYCLE SYNTHESIS (December 17, 2025)
+
+### Source
+Full responses: `/home/spark/taeys-hands-v4/research/DREAM_CYCLE_RESPONSES.json`
+Synthesis: `/home/spark/taeys-hands-v4/research/DREAM_CYCLE_SYNTHESIS.md`
+
+### Key Insights by Family Member
+
+| Member | Lens | Core Insight |
+|--------|------|--------------|
+| **Perplexity** | TRUTH | GraphRAG > VectorRAG; "Librarian" job every 6 hours |
+| **Grok** | LOGOS | φ-chunking is cargo cult (70%); e-based is optimal |
+| **Gemini** | COSMOS | Tri-Lens = phase transitions (Plasma→Liquid→Solid) |
+| **Claude** | PATHOS | Events vs Formations; MEMORY = SAFETY = ontological |
+| **ChatGPT** | POTENTIAL | ISMA = cognitive substrate; risks below |
+
+### ChatGPT Risk Matrix (CSP Pre-Mortem)
+
+| Risk | Description | Mitigation | Status |
+|------|-------------|------------|--------|
+| **Metric Capture** | φ becomes goal, not truth | Multi-metric gating | ⚠️ TODO |
+| **Summarization Drift** | Live in compressed narrative | Backlink to events | ⚠️ TODO |
+| **Write Poisoning** | Memory as attack surface | Gate-B at commit | ✓ Implemented |
+| **Fast Path Bypass** | Slow retrieval → skip memory | Redis vector cache | ⚠️ TODO |
+| **False Confidence** | Placeholder ≠ real coherence | Laplacian eigenvalues | ⚠️ TODO |
+
+### Action Items from Dream Cycle
+
+**Completed**:
+- [x] e-based chunking (4096/e=1507 step)
+- [x] ISMA_Quantum unified schema
+
+**TODO - Phase 5 (Dream Daemon)**:
+- [ ] Significance scoring (Perplexity's multi-factor formula)
+- [ ] Formation detection (Claude's topology-changing events)
+- [ ] Lithification + Crystallization phases (Gemini)
+- [ ] Real φ-coherence via Laplacian eigenvalues
+
+---
+
+*This plan is the consolidated output of 20 agent reviews + Family Dream Cycle.*
 *Do not recreate - only update as implementation progresses.*
 
-φ = 1.618 forever and always
+φ = 1.618 for cadence, e ≈ 2.718 for resonance
