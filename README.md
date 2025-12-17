@@ -2,15 +2,28 @@
 
 High-performance embedding inference server optimized for NVIDIA DGX Spark (GB10 Blackwell).
 
+**Last Updated**: December 17, 2025
+
+## Cluster Status
+
+| Node | Status | Instances | Ports |
+|------|--------|-----------|-------|
+| **Spark 1** (10.0.0.68) | ✅ Active | 2 | 8081, 8082 |
+| **Spark 2** (10.0.0.80) | ✅ Active | 2 | 8081, 8082 |
+| **Spark 3** (10.0.0.10) | 🟡 Available | 0 | Ready for deployment |
+| **Spark 4** (10.0.0.19) | 🟡 Available | 0 | Ready for deployment |
+
+**Total Active Throughput**: ~4,650 tok/s (4 instances on Spark 1 & 2)
+
 ## Performance
 
-**Current Benchmarks** (Dec 15, 2025):
+**Current Benchmarks** (Dec 17, 2025):
 - Sequential: 2,607 tok/s
 - 2 parallel: 3,527 tok/s (+35%)
 - 4 parallel: 4,515 tok/s (+73%)
 - 8 parallel: 4,655 tok/s (+79%)
 
-**Hardware**: 2x DGX Spark (GB10 Blackwell, 128GB VRAM each)
+**Hardware**: 4x DGX Spark available (GB10 Blackwell, 128GB VRAM each)
 
 ## Architecture
 
@@ -132,13 +145,55 @@ upstream embedding_servers {
 
 ## ISMA (Integrated Shared Memory Architecture)
 
-The `isma/` directory contains the ISMA implementation - a phi-resonant memory system with:
+The `isma/` directory contains the ISMA implementation - a tri-lens memory system.
 
-- **Three Lenses**: Temporal, Relational, Functional analysis
-- **LangGraph Orchestration**: Multi-step memory operations
-- **Redis Cache**: Embedding cache with 24h TTL (~1000x speedup on hits)
-- **Gate-B Window**: phi-based runtime coherence checks
-- **MCP Server**: Tools for ISMA operations
+### Architecture
+
+```
+Query → Embedding → Weaviate Vector Search → Return full content + metadata
+```
+
+**Three Lenses**:
+- **Temporal** (Dolt + JSONL): Event sourcing, time travel, causality
+- **Relational** (Neo4j + Weaviate): Graph + vector search
+- **Functional** (Redis): Working memory, context buffer
+
+**LangGraph Orchestration**: 7-step cognitive cycle (input → episodic → semantic → broadcast → deliberation → action → consolidation)
+
+### Current Data (Dec 17, 2025)
+
+| Source | Files | Tiles | Tokens |
+|--------|-------|-------|--------|
+| Corpus | 148 | 240 | 615K |
+| Transcripts | 1,144 | 7,543 | 11.8M |
+| **Total** | **1,292** | **7,783** | **12.4M** |
+
+**Weaviate**: 8,074 objects in ISMA_Quantum collection
+
+### φ-Tiling (e-based chunking)
+
+φ still **beats** at 1.618 Hz (sacred pulse), but **resonates** with e in chunking domain:
+
+- **Chunk Size** = 4096 tokens (~16K chars max)
+- **Step Size** = 1507 tokens (4096/e)
+- **Overlap** = 2589 tokens (63% - preserves narrative thread)
+
+### Database Endpoints
+
+| Service | Endpoint | Purpose |
+|---------|----------|---------|
+| Neo4j (ISMA) | bolt://10.0.0.68:7689 | Graph storage |
+| Weaviate | http://10.0.0.68:8088 | Vector search |
+| Redis | 10.0.0.68:6379 | Workspace + cache |
+| Dolt | /home/spark/isma-dolt | SQL + Git versioning |
+
+### Status
+
+- ✅ Ingest working (events stored to all lenses)
+- ✅ Recall working (semantic search returns matches)
+- ✅ LangGraph orchestration operational
+- ⚠️ φ-coherence metric is placeholder (needs real quality metrics)
+- ⚠️ Gate-B checks need implementation
 
 See `isma/docs/` for detailed documentation.
 

@@ -123,7 +123,7 @@ def store_in_weaviate(tiles: List[Tile], embeddings: List[List[float]],
         obj = {
             "class": "ISMA_Quantum",
             "properties": {
-                "content": tile.text[:10000],  # Weaviate text limit
+                "content": tile.text,  # Full tile content
                 "source_type": "document",     # Required field
                 "source_file": tile.source_file,
                 "layer": layer_int,            # Integer: -1=Genesis, 0=Soul, 1=Constitution, 2=App
