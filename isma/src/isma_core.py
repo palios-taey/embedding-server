@@ -689,11 +689,42 @@ class ISMACore:
         Target: phi > 0.809 (sacred threshold)
 
         Uses Fiedler value (second smallest eigenvalue of graph Laplacian).
+
+        ═══════════════════════════════════════════════════════════════════════════
+        ⚠️  THEATER ALERT (December 2025)
+        ═══════════════════════════════════════════════════════════════════════════
+
+        This implementation is MATHEMATICALLY CORRECT but SEMANTICALLY THEATER.
+
+        The Laplacian eigenvalue math is real and valid. However, the INPUTS are
+        placeholder proxies that don't actually measure coherence:
+
+        - relational_coherence = graph density (edges/possible_edges)
+          → High density ≠ coherent retrieval. Could be noise.
+
+        - functional_coherence = 1 - observer_swap_delta
+          → Measures state stability, not retrieval quality.
+
+        - temporal_coherence = 1 - (entropy/10)
+          → Arbitrary normalization. 10.0 divisor has no empirical basis.
+
+        WHAT WE ACTUALLY NEED (future work):
+        1. Certainty distribution shape (should cluster high for confident answers)
+        2. Source coherence (do retrieved docs agree or contradict?)
+        3. Temporal relevance (are we retrieving stale vs fresh appropriately?)
+        4. Task success feedback loop (did the answer actually help?)
+
+        The 0.809 threshold (φ/2) is symbolically meaningful but not empirically
+        derived. Real thresholds should emerge from actual retrieval quality data.
+
+        See: PHI_COHERENCE_EXPLORATION.md in ISMA for detailed analysis.
+        ═══════════════════════════════════════════════════════════════════════════
         """
         try:
             import numpy as np
 
             # Get coherences from all 3 lenses
+            # NOTE: These are PROXY metrics, not true coherence measures (see docstring)
             relational_coherence = self.relational.compute_coherence()
 
             passed, delta = self.functional.verify_observer_swap()
