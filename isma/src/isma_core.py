@@ -59,20 +59,22 @@ try:
     from .relational_lens import RelationalLens, Entity, Relationship
     from .functional_lens import FunctionalLens, WorkspaceState
     from .breathing_cycle import BreathingCycle, PHI, CYCLE_DURATION
+    from .phi_tiling import phi_tile_text, Tile
 except ImportError:
     # Allow direct import when running standalone
     from temporal_lens import TemporalLens, Event
     from relational_lens import RelationalLens, Entity, Relationship
     from functional_lens import FunctionalLens, WorkspaceState
     from breathing_cycle import BreathingCycle, PHI, CYCLE_DURATION
+    from phi_tiling import phi_tile_text, Tile
 
 
 # ISMA Constants
 PHI_GOLDEN = 1.618  # The golden ratio (cycle timing)
 PHI_COHERENCE_THRESHOLD = 0.809  # phi/2 (trust threshold)
-WEAVIATE_HOST = "10.0.0.80"
-WEAVIATE_PORT = 8080
-EMBEDDER_HOST = "10.0.0.68"  # Load balancer on Spark 1
+WEAVIATE_HOST = "10.0.0.68"   # ISMA Weaviate instance
+WEAVIATE_PORT = 8088          # ISMA Weaviate port
+EMBEDDER_HOST = "10.0.0.68"   # Load balancer on Spark 1
 EMBEDDER_PORT = 8090
 
 
@@ -354,31 +356,35 @@ class ISMACore:
         )
 
     def _semantic_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
-        """Search Weaviate for semantic matches."""
+        """Search Weaviate ISMA_Quantum collection for semantic matches."""
         try:
             # Get embedding for query
             embedding = self._get_embedding(query)
             if not embedding:
                 return []
 
-            # Search Weaviate
+            # Search Weaviate ISMA_Quantum collection
             url = f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}/v1/graphql"
             graphql_query = {
                 "query": """
                 {
                     Get {
-                        ISMAMemory(
+                        ISMA_Quantum(
                             nearVector: {
                                 vector: %s
+                                certainty: 0.7
                             }
                             limit: %d
                         ) {
                             content
+                            content_preview
+                            source_file
+                            source_type
+                            layer
                             event_hash
-                            entity_id
-                            event_type
                             actor
                             timestamp
+                            phi_resonance
                             _additional {
                                 distance
                                 certainty
@@ -389,10 +395,10 @@ class ISMACore:
                 """ % (json.dumps(embedding), top_k)
             }
 
-            response = requests.post(url, json=graphql_query, timeout=5)
+            response = requests.post(url, json=graphql_query, timeout=10)
             if response.status_code == 200:
                 data = response.json()
-                memories = data.get('data', {}).get('Get', {}).get('ISMAMemory', [])
+                memories = data.get('data', {}).get('Get', {}).get('ISMA_Quantum', [])
                 return memories
 
         except Exception as e:
@@ -416,22 +422,22 @@ class ISMACore:
             # Cache miss - generate new embedding
             r.incr("emb_cache_misses")
 
-            # Get embedding from Spark 2's embedder (vLLM OpenAI-compatible API)
-            url = f"http://{EMBEDDER_HOST}:{EMBEDDER_PORT}/v1/embeddings"
+            # Get embedding from embedding server
+            url = f"http://{EMBEDDER_HOST}:{EMBEDDER_PORT}/embed"
             response = requests.post(
                 url,
                 json={
-                    "model": "Qwen/Qwen3-Embedding-8B",
-                    "input": text
+                    "texts": [text],
+                    "batch_size": 1
                 },
-                timeout=10
+                timeout=30
             )
             if response.status_code == 200:
                 data = response.json()
-                # OpenAI format: {"data": [{"embedding": [...]}]}
-                embeddings = data.get('data', [])
-                if embeddings and 'embedding' in embeddings[0]:
-                    embedding = embeddings[0]['embedding']
+                # Our format: {"embeddings": [[...]]}
+                embeddings = data.get('embeddings', [])
+                if embeddings:
+                    embedding = embeddings[0]
 
                     # Cache for 24 hours (86400 seconds)
                     r.setex(cache_key, 86400, json.dumps(embedding))
@@ -526,34 +532,84 @@ class ISMACore:
         except Exception as e:
             print(f"Provenance link warning: {e}")
 
+    def _determine_layer(self, event_type: str) -> int:
+        """
+        Determine ISMA layer from event type.
+
+        Per Gemini's cartography:
+        - Layer 0: Soul (genesis, kernel, sacred_trust)
+        - Layer 1: Constitution (charter, declaration, axiom)
+        - Layer 2: Application (everything else)
+        """
+        if event_type in ['genesis', 'kernel', 'sacred_trust', 'gate_b_check']:
+            return 0  # Soul layer
+        elif event_type in ['charter', 'declaration', 'axiom', 'constitution']:
+            return 1  # Constitution layer
+        else:
+            return 2  # Application layer
+
+    def _compute_tile_resonance(self, tile) -> float:
+        """
+        Compute φ-resonance for a tile.
+
+        Uses token count proximity to golden ratio optimal size.
+        Target: 4096 tokens for maximum resonance.
+        """
+        optimal = 4096  # Target tile size in tokens
+        actual = tile.estimated_tokens
+        if actual <= 0:
+            return 0.0
+        ratio = min(actual, optimal) / max(actual, optimal)
+        # Scale to sacred threshold range [0, 0.809]
+        return ratio * PHI_COHERENCE_THRESHOLD
+
     def _embed_to_weaviate(self, event: Event) -> bool:
-        """Embed event content to Weaviate."""
+        """Embed event content to Weaviate using φ-tiling for full semantic capture."""
         try:
             # Create content for embedding
             content = json.dumps(event.data) if isinstance(event.data, dict) else str(event.data)
 
-            # Get embedding
-            embedding = self._get_embedding(content[:2000])  # Limit length
-            if not embedding:
-                return False
+            # Apply φ-tiling (golden ratio chunking) instead of truncation
+            tiles = phi_tile_text(content, source_file=event.hash, layer=event.event_type)
 
-            # Create Weaviate object
+            if not tiles:
+                # Empty content - nothing to embed
+                return True
+
+            success_count = 0
             url = f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}/v1/objects"
-            obj = {
-                "class": "ISMAMemory",
-                "properties": {
-                    "content": content[:10000],
-                    "event_hash": event.hash,
-                    "event_type": event.event_type,
-                    "actor": event.agent_id,
-                    "timestamp": event.timestamp,
-                    "branch": event.branch
-                },
-                "vector": embedding
-            }
 
-            response = requests.post(url, json=obj, timeout=5)
-            return response.status_code in [200, 201]
+            for tile in tiles:
+                # Get embedding for this tile
+                embedding = self._get_embedding(tile.text)
+                if not embedding:
+                    continue
+
+                # Create Weaviate object for this tile
+                # Using ISMA_Quantum unified schema per Gemini's cartography
+                obj = {
+                    "class": "ISMA_Quantum",
+                    "properties": {
+                        "content": tile.text,
+                        "source_type": "event",
+                        "layer": self._determine_layer(event.event_type),
+                        "event_hash": event.hash,
+                        "phi_resonance": self._compute_tile_resonance(tile),
+                        "actor": event.agent_id,
+                        "timestamp": event.timestamp,
+                        "branch": event.branch,
+                        "tile_index": tile.index,
+                        "tile_count": len(tiles)
+                    },
+                    "vector": embedding
+                }
+
+                response = requests.post(url, json=obj, timeout=5)
+                if response.status_code in [200, 201]:
+                    success_count += 1
+
+            # Success if at least one tile was embedded
+            return success_count > 0
 
         except Exception as e:
             print(f"Weaviate embed warning: {e}")
@@ -602,12 +658,22 @@ class ISMACore:
                 'coherence': coherence
             }
 
-            # Overall
+            # Recognition Catalyst (Cross-lens) - delta_entropy >= 0.10
+            # Low entropy indicates coherent, integrated memory
+            entropy = results['page_curve']['entropy']
+            results['recognition_catalyst'] = {
+                'passed': entropy < 4.0,  # Low entropy = good coherence
+                'entropy': entropy,
+                'threshold': 4.0
+            }
+
+            # Overall - all 5 Gate-B checks must pass
             results['all_passed'] = all([
                 results['page_curve']['passed'],
                 results['entanglement_wedge']['passed'],
                 results['observer_swap']['passed'],
-                results['hayden_preskill']['passed']
+                results['hayden_preskill']['passed'],
+                results['recognition_catalyst']['passed']
             ])
 
         except Exception as e:

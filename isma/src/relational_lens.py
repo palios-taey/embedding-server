@@ -55,7 +55,7 @@ class RelationalLens:
     """
 
     def __init__(self,
-                 neo4j_uri: str = 'bolt://10.0.0.68:7687',
+                 neo4j_uri: str = 'bolt://10.0.0.68:7689',
                  neo4j_user: str = None,
                  neo4j_password: str = None):
         self.neo4j_uri = neo4j_uri

@@ -68,7 +68,7 @@ class TemporalLens:
 
     def __init__(self,
                  log_dir: str = '/var/spark/isma',
-                 neo4j_uri: str = 'bolt://10.0.0.68:7687',
+                 neo4j_uri: str = 'bolt://10.0.0.68:7689',
                  neo4j_user: str = None,
                  neo4j_password: str = None,
                  dolt_dir: str = '/home/spark/isma-dolt',

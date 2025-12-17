@@ -23,7 +23,8 @@ class ISMAMCPConfig:
     host: str = "0.0.0.0"
     port: int = 8100
     isma_redis_url: str = "redis://10.0.0.68:6379"
-    isma_neo4j_url: str = "bolt://10.0.0.68:7687"
+    isma_neo4j_url: str = "bolt://10.0.0.68:7689"  # ISMA instance (no auth)
+    isma_weaviate_url: str = "http://10.0.0.68:8088"  # ISMA Weaviate
     embedder_url: str = "http://10.0.0.68:8090/embed"
 
 class ISMAMCPServer:
