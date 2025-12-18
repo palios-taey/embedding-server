@@ -76,7 +76,7 @@ CONTENT_MANIFEST = MANIFEST_DIR / "content_manifest.json"
 # v3 config: 16 parallel, batch_size=32 → ~3400 tok/s (CPU bottleneck)
 # v4 audit fixes (Grok + Perplexity): 4 CPU producers, batch=128, connection pooling
 EMBED_PARALLEL_WORKERS = 16  # 2 per instance × 8 instances
-BATCH_SIZE = 128  # Increased from 32 per Grok audit (+22% saturation)
+BATCH_SIZE = 64  # 128 too large for embedding server, use 64 as middle ground
 CPU_PRODUCERS = 4  # Parallel CPU threads for read/hash/tile (was 1)
 CHARS_PER_TOKEN = 4
 
@@ -441,7 +441,7 @@ def load_all_transcripts(loaded_manifest: Dict[str, LoadedContent]) -> Tuple[Dic
         if (i + 1) % 10 == 0:
             elapsed = (datetime.now() - start_time).total_seconds()
             rate = stats["tokens"] / elapsed if elapsed > 0 else 0
-            print(f"  [{i+1}/{len(all_files)}] {stats['loaded']} loaded, {stats['tokens']:,} tok @ {rate:.0f} tok/s")
+            print(f"  [{i+1}/{len(all_files)}] {stats['loaded']} loaded, {stats['tokens']:,} tok @ {rate:.0f} tok/s", flush=True)
 
         stats["processed"] += 1
         result = load_transcript(filepath, loaded_hashes)
@@ -555,9 +555,16 @@ def load_all_corpus(loaded_manifest: Dict[str, LoadedContent], file_pattern: str
 
     def cpu_producer(file_subset: List[Path], producer_id: int):
         """Read files, hash, tile - feed tile_queue (CPU work)."""
+        local_processed = 0
+        local_queued = 0
         for filepath in file_subset:
+            local_processed += 1
             with stats_lock:
                 stats["processed"] += 1
+
+            # Progress every 1000 files per producer
+            if local_processed % 1000 == 0:
+                print(f"  [Producer {producer_id}] {local_processed} processed, {local_queued} queued", flush=True)
 
             try:
                 content_hash = compute_file_hash(filepath)
@@ -577,12 +584,14 @@ def load_all_corpus(loaded_manifest: Dict[str, LoadedContent], file_pattern: str
                 tiles = phi_tile_text(content, filepath.name, "corpus")
                 if tiles:
                     tile_queue.put((filepath, content_hash, tiles))
+                    local_queued += 1
 
             except Exception as e:
                 with stats_lock:
                     stats["skipped"] += 1
 
         # Signal this producer is done
+        print(f"  [Producer {producer_id}] DONE - {local_processed} processed, {local_queued} queued", flush=True)
         with producers_lock:
             producers_done[0] += 1
             if producers_done[0] == CPU_PRODUCERS:
@@ -590,7 +599,8 @@ def load_all_corpus(loaded_manifest: Dict[str, LoadedContent], file_pattern: str
 
     def gpu_consumer():
         """Batch tiles, embed, store to Weaviate (GPU work)."""
-        EMBED_BATCH = BATCH_SIZE  # Use module-level batch size
+        # Accumulate 16 batches worth of tiles to maximize parallel embedding
+        EMBED_BATCH = BATCH_SIZE * EMBED_PARALLEL_WORKERS  # 64 * 16 = 1024 tiles
         pending = []
 
         while True:
