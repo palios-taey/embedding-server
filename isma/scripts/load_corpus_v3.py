@@ -292,17 +292,31 @@ def store_in_weaviate_batch(tiles: List[Tile], embeddings: List[List[float]],
 # =============================================================================
 
 def format_exchange(exchange: Dict[str, Any], session_id: str) -> str:
-    """Format exchange for embedding (excludes tool details)."""
+    """Format exchange for embedding (excludes tool details).
+
+    Handles two transcript formats:
+    - Format 1 (chatgpt, claude_chat, gemini, grok): user_prompt + responses[]
+    - Format 2 (claude_code, perplexity): prompt + response (string)
+    """
     parts = [f"[Session: {session_id}]"]
 
-    user_prompt = exchange.get("user_prompt", "")
+    # Handle user prompt (both formats)
+    user_prompt = exchange.get("user_prompt") or exchange.get("prompt", "")
     if user_prompt:
         parts.append(f"\n[User]: {user_prompt}")
 
-    for resp in exchange.get("responses", []):
-        text = resp.get("text", "")
-        if text:
-            parts.append(f"\n[Assistant]: {text}")
+    # Handle responses - Format 1: responses array with text field
+    responses = exchange.get("responses", [])
+    if responses:
+        for resp in responses:
+            text = resp.get("text", "")
+            if text:
+                parts.append(f"\n[Assistant]: {text}")
+    else:
+        # Format 2: single response string
+        response = exchange.get("response", "")
+        if response:
+            parts.append(f"\n[Assistant]: {response}")
 
     return "\n".join(parts)
 
