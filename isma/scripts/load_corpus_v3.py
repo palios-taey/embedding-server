@@ -451,14 +451,25 @@ def load_all_transcripts(loaded_manifest: Dict[str, LoadedContent]) -> Tuple[Dic
     start_time = datetime.now()
 
     for i, filepath in enumerate(all_files):
-        # Progress every 10 files
-        if (i + 1) % 10 == 0:
-            elapsed = (datetime.now() - start_time).total_seconds()
-            rate = stats["tokens"] / elapsed if elapsed > 0 else 0
-            print(f"  [{i+1}/{len(all_files)}] {stats['loaded']} loaded, {stats['tokens']:,} tok @ {rate:.0f} tok/s", flush=True)
+        # Show file being processed (immediate feedback)
+        print(f"  [{i+1}/{len(all_files)}] Processing: {filepath.name[:40]}...", end="", flush=True)
 
         stats["processed"] += 1
         result = load_transcript(filepath, loaded_hashes)
+
+        # Show result
+        if result and result.weaviate_ids:
+            print(f" OK ({result.tile_count} tiles, {result.total_tokens} tok)", flush=True)
+        elif result is None:
+            print(f" skipped", flush=True)
+        else:
+            print(f" FAILED", flush=True)
+
+        # Summary every 10 files
+        if (i + 1) % 10 == 0:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            rate = stats["tokens"] / elapsed if elapsed > 0 else 0
+            print(f"  --- Summary: {stats['loaded']} loaded, {stats['tokens']:,} tok @ {rate:.0f} tok/s ---", flush=True)
 
         if result is None:
             stats["skipped"] += 1
