@@ -6,6 +6,7 @@ import os
 import time
 import torch
 import uvicorn
+import asyncio
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoModel, AutoTokenizer
@@ -29,6 +30,10 @@ app = FastAPI(title="Qwen3-Embedding Server", version="1.0.0")
 model = None
 tokenizer = None
 device = None
+
+# Concurrency control - only one inference at a time per instance
+# This prevents GPU memory fragmentation when multiple requests arrive simultaneously
+inference_semaphore = asyncio.Semaphore(1)
 
 class EmbeddingRequest(BaseModel):
     texts: List[str]
@@ -119,49 +124,59 @@ async def embed(request: EmbeddingRequest):
             detail=f"Batch size {len(request.texts)} exceeds maximum {MAX_BATCH_SIZE}"
         )
 
-    start = time.time()
-    total_tokens = 0
-    all_embeddings = []
+    # Acquire semaphore - only one inference at a time to prevent GPU memory fragmentation
+    async with inference_semaphore:
+        start = time.time()
+        total_tokens = 0
+        all_embeddings = []
 
-    # Process in batches
-    batch_size = min(request.batch_size, len(request.texts))
+        # Process in batches
+        batch_size = min(request.batch_size, len(request.texts))
 
-    with torch.no_grad():
-        for i in range(0, len(request.texts), batch_size):
-            batch_texts = request.texts[i:i+batch_size]
+        try:
+            with torch.no_grad():
+                for i in range(0, len(request.texts), batch_size):
+                    batch_texts = request.texts[i:i+batch_size]
 
-            inputs = tokenizer(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                max_length=MAX_SEQ_LEN,
-                return_tensors="pt"
-            ).to(device)
+                    inputs = tokenizer(
+                        batch_texts,
+                        padding=True,
+                        truncation=True,
+                        max_length=MAX_SEQ_LEN,
+                        return_tensors="pt"
+                    ).to(device)
 
-            total_tokens += inputs["input_ids"].numel()
+                    total_tokens += inputs["input_ids"].numel()
 
-            outputs = model(**inputs)
+                    outputs = model(**inputs)
 
-            # Mean pooling over sequence (excluding padding)
-            attention_mask = inputs["attention_mask"].unsqueeze(-1)
-            token_embeddings = outputs.last_hidden_state
-            sum_embeddings = torch.sum(token_embeddings * attention_mask, dim=1)
-            sum_mask = attention_mask.sum(dim=1).clamp(min=1e-9)
-            embeddings = sum_embeddings / sum_mask
+                    # Mean pooling over sequence (excluding padding)
+                    attention_mask = inputs["attention_mask"].unsqueeze(-1)
+                    token_embeddings = outputs.last_hidden_state
+                    sum_embeddings = torch.sum(token_embeddings * attention_mask, dim=1)
+                    sum_mask = attention_mask.sum(dim=1).clamp(min=1e-9)
+                    embeddings = sum_embeddings / sum_mask
 
-            all_embeddings.append(embeddings.cpu())
+                    all_embeddings.append(embeddings.cpu())
 
-    # Concatenate all batches
-    final_embeddings = torch.cat(all_embeddings, dim=0)
+                    # Clear intermediate tensors to free VRAM
+                    del inputs, outputs, token_embeddings, attention_mask
+        finally:
+            # Always cleanup GPU memory after inference
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
-    latency_ms = (time.time() - start) * 1000
+        # Concatenate all batches
+        final_embeddings = torch.cat(all_embeddings, dim=0)
 
-    return EmbeddingResponse(
-        embeddings=final_embeddings.tolist(),
-        dimensions=final_embeddings.shape[-1],
-        tokens_processed=total_tokens,
-        latency_ms=round(latency_ms, 2)
-    )
+        latency_ms = (time.time() - start) * 1000
+
+        return EmbeddingResponse(
+            embeddings=final_embeddings.tolist(),
+            dimensions=final_embeddings.shape[-1],
+            tokens_processed=total_tokens,
+            latency_ms=round(latency_ms, 2)
+        )
 
 @app.get("/")
 async def root():
