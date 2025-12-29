@@ -95,6 +95,24 @@ def phi_tile_text(text: str, source_file: str = "", layer: str = "unknown") -> L
     index = 0
 
     while start < text_len:
+        # Safety check FIRST: don't create tiny final tiles
+        # Check if remaining text is too small to warrant a new tile
+        remaining = text_len - start
+        if remaining < step_chars // 2 and tiles:
+            # Too little text remaining - extend previous tile to end instead
+            last_tile = tiles[-1]
+            extended_text = text[last_tile.start_char:]
+            tiles[-1] = Tile(
+                index=last_tile.index,
+                text=extended_text,
+                start_char=last_tile.start_char,
+                end_char=text_len,
+                estimated_tokens=estimate_tokens(extended_text),
+                layer=layer,
+                source_file=source_file
+            )
+            break
+
         end = min(start + chunk_chars, text_len)
 
         # Try to break at sentence/paragraph boundary
@@ -127,23 +145,6 @@ def phi_tile_text(text: str, source_file: str = "", layer: str = "unknown") -> L
         # Move by step size (creates overlap)
         start += step_chars
         index += 1
-
-        # Safety: don't create tiny final tiles
-        if text_len - start < step_chars // 2:
-            # Extend last tile to end
-            if tiles:
-                last_tile = tiles[-1]
-                extended_text = text[last_tile.start_char:]
-                tiles[-1] = Tile(
-                    index=last_tile.index,
-                    text=extended_text,
-                    start_char=last_tile.start_char,
-                    end_char=text_len,
-                    estimated_tokens=estimate_tokens(extended_text),
-                    layer=layer,
-                    source_file=source_file
-                )
-            break
 
     return tiles
 
