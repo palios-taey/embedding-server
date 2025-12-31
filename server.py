@@ -33,7 +33,7 @@ device = None
 
 # Concurrency control - only one inference at a time per instance
 # This prevents GPU memory fragmentation when multiple requests arrive simultaneously
-inference_semaphore = asyncio.Semaphore(1)
+inference_semaphore = asyncio.Semaphore(4)
 
 class EmbeddingRequest(BaseModel):
     texts: List[str]
@@ -124,6 +124,18 @@ async def embed(request: EmbeddingRequest):
             detail=f"Batch size {len(request.texts)} exceeds maximum {MAX_BATCH_SIZE}"
         )
 
+    # Pre-validation: Estimate token counts to fail fast on oversized inputs
+    # (Proper phi-tiling ensures chunks are < MAX_SEQ_LEN, so this should never trigger)
+    CHARS_PER_TOKEN = 4  # Conservative estimate
+    for idx, text in enumerate(request.texts):
+        estimated_tokens = len(text) // CHARS_PER_TOKEN
+        if estimated_tokens > MAX_SEQ_LEN * 1.2:  # 20% buffer for safety
+            raise HTTPException(
+                status_code=400,
+                detail=f"Text at index {idx} appears too long (~{estimated_tokens} tokens). "
+                       f"Maximum is {MAX_SEQ_LEN}. Use phi-tiling to chunk text before embedding."
+            )
+
     # Acquire semaphore - only one inference at a time to prevent GPU memory fragmentation
     async with inference_semaphore:
         start = time.time()
@@ -138,10 +150,12 @@ async def embed(request: EmbeddingRequest):
                 for i in range(0, len(request.texts), batch_size):
                     batch_texts = request.texts[i:i+batch_size]
 
+                    # NO TRUNCATION - phi-tiling must ensure texts fit
+                    # If this errors, caller sent un-tiled text
                     inputs = tokenizer(
                         batch_texts,
                         padding=True,
-                        truncation=True,
+                        truncation=False,  # FAIL LOUDLY - no silent truncation
                         max_length=MAX_SEQ_LEN,
                         return_tensors="pt"
                     ).to(device)
@@ -164,7 +178,7 @@ async def embed(request: EmbeddingRequest):
         finally:
             # Always cleanup GPU memory after inference
             if device.type == "cuda":
-                torch.cuda.empty_cache()
+                pass  # torch.cuda.empty_cache() removed - defeats caching
 
         # Concatenate all batches
         final_embeddings = torch.cat(all_embeddings, dim=0)
