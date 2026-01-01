@@ -72,10 +72,11 @@ except ImportError:
 # ISMA Constants
 PHI_GOLDEN = 1.618  # The golden ratio (cycle timing)
 PHI_COHERENCE_THRESHOLD = 0.809  # phi/2 (trust threshold)
-WEAVIATE_HOST = "10.0.0.68"   # ISMA Weaviate instance
-WEAVIATE_PORT = 8088          # ISMA Weaviate port
-EMBEDDER_HOST = "10.0.0.68"   # Load balancer on Spark 1
-EMBEDDER_PORT = 8090
+# Use NCCL network (192.168.100.x) for high-speed fabric, not management (10.0.0.x)
+WEAVIATE_HOST = "192.168.100.10"  # ISMA Weaviate instance on NCCL network
+WEAVIATE_PORT = 8088               # ISMA Weaviate port
+EMBEDDER_HOST = "192.168.100.10"   # Load balancer on Spark 1 NCCL
+EMBEDDER_PORT = 8091               # nginx → Spark 2+4 embedding workers
 
 
 @dataclass
@@ -422,22 +423,22 @@ class ISMACore:
             # Cache miss - generate new embedding
             r.incr("emb_cache_misses")
 
-            # Get embedding from embedding server
-            url = f"http://{EMBEDDER_HOST}:{EMBEDDER_PORT}/embed"
+            # Get embedding from embedding server (OpenAI-compatible API)
+            url = f"http://{EMBEDDER_HOST}:{EMBEDDER_PORT}/v1/embeddings"
             response = requests.post(
                 url,
                 json={
-                    "texts": [text],
-                    "batch_size": 1
+                    "input": text,
+                    "model": "Qwen/Qwen3-Embedding-8B"
                 },
                 timeout=30
             )
             if response.status_code == 200:
                 data = response.json()
-                # Our format: {"embeddings": [[...]]}
-                embeddings = data.get('embeddings', [])
-                if embeddings:
-                    embedding = embeddings[0]
+                # OpenAI format: {"data": [{"embedding": [...]}]}
+                data_list = data.get('data', [])
+                if data_list and 'embedding' in data_list[0]:
+                    embedding = data_list[0]['embedding']
 
                     # Cache for 24 hours (86400 seconds)
                     r.setex(cache_key, 86400, json.dumps(embedding))
@@ -591,7 +592,7 @@ class ISMACore:
                     "class": "ISMA_Quantum",
                     "properties": {
                         "content": tile.text,
-                        "source_type": "event",
+                        "source_type": event.event_type,  # Use actual event type (exchange, tool_call, etc.)
                         "layer": self._determine_layer(event.event_type),
                         "event_hash": event.hash,
                         "phi_resonance": self._compute_tile_resonance(tile),
