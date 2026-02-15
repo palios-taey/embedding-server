@@ -194,6 +194,144 @@ def phi_tile_markdown(text: str, source_file: str = "", layer: str = "unknown") 
     return enhanced_tiles
 
 
+# =============================================================================
+# MULTI-SCALE TILING (February 2026)
+# Research consensus: 512 (search), 2048 (context), 4096 (generation)
+# Same e-based overlap at each scale for consistency.
+# =============================================================================
+
+SCALES = [
+    ("search_512",   512,  int(512 / E)),    # 188-token step
+    ("context_2048", 2048, int(2048 / E)),   # 753-token step
+    ("full_4096",    4096, int(4096 / E)),   # 1507-token step
+]
+
+
+@dataclass
+class MultiScaleTile:
+    """A tile at a specific scale level."""
+    index: int
+    text: str
+    start_char: int
+    end_char: int
+    estimated_tokens: int
+    scale: str          # "search_512", "context_2048", "full_4096"
+    parent_index: int   # Index of parent tile at next scale up (-1 if top)
+    layer: str
+    source_file: str
+
+
+def _tile_at_scale(text: str, chunk_chars: int, step_chars: int,
+                   scale_name: str, source_file: str, layer: str) -> List[MultiScaleTile]:
+    """Tile text at a single scale, with boundary-aware splitting."""
+    tiles = []
+    text_len = len(text)
+
+    if text_len == 0:
+        return tiles
+
+    # Single tile if text fits
+    if text_len <= chunk_chars:
+        tiles.append(MultiScaleTile(
+            index=0, text=text, start_char=0, end_char=text_len,
+            estimated_tokens=estimate_tokens(text),
+            scale=scale_name, parent_index=-1,
+            layer=layer, source_file=source_file
+        ))
+        return tiles
+
+    start = 0
+    index = 0
+
+    while start < text_len:
+        remaining = text_len - start
+        if remaining < step_chars // 2 and tiles:
+            # Extend last tile to end
+            last = tiles[-1]
+            extended_text = text[last.start_char:]
+            tiles[-1] = MultiScaleTile(
+                index=last.index, text=extended_text,
+                start_char=last.start_char, end_char=text_len,
+                estimated_tokens=estimate_tokens(extended_text),
+                scale=scale_name, parent_index=-1,
+                layer=layer, source_file=source_file
+            )
+            break
+
+        end = min(start + chunk_chars, text_len)
+
+        # Try to break at sentence/paragraph boundary
+        if end < text_len:
+            search_start = start + int(chunk_chars * 0.8)
+            search_region = text[search_start:end]
+            para_break = search_region.rfind('\n\n')
+            if para_break != -1:
+                end = search_start + para_break + 2
+            else:
+                sent_break = search_region.rfind('. ')
+                if sent_break != -1:
+                    end = search_start + sent_break + 2
+
+        chunk_text = text[start:end]
+        tiles.append(MultiScaleTile(
+            index=index, text=chunk_text,
+            start_char=start, end_char=end,
+            estimated_tokens=estimate_tokens(chunk_text),
+            scale=scale_name, parent_index=-1,
+            layer=layer, source_file=source_file
+        ))
+
+        start += step_chars
+        index += 1
+
+    return tiles
+
+
+def _link_parents(all_tiles: List[MultiScaleTile]) -> None:
+    """Link search_512 tiles to their containing context_2048 parent."""
+    # Group by scale
+    by_scale = {}
+    for t in all_tiles:
+        by_scale.setdefault(t.scale, []).append(t)
+
+    search_tiles = by_scale.get("search_512", [])
+    context_tiles = by_scale.get("context_2048", [])
+
+    if not context_tiles:
+        return
+
+    for st in search_tiles:
+        mid = (st.start_char + st.end_char) // 2
+        for ct in context_tiles:
+            if ct.start_char <= mid < ct.end_char:
+                st.parent_index = ct.index
+                break
+
+
+def multi_scale_tile(text: str, source_file: str = "",
+                     layer: str = "unknown") -> List[MultiScaleTile]:
+    """
+    Multi-scale tiling: 512 (search), 2048 (context), 4096 (generation).
+
+    - search_512: High precision retrieval, fine-grained matching
+    - context_2048: Surrounding context for LLM reasoning
+    - full_4096: Full generation context window
+
+    Parent-child links enable "retrieve at 512, expand to 2048" pattern.
+    """
+    all_tiles = []
+
+    for scale_name, chunk_size, step_size in SCALES:
+        chunk_chars = chunk_size * CHARS_PER_TOKEN
+        step_chars = step_size * CHARS_PER_TOKEN
+        tiles = _tile_at_scale(text, chunk_chars, step_chars,
+                               scale_name, source_file, layer)
+        all_tiles.extend(tiles)
+
+    _link_parents(all_tiles)
+    return all_tiles
+
+
 def tile_stats(tiles: List[Tile]) -> Dict:
     """Get statistics about tiling."""
     if not tiles:

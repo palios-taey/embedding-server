@@ -59,14 +59,14 @@ try:
     from .relational_lens import RelationalLens, Entity, Relationship
     from .functional_lens import FunctionalLens, WorkspaceState
     from .breathing_cycle import BreathingCycle, PHI, CYCLE_DURATION
-    from .phi_tiling import phi_tile_text, Tile
+    from .phi_tiling import phi_tile_text, multi_scale_tile, Tile, MultiScaleTile
 except ImportError:
     # Allow direct import when running standalone
     from temporal_lens import TemporalLens, Event
     from relational_lens import RelationalLens, Entity, Relationship
     from functional_lens import FunctionalLens, WorkspaceState
     from breathing_cycle import BreathingCycle, PHI, CYCLE_DURATION
-    from phi_tiling import phi_tile_text, Tile
+    from phi_tiling import phi_tile_text, multi_scale_tile, Tile, MultiScaleTile
 
 
 # ISMA Constants
@@ -104,7 +104,7 @@ class ISMACore:
                  relational: RelationalLens = None,
                  functional: FunctionalLens = None,
                  breathing: BreathingCycle = None,
-                 redis_host: str = '10.0.0.68',
+                 redis_host: str = '192.168.100.10',
                  redis_port: int = 6379):
 
         # Initialize lenses (use shared instances if provided)
@@ -306,8 +306,16 @@ class ISMACore:
         4. Functional context update (action)
         """
 
-        # 1. SEMANTIC: Search Weaviate
+        # 1. SEMANTIC: Multi-scale hybrid search
+        # First: precise 512-token matches. Then: expand to 2048-token context.
         semantic_matches = self._semantic_search(query, top_k)
+
+        # Expand search_512 matches to their context_2048 parents
+        for match in semantic_matches:
+            if match.get('scale') == 'search_512' and match.get('parent_tile_id'):
+                parent = self._fetch_tile_by_id(match['parent_tile_id'])
+                if parent:
+                    match['expanded_context'] = parent.get('content', '')[:2000]
 
         # 2. RELATIONAL: Expand graph neighborhood
         entity_ids = [m.get('entity_id') for m in semantic_matches if m.get('entity_id')]
@@ -357,55 +365,122 @@ class ISMACore:
         )
 
     def _semantic_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
-        """Search Weaviate ISMA_Quantum collection for semantic matches."""
-        try:
-            # Get embedding for query
-            embedding = self._get_embedding(query)
-            if not embedding:
-                return []
+        """Hybrid BM25 + vector search on Weaviate ISMA_Quantum collection.
 
-            # Search Weaviate ISMA_Quantum collection
+        Uses native Weaviate hybrid query with explicit vector.
+        BM25 is already indexed (b=0.75, k1=1.2).
+        Alpha=0.5 for balanced keyword/semantic matching on conversational data.
+        """
+        try:
+            embedding = self._get_embedding(query)
+            safe_query = query.replace('"', '\\"').replace('\n', ' ')[:200]
             url = f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}/v1/graphql"
-            graphql_query = {
-                "query": """
-                {
-                    Get {
-                        ISMA_Quantum(
-                            nearVector: {
-                                vector: %s
-                                certainty: 0.7
-                            }
-                            limit: %d
-                        ) {
-                            content
-                            content_preview
-                            source_file
-                            source_type
-                            layer
-                            event_hash
-                            actor
-                            timestamp
-                            phi_resonance
-                            _additional {
-                                distance
-                                certainty
+
+            if embedding:
+                # Hybrid search: BM25 + vector combined
+                graphql_query = {
+                    "query": """{
+                        Get {
+                            ISMA_Quantum(
+                                hybrid: {
+                                    query: "%s"
+                                    alpha: 0.65
+                                    vector: %s
+                                }
+                                limit: %d
+                            ) {
+                                content
+                                source_file
+                                source_type
+                                layer
+                                event_hash
+                                actor
+                                timestamp
+                                phi_resonance
+                                scale
+                                parent_tile_id
+                                _additional { id score }
                             }
                         }
-                    }
+                    }""" % (safe_query, json.dumps(embedding), top_k)
                 }
-                """ % (json.dumps(embedding), top_k)
-            }
+            else:
+                # Fallback: BM25 only (no embedding available)
+                graphql_query = {
+                    "query": """{
+                        Get {
+                            ISMA_Quantum(
+                                bm25: { query: "%s" }
+                                limit: %d
+                            ) {
+                                content
+                                source_file
+                                source_type
+                                layer
+                                event_hash
+                                actor
+                                timestamp
+                                phi_resonance
+                                scale
+                                parent_tile_id
+                                _additional { id score }
+                            }
+                        }
+                    }""" % (safe_query, top_k)
+                }
 
             response = requests.post(url, json=graphql_query, timeout=10)
             if response.status_code == 200:
                 data = response.json()
-                memories = data.get('data', {}).get('Get', {}).get('ISMA_Quantum', [])
-                return memories
+                if "errors" not in data:
+                    return data.get('data', {}).get('Get', {}).get('ISMA_Quantum', [])
+                # If hybrid fails, fall back to vector-only
+                return self._vector_only_search(embedding, top_k)
 
         except Exception as e:
-            print(f"Semantic search warning: {e}")
+            print(f"Hybrid search warning: {e}")
 
         return []
+
+    def _vector_only_search(self, embedding: List[float], top_k: int) -> List[Dict[str, Any]]:
+        """Fallback: vector-only search when hybrid fails."""
+        if not embedding:
+            return []
+        try:
+            url = f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}/v1/graphql"
+            graphql_query = {
+                "query": """{
+                    Get {
+                        ISMA_Quantum(
+                            nearVector: { vector: %s certainty: 0.7 }
+                            limit: %d
+                        ) {
+                            content source_file source_type layer
+                            event_hash actor timestamp phi_resonance
+                            _additional { id certainty }
+                        }
+                    }
+                }""" % (json.dumps(embedding), top_k)
+            }
+            response = requests.post(url, json=graphql_query, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('data', {}).get('Get', {}).get('ISMA_Quantum', [])
+        except Exception as e:
+            print(f"Vector search warning: {e}")
+        return []
+
+    def _fetch_tile_by_id(self, tile_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a Weaviate object by its UUID (for parent tile expansion)."""
+        try:
+            url = f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}/v1/objects/ISMA_Quantum/{tile_id}"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                obj = response.json()
+                return obj.get('properties', {})
+        except Exception:
+            pass
+        return None
 
     def _get_embedding(self, text: str) -> Optional[List[float]]:
         """Get embedding with Redis cache (per Grok's optimization)."""
@@ -565,34 +640,40 @@ class ISMACore:
         return ratio * PHI_COHERENCE_THRESHOLD
 
     def _embed_to_weaviate(self, event: Event) -> bool:
-        """Embed event content to Weaviate using φ-tiling for full semantic capture."""
+        """Embed event content to Weaviate using multi-scale tiling.
+
+        Uses 3 scales: search_512 (precise), context_2048 (expanded), full_4096 (generation).
+        Each tile gets its own embedding and Weaviate object.
+        """
         try:
-            # Create content for embedding
             content = json.dumps(event.data) if isinstance(event.data, dict) else str(event.data)
 
-            # Apply φ-tiling (golden ratio chunking) instead of truncation
-            tiles = phi_tile_text(content, source_file=event.hash, layer=event.event_type)
+            # Multi-scale tiling (512/2048/4096)
+            tiles = multi_scale_tile(content, source_file=event.hash, layer=event.event_type)
 
             if not tiles:
-                # Empty content - nothing to embed
                 return True
 
             success_count = 0
             url = f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}/v1/objects"
 
+            # Build tile ID map for parent linking
+            tile_ids = {}  # (scale, index) -> weaviate_uuid
+
             for tile in tiles:
-                # Get embedding for this tile
                 embedding = self._get_embedding(tile.text)
                 if not embedding:
                     continue
 
-                # Create Weaviate object for this tile
-                # Using ISMA_Quantum unified schema per Gemini's cartography
+                import uuid
+                tile_uuid = str(uuid.uuid4())
+
                 obj = {
                     "class": "ISMA_Quantum",
+                    "id": tile_uuid,
                     "properties": {
                         "content": tile.text,
-                        "source_type": event.event_type,  # Use actual event type (exchange, tool_call, etc.)
+                        "source_type": event.event_type,
                         "layer": self._determine_layer(event.event_type),
                         "event_hash": event.hash,
                         "phi_resonance": self._compute_tile_resonance(tile),
@@ -600,7 +681,9 @@ class ISMACore:
                         "timestamp": event.timestamp,
                         "branch": event.branch,
                         "tile_index": tile.index,
-                        "tile_count": len(tiles)
+                        "tile_count": len(tiles),
+                        "scale": tile.scale,
+                        "parent_tile_id": "",
                     },
                     "vector": embedding
                 }
@@ -608,8 +691,23 @@ class ISMACore:
                 response = requests.post(url, json=obj, timeout=5)
                 if response.status_code in [200, 201]:
                     success_count += 1
+                    tile_ids[(tile.scale, tile.index)] = tile_uuid
 
-            # Success if at least one tile was embedded
+            # Link parent IDs: search_512 → context_2048
+            for tile in tiles:
+                if tile.scale == "search_512" and tile.parent_index >= 0:
+                    child_id = tile_ids.get(("search_512", tile.index))
+                    parent_id = tile_ids.get(("context_2048", tile.parent_index))
+                    if child_id and parent_id:
+                        try:
+                            requests.patch(
+                                f"{url}/ISMA_Quantum/{child_id}",
+                                json={"properties": {"parent_tile_id": parent_id}},
+                                timeout=2
+                            )
+                        except Exception:
+                            pass  # Non-critical - linking is best-effort
+
             return success_count > 0
 
         except Exception as e:

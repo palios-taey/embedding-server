@@ -64,9 +64,9 @@ SKIP_PATTERNS = [
     ".Trash", "exo", "tinygrad",  # Fork repos
 ]
 
-# Infrastructure
-EMBEDDING_URL = "http://10.0.0.68:8090/embed"
-WEAVIATE_URL = "http://10.0.0.68:8088"
+# Infrastructure - use NCCL IPs (192.168.100.x), not management (10.0.0.x)
+EMBEDDING_URL = "http://192.168.100.10:8091/v1/embeddings"
+WEAVIATE_URL = "http://192.168.100.10:8088"
 
 # Manifests
 MANIFEST_DIR = Path("/var/spark/isma")
@@ -186,16 +186,18 @@ def save_content_manifest(content: Dict[str, LoadedContent], stats: Dict):
 # =============================================================================
 
 def embed_batch(batch: List[str], batch_size: int = BATCH_SIZE) -> Optional[List[List[float]]]:
-    """Embed a single batch of texts using connection-pooled session."""
+    """Embed a single batch of texts using OpenAI-compatible API via nginx LB."""
     session = get_session()
     try:
         response = session.post(
             EMBEDDING_URL,
-            json={"texts": batch, "batch_size": batch_size},
+            json={"input": batch, "model": "Qwen/Qwen3-Embedding-8B"},
             timeout=300
         )
         response.raise_for_status()
-        return response.json()["embeddings"]
+        data = response.json()
+        # OpenAI format: {"data": [{"embedding": [...], "index": N}, ...]}
+        return [item["embedding"] for item in sorted(data["data"], key=lambda x: x["index"])]
     except Exception as e:
         print(f"  Batch failed: {e}")
         return None

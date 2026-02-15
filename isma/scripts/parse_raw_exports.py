@@ -132,12 +132,36 @@ def unix_to_iso(ts) -> str:
         return ""
 
 
+def mongo_timestamp_to_iso(ts_obj) -> str:
+    """Convert MongoDB timestamp format to ISO 8601.
+
+    Format: {"$date": {"$numberLong": "1762748309259"}}
+    The numberLong is milliseconds since epoch.
+    """
+    if not ts_obj:
+        return ""
+    if isinstance(ts_obj, dict):
+        if '$date' in ts_obj:
+            date_obj = ts_obj['$date']
+            if isinstance(date_obj, dict) and '$numberLong' in date_obj:
+                # Convert milliseconds to seconds
+                ms = int(date_obj['$numberLong'])
+                return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).isoformat()
+    # Fallback to regular ISO or unix timestamp
+    return ensure_iso(ts_obj)
+
+
 def ensure_iso(ts) -> str:
     """Ensure timestamp is ISO 8601 string."""
     if not ts:
         return ""
+    # Handle MongoDB format
+    if isinstance(ts, dict) and '$date' in ts:
+        return mongo_timestamp_to_iso(ts)
+    # Handle unix timestamp
     if isinstance(ts, (int, float)):
         return unix_to_iso(ts)
+    # Already ISO string
     return str(ts)
 
 
@@ -152,7 +176,16 @@ def make_id(platform: str, *parts) -> str:
 # =============================================================================
 
 def parse_chatgpt_bulk(filepath: str) -> List[Dict]:
-    """Parse ChatGPT bulk export conversations.json."""
+    """Parse ChatGPT bulk export conversations.json with full artifact support.
+
+    Captures:
+    - Canvas artifacts (canmore.create_textdoc / canmore.update_textdoc)
+    - Code interpreter (role="tool", python recipient)
+    - DALL-E results (role="tool" with image asset pointers)
+    - Per-message model slugs
+    - Dict parts (image/file references)
+    - Citations from metadata
+    """
     with open(filepath) as f:
         conversations = json.load(f)
 
@@ -168,8 +201,8 @@ def parse_chatgpt_bulk(filepath: str) -> List[Dict]:
         # BFS traversal of tree to get messages in order
         messages = _chatgpt_tree_to_messages(mapping)
 
-        # Group into exchanges (user prompt -> assistant responses)
-        exchanges = _group_into_exchanges(messages, 'chatgpt')
+        # Group into exchanges with artifact pairing
+        exchanges = _group_chatgpt_exchanges_with_artifacts(messages)
 
         all_attachments = sum(len(ex.get('attachments', [])) for ex in exchanges)
         all_refs = sum(len(ex.get('file_references', [])) for ex in exchanges)
@@ -196,7 +229,22 @@ def parse_chatgpt_bulk(filepath: str) -> List[Dict]:
 
 
 def _chatgpt_tree_to_messages(mapping: Dict) -> List[Dict]:
-    """BFS traversal of ChatGPT mapping tree to ordered messages."""
+    """BFS traversal of ChatGPT mapping tree to ordered messages.
+
+    Extracts ALL message types:
+    - role="user" (user prompts)
+    - role="assistant" (ChatGPT responses)
+    - role="tool" (code interpreter output, DALL-E results, browser results)
+    - recipient="python" (code interpreter input)
+    - recipient="canmore.create_textdoc" (canvas creation)
+    - recipient="canmore.update_textdoc" (canvas updates)
+
+    Preserves:
+    - Per-message model_slug
+    - Dict parts (image pointers, file references)
+    - Citations from metadata
+    - Full content parts array for downstream processing
+    """
     # Find root node (no parent or parent not in mapping)
     root_id = None
     for nid, node in mapping.items():
@@ -229,16 +277,27 @@ def _chatgpt_tree_to_messages(mapping: Dict) -> List[Dict]:
             parts = content.get('parts', [])
             meta = msg.get('metadata', {})
             create_time = msg.get('create_time')
+            recipient = msg.get('recipient', 'all')  # Canvas/code interpreter target
+
+            # Per-message model (overrides conversation default)
+            model_slug = meta.get('model_slug', '')
 
             # Extract text from parts (can be strings or dicts)
             text_parts = []
+            dict_parts = []  # Store dict parts for downstream artifact processing
+
             for part in parts:
                 if isinstance(part, str):
                     text_parts.append(part)
                 elif isinstance(part, dict):
+                    # Store dict part for artifact processing
+                    dict_parts.append(part)
+
+                    # Try to extract text if available
                     t = part.get('text', '')
                     if t:
                         text_parts.append(t)
+
             text = '\n'.join(text_parts).strip()
 
             # Extract attachments from metadata
@@ -250,13 +309,26 @@ def _chatgpt_tree_to_messages(mapping: Dict) -> List[Dict]:
                     "mime_type": att.get('mime_type', ''),
                 })
 
-            if text or attachments:  # Skip empty nodes
-                ordered.append({
-                    "role": role,
-                    "text": text,
-                    "timestamp": unix_to_iso(create_time),
-                    "attachments": attachments,
-                })
+            # Extract citations
+            citations = meta.get('citations', [])
+
+            # Build message object
+            # Include even if text is empty - role="tool" messages often have no text
+            # but contain crucial output in metadata
+            msg_obj = {
+                "role": role,
+                "text": text,
+                "timestamp": unix_to_iso(create_time),
+                "attachments": attachments,
+                "model": model_slug,
+                "recipient": recipient,
+                "parts": parts,  # Preserve original parts for artifact extraction
+                "dict_parts": dict_parts,
+                "citations": citations,
+                "metadata": meta,  # Preserve full metadata for artifact processing
+            }
+
+            ordered.append(msg_obj)
 
         # Add children to queue
         children = node.get('children', [])
@@ -265,12 +337,287 @@ def _chatgpt_tree_to_messages(mapping: Dict) -> List[Dict]:
     return ordered
 
 
+def _group_chatgpt_exchanges_with_artifacts(messages: List[Dict]) -> List[Dict]:
+    """Group ChatGPT messages into exchanges with artifact extraction.
+
+    Pairs messages to extract artifacts:
+    1. assistant + canmore.create_textdoc → Canvas artifact (create)
+    2. assistant + canmore.update_textdoc → Canvas artifact (update)
+    3. assistant + python → tool + Code interpreter artifact
+    4. tool messages → Code interpreter output, DALL-E results
+
+    Exchange schema:
+    {
+      "index": 0,
+      "timestamp": "ISO 8601",
+      "model": "gpt-5-2-pro",  # Per-exchange model
+      "user_prompt": "full user text",
+      "responses": [{
+        "text": "full assistant text",
+        "model": "gpt-5-2-pro",  # Per-response model
+        "artifacts": [...],
+        "tools": [...],
+        "citations": [...]
+      }],
+      "attachments": [...],
+      "file_references": [...]
+    }
+    """
+    exchanges = []
+    idx = 0
+    i = 0
+
+    while i < len(messages):
+        msg = messages[i]
+        role = msg.get('role', '')
+
+        if role == 'user':
+            # Start new exchange
+            user_text = msg.get('text', '')
+            user_ts = msg.get('timestamp', '')
+            user_attachments = msg.get('attachments', [])
+            user_model = msg.get('model', '')
+
+            # Collect all assistant/tool responses until next user message
+            responses = []
+            i += 1
+
+            while i < len(messages) and messages[i].get('role') != 'user':
+                resp_msg = messages[i]
+                resp_role = resp_msg.get('role', '')
+                recipient = resp_msg.get('recipient', 'all')
+
+                if resp_role == 'assistant':
+                    # Build response object
+                    response_obj = _extract_assistant_response(resp_msg)
+                    responses.append(response_obj)
+
+                elif resp_role == 'tool':
+                    # Tool output - pair with previous assistant if it was code interpreter
+                    if responses and recipient == 'all':
+                        # This is output from previous tool call
+                        tool_artifact = _extract_tool_artifact(resp_msg)
+                        if tool_artifact:
+                            # Add to last response's artifacts
+                            responses[-1]['artifacts'].append(tool_artifact)
+                    else:
+                        # Orphaned tool message - create standalone response
+                        response_obj = {
+                            "text": resp_msg.get('text', ''),
+                            "model": resp_msg.get('model', ''),
+                            "artifacts": [_extract_tool_artifact(resp_msg)] if _extract_tool_artifact(resp_msg) else [],
+                            "tools": [],
+                            "citations": [],
+                        }
+                        responses.append(response_obj)
+
+                i += 1
+
+            # Build exchange
+            if responses or user_text:
+                # Merge all response texts
+                merged_text = '\n\n'.join(r['text'] for r in responses if r.get('text'))
+
+                # Merge all artifacts
+                all_artifacts = []
+                all_tools = []
+                all_citations = []
+                response_model = ''
+
+                for r in responses:
+                    all_artifacts.extend(r.get('artifacts', []))
+                    all_tools.extend(r.get('tools', []))
+                    all_citations.extend(r.get('citations', []))
+                    if not response_model and r.get('model'):
+                        response_model = r['model']
+
+                # Extract file references
+                file_refs = extract_file_references(user_text + '\n' + merged_text)
+
+                # Add code fence artifacts
+                code_artifacts = extract_artifacts(merged_text)
+                all_artifacts.extend(code_artifacts)
+
+                exchange = {
+                    "index": idx,
+                    "timestamp": user_ts,
+                    "model": response_model or user_model,
+                    "user_prompt": user_text,
+                    "responses": [{
+                        "text": merged_text,
+                        "model": response_model,
+                        "artifacts": all_artifacts,
+                        "tools": all_tools,
+                        "citations": all_citations,
+                    }],
+                    "attachments": user_attachments,
+                    "file_references": file_refs,
+                }
+
+                exchanges.append(exchange)
+                idx += 1
+        else:
+            # Orphaned assistant/tool at start - skip or handle
+            i += 1
+
+    return exchanges
+
+
+def _extract_assistant_response(msg: Dict) -> Dict:
+    """Extract response object from assistant message.
+
+    Handles:
+    - Canvas artifacts (canmore recipients)
+    - Code interpreter (python recipient)
+    - Regular text responses
+    - Citations
+    """
+    text = msg.get('text', '')
+    model = msg.get('model', '')
+    recipient = msg.get('recipient', 'all')
+    citations = msg.get('citations', [])
+    parts = msg.get('parts', [])
+    metadata = msg.get('metadata', {})
+
+    artifacts = []
+    tools = []
+
+    # Canvas artifact detection
+    if recipient == 'canmore.create_textdoc':
+        # Initial canvas creation
+        canvas_artifact = _extract_canvas_artifact(parts, 'create')
+        if canvas_artifact:
+            artifacts.append(canvas_artifact)
+
+    elif recipient == 'canmore.update_textdoc':
+        # Canvas update
+        canvas_artifact = _extract_canvas_artifact(parts, 'update')
+        if canvas_artifact:
+            artifacts.append(canvas_artifact)
+
+    elif recipient == 'python':
+        # Code interpreter input
+        # Extract code from parts or metadata
+        code = ''
+        if isinstance(text, str) and text.strip():
+            code = text
+
+        # Check metadata for aggregate_result
+        agg = metadata.get('aggregate_result', {})
+        if agg.get('code'):
+            code = agg['code']
+
+        if code:
+            artifacts.append({
+                "type": "code_interpreter",
+                "code": code,
+                "language": "python",
+                "command": "execute",
+            })
+
+    return {
+        "text": text,
+        "model": model,
+        "artifacts": artifacts,
+        "tools": tools,
+        "citations": citations,
+    }
+
+
+def _extract_canvas_artifact(parts: List, command: str) -> Optional[Dict]:
+    """Extract canvas artifact from parts.
+
+    Canvas format:
+    parts[0] = JSON string: {"name": "doc_name", "type": "document"|"code/python", "content": "FULL CONTENT"}
+    """
+    if not parts:
+        return None
+
+    first_part = parts[0]
+
+    # Canvas content is in a JSON string
+    if isinstance(first_part, str):
+        try:
+            canvas_data = json.loads(first_part)
+            if isinstance(canvas_data, dict) and 'content' in canvas_data:
+                return {
+                    "type": "canvas",
+                    "name": canvas_data.get('name', 'untitled'),
+                    "content_type": canvas_data.get('type', 'document'),
+                    "content": canvas_data.get('content', ''),
+                    "command": command,
+                }
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def _extract_tool_artifact(msg: Dict) -> Optional[Dict]:
+    """Extract artifact from tool message.
+
+    Tool messages contain:
+    - Code interpreter output (text in parts)
+    - DALL-E results (asset_pointer in dict parts)
+    - Browser results
+    """
+    parts = msg.get('parts', [])
+    metadata = msg.get('metadata', {})
+
+    # Check for DALL-E asset pointer
+    for part in parts:
+        if isinstance(part, dict):
+            content_type = part.get('content_type', '')
+            if content_type == 'image_asset_pointer':
+                return {
+                    "type": "dalle",
+                    "asset_pointer": part.get('asset_pointer', ''),
+                    "metadata": part.get('metadata', {}),
+                }
+
+    # Check for code interpreter output
+    text = msg.get('text', '')
+    if text:
+        # This is code execution output
+        return {
+            "type": "code_interpreter_output",
+            "output": text,
+        }
+
+    # Check metadata for aggregate result
+    agg = metadata.get('aggregate_result', {})
+    if agg:
+        messages = agg.get('messages', [])
+        if messages:
+            output_parts = []
+            for m in messages:
+                if isinstance(m, dict):
+                    output_parts.append(m.get('text', str(m)))
+                else:
+                    output_parts.append(str(m))
+
+            return {
+                "type": "code_interpreter_output",
+                "output": '\n'.join(output_parts),
+            }
+
+    return None
+
+
 # =============================================================================
 # CLAUDE CHAT PARSER - chat_messages array
 # =============================================================================
 
 def parse_claude_bulk(filepath: str) -> List[Dict]:
-    """Parse Claude Chat bulk export conversations.json."""
+    """Parse Claude Chat bulk export conversations.json.
+
+    Captures:
+    - type=text blocks with inline citations
+    - type=thinking blocks (extended thinking)
+    - type=tool_use with name=artifacts (AI-generated canonical content)
+    - type=tool_use/tool_result for other tools (web_search, create_file, bash_tool, etc.)
+    - Attachments with extracted_content
+    """
     with open(filepath) as f:
         conversations = json.load(f)
 
@@ -295,21 +642,108 @@ def parse_claude_bulk(filepath: str) -> List[Dict]:
             else:
                 role = sender
 
-            # Extract text from content array
+            # Extract all content types from content array
             content_blocks = msg.get('content', [])
             text_parts = []
+            thinking_parts = []
+            artifacts = []
+            tools = []
+            citations = []
+
             for block in content_blocks:
-                if isinstance(block, dict):
+                if isinstance(block, str):
+                    text_parts.append(block)
+                    continue
+
+                if not isinstance(block, dict):
+                    continue
+
+                block_type = block.get('type', '')
+
+                # type=text - main response text with optional citations
+                if block_type == 'text':
                     t = block.get('text', '')
                     if t:
                         text_parts.append(t)
-                elif isinstance(block, str):
-                    text_parts.append(block)
+                    # Extract citations from text blocks
+                    block_citations = block.get('citations', [])
+                    if block_citations:
+                        for cit in block_citations:
+                            citations.append({
+                                "url": cit.get('url', ''),
+                                "title": cit.get('title', ''),
+                                "start_index": cit.get('start_index', 0),
+                                "end_index": cit.get('end_index', 0),
+                                "origin_tool_name": cit.get('origin_tool_name', ''),
+                            })
+
+                # type=thinking - extended thinking blocks
+                elif block_type == 'thinking':
+                    thinking = block.get('thinking', '')
+                    if thinking:
+                        thinking_parts.append(thinking)
+                    # Also preserve summaries if present
+                    summaries = block.get('summaries', [])
+                    if summaries:
+                        thinking_parts.append('\n'.join(f"[Summary] {s}" for s in summaries))
+
+                # type=tool_use with name=artifacts - CANONICAL AI-GENERATED CONTENT
+                elif block_type == 'tool_use' and block.get('name') == 'artifacts':
+                    tool_input = block.get('input', {})
+                    artifacts.append({
+                        "type": "generated",  # Distinguish from code_fence
+                        "id": tool_input.get('id', ''),
+                        "content_type": tool_input.get('type', ''),
+                        "title": tool_input.get('title', ''),
+                        "command": tool_input.get('command', ''),  # create/update/rewrite
+                        "content": tool_input.get('content', ''),  # THE CANONICAL CONTENT
+                        "language": tool_input.get('language'),
+                        "citations": tool_input.get('md_citations', []),
+                        "version_uuid": tool_input.get('version_uuid', ''),
+                    })
+
+                # type=tool_use - other tools (web_search, create_file, bash_tool, etc.)
+                elif block_type == 'tool_use':
+                    tool_name = block.get('name', 'unknown')
+                    tool_input = block.get('input', {})
+                    tools.append({
+                        "type": tool_name,
+                        "input": tool_input,
+                        "tool_use_id": block.get('id', ''),
+                    })
+
+                # type=tool_result - tool outputs
+                elif block_type == 'tool_result':
+                    tool_use_id = block.get('tool_use_id', '')
+                    # Find matching tool_use to attach output
+                    for tool in tools:
+                        if tool.get('tool_use_id') == tool_use_id:
+                            # Content can be string or array of blocks
+                            result_content = block.get('content', '')
+                            if isinstance(result_content, list):
+                                result_parts = []
+                                for rc in result_content:
+                                    if isinstance(rc, str):
+                                        result_parts.append(rc)
+                                    elif isinstance(rc, dict) and rc.get('type') == 'text':
+                                        result_parts.append(rc.get('text', ''))
+                                result_content = '\n'.join(result_parts)
+                            tool['output'] = result_content
+                            break
+
+                # type=token_budget, type=flag - minor types, just note them
+                elif block_type in ('token_budget', 'flag'):
+                    pass  # Skip for now
+
+            # Combine text parts
             text = '\n'.join(text_parts).strip()
 
             # If content array is empty, fall back to text field
             if not text:
                 text = msg.get('text', '').strip()
+
+            # Combine thinking parts
+            thinking = '\n\n'.join(thinking_parts).strip() if thinking_parts else ''
 
             # Extract attachments
             attachments = []
@@ -325,19 +759,37 @@ def parse_claude_bulk(filepath: str) -> List[Dict]:
                 if isinstance(f_info, dict):
                     name = f_info.get('file_name', '')
                     if name and not any(a['name'] == name for a in attachments):
-                        attachments.append({"name": name, "size": 0, "mime_type": ""})
+                        attachments.append({
+                            "name": name,
+                            "size": 0,
+                            "mime_type": "",
+                            "extracted_content": "",
+                        })
 
             timestamp = ensure_iso(msg.get('created_at', ''))
 
-            if text or attachments:
-                messages.append({
+            # Store all extracted data in message
+            if text or attachments or thinking or artifacts or tools:
+                msg_obj = {
                     "role": role,
                     "text": text,
                     "timestamp": timestamp,
                     "attachments": attachments,
-                })
+                }
+                # Store metadata fields for later grouping
+                if thinking:
+                    msg_obj['_thinking'] = thinking
+                if artifacts:
+                    msg_obj['_artifacts'] = artifacts
+                if tools:
+                    msg_obj['_tools'] = tools
+                if citations:
+                    msg_obj['_citations'] = citations
 
-        exchanges = _group_into_exchanges(messages, 'claude_chat')
+                messages.append(msg_obj)
+
+        # Group into exchanges with enhanced content extraction
+        exchanges = _group_into_exchanges_claude_enhanced(messages, 'claude_chat')
 
         all_attachments = sum(len(ex.get('attachments', [])) for ex in exchanges)
         all_refs = sum(len(ex.get('file_references', [])) for ex in exchanges)
@@ -363,16 +815,177 @@ def parse_claude_bulk(filepath: str) -> List[Dict]:
     return results
 
 
+def _group_into_exchanges_claude_enhanced(messages: List[Dict], platform: str) -> List[Dict]:
+    """Group Claude messages into exchanges, preserving thinking/artifacts/tools/citations.
+
+    This extends the standard grouping to handle:
+    - _thinking: Extended thinking blocks
+    - _artifacts: AI-generated canonical content from artifacts tool
+    - _tools: Other tool uses (web_search, create_file, etc.)
+    - _citations: Inline citations with URL/title/offsets
+
+    Also preserves code_fence artifacts from regex extraction.
+    """
+    exchanges = []
+    current_user = None
+    current_responses = []
+    current_attachments = []
+    current_timestamp = ''
+    idx = 0
+
+    for msg in messages:
+        role = msg.get('role', '')
+
+        if role == 'user':
+            # Save previous exchange
+            if current_user is not None and current_responses:
+                # Merge all assistant response data
+                resp_texts = []
+                all_thinking = []
+                all_artifacts = []
+                all_tools = []
+                all_citations = []
+
+                for r in current_responses:
+                    if r.get('text'):
+                        resp_texts.append(r['text'])
+                    if r.get('_thinking'):
+                        all_thinking.append(r['_thinking'])
+                    if r.get('_artifacts'):
+                        all_artifacts.extend(r['_artifacts'])
+                    if r.get('_tools'):
+                        all_tools.extend(r['_tools'])
+                    if r.get('_citations'):
+                        all_citations.extend(r['_citations'])
+
+                resp_text = '\n'.join(resp_texts)
+                thinking = '\n\n---\n\n'.join(all_thinking) if all_thinking else ''
+
+                # Also extract code_fence artifacts from text (backwards compat)
+                code_fence_artifacts = extract_artifacts(resp_text)
+
+                # Combine generated artifacts and code_fence artifacts
+                combined_artifacts = all_artifacts + code_fence_artifacts
+
+                # Build response object
+                response_obj = {
+                    "text": resp_text,
+                    "tools": all_tools,
+                    "artifacts": combined_artifacts,
+                }
+                if thinking:
+                    response_obj['thinking'] = thinking
+                if all_citations:
+                    response_obj['citations'] = all_citations
+
+                # Extract file references
+                file_refs = extract_file_references(current_user + '\n' + resp_text)
+                for tool in all_tools:
+                    inp = tool.get('input', {})
+                    fp = inp.get('file_path', '') or inp.get('path', '') or inp.get('command', '')
+                    if fp:
+                        file_refs.extend(extract_file_references(fp))
+                file_refs = sorted(set(file_refs))
+
+                exchanges.append({
+                    "index": idx,
+                    "timestamp": current_timestamp,
+                    "user_prompt": current_user,
+                    "responses": [response_obj],
+                    "attachments": current_attachments,
+                    "file_references": file_refs,
+                })
+                idx += 1
+
+            current_user = msg.get('text', '')
+            current_responses = []
+            current_attachments = msg.get('attachments', [])
+            current_timestamp = msg.get('timestamp', '')
+
+        elif role == 'assistant':
+            current_responses.append(msg)
+
+        elif role == 'system':
+            pass  # Skip system messages
+
+    # Save last exchange
+    if current_user is not None and current_responses:
+        resp_texts = []
+        all_thinking = []
+        all_artifacts = []
+        all_tools = []
+        all_citations = []
+
+        for r in current_responses:
+            if r.get('text'):
+                resp_texts.append(r['text'])
+            if r.get('_thinking'):
+                all_thinking.append(r['_thinking'])
+            if r.get('_artifacts'):
+                all_artifacts.extend(r['_artifacts'])
+            if r.get('_tools'):
+                all_tools.extend(r['_tools'])
+            if r.get('_citations'):
+                all_citations.extend(r['_citations'])
+
+        resp_text = '\n'.join(resp_texts)
+        thinking = '\n\n---\n\n'.join(all_thinking) if all_thinking else ''
+
+        code_fence_artifacts = extract_artifacts(resp_text)
+        combined_artifacts = all_artifacts + code_fence_artifacts
+
+        response_obj = {
+            "text": resp_text,
+            "tools": all_tools,
+            "artifacts": combined_artifacts,
+        }
+        if thinking:
+            response_obj['thinking'] = thinking
+        if all_citations:
+            response_obj['citations'] = all_citations
+
+        file_refs = extract_file_references(current_user + '\n' + resp_text)
+        for tool in all_tools:
+            inp = tool.get('input', {})
+            fp = inp.get('file_path', '') or inp.get('path', '') or inp.get('command', '')
+            if fp:
+                file_refs.extend(extract_file_references(fp))
+        file_refs = sorted(set(file_refs))
+
+        exchanges.append({
+            "index": idx,
+            "timestamp": current_timestamp,
+            "user_prompt": current_user,
+            "responses": [response_obj],
+            "attachments": current_attachments,
+            "file_references": file_refs,
+        })
+
+    return exchanges
+
+
 # =============================================================================
-# GROK PARSER - Two formats: responses[] and conversation.messages[]
+# GROK PARSER - Three formats:
+#   A: responses[] with conversation metadata (conversations_old files)
+#   B: conversation.messages[] array (alternative individual format)
+#   C: {"conversations": [...]} master bulk export (prod-grok-backend.json)
 # =============================================================================
 
 def parse_grok_bulk(filepath: str) -> List[Dict]:
-    """Parse Grok bulk export (prod-grok-backend.json or similar)."""
+    """Parse Grok bulk export (prod-grok-backend.json or individual files)."""
     with open(filepath) as f:
         data = json.load(f)
 
-    # Grok can be a single conversation or array
+    # Format C: Master bulk export with {"conversations": [...]}
+    if isinstance(data, dict) and 'conversations' in data:
+        results = []
+        for conv_wrapper in data['conversations']:
+            result = _parse_grok_format_c(conv_wrapper, filepath)
+            if result:
+                results.append(result)
+        return results
+
+    # Legacy formats: single conversation or array
     if isinstance(data, list):
         conversations = data
     elif isinstance(data, dict):
@@ -398,37 +1011,210 @@ def parse_grok_bulk(filepath: str) -> List[Dict]:
     return results
 
 
-def _parse_grok_format_a(data: Dict, filepath: str) -> Optional[Dict]:
-    """Grok Format A: responses[] array."""
-    conv_meta = data.get('conversation', {})
-    conv_id = conv_meta.get('conversation_id', make_id('grok', filepath))
+def _parse_grok_format_c(conv_wrapper: Dict, filepath: str) -> Optional[Dict]:
+    """Grok Format C: Master bulk export {"conversations": [{"conversation": {...}, "responses": [...]}]}.
+
+    Handles:
+    - MongoDB timestamps: {"$date": {"$numberLong": "ms"}}
+    - ISO 8601 timestamps: "2025-06-03T16:26:30.954604Z"
+    - file_attachments as list of UUIDs
+    - thinking_trace extraction
+    - steps[] for web search
+    - model field (grok-3, grok-4, grok-4-heavy)
+    - parent_response_id for tree ordering
+    """
+    conv_meta = conv_wrapper.get('conversation', {})
+    conv_id = conv_meta.get('id') or conv_meta.get('conversation_id') or make_id('grok', filepath)
     title = conv_meta.get('title', 'Untitled')
-    created = unix_to_iso(conv_meta.get('create_time'))
-    updated = unix_to_iso(conv_meta.get('modify_time'))
+    created = ensure_iso(conv_meta.get('create_time'))
+    updated = ensure_iso(conv_meta.get('modify_time'))
+
+    # Build message tree from responses
+    responses_raw = conv_wrapper.get('responses', [])
+    response_map = {}  # response_id -> response object
+
+    for resp_wrapper in responses_raw:
+        resp = resp_wrapper.get('response', resp_wrapper)
+        resp_id = resp.get('_id') or resp.get('response_id')
+        if resp_id:
+            response_map[resp_id] = resp
+
+    # Traverse tree starting from messages with no parent (or parent not in tree)
+    # Build ordered list following parent_response_id chain
+    messages = []
+    processed = set()
+
+    def add_message(resp: Dict):
+        """Convert response object to message."""
+        resp_id = resp.get('_id') or resp.get('response_id')
+        if resp_id in processed:
+            return
+        processed.add(resp_id)
+
+        text = resp.get('message', '')
+        sender = resp.get('sender', '')
+        ts = ensure_iso(resp.get('create_time'))
+        model = resp.get('model', '')
+
+        # Normalize sender: "human", "assistant", "ASSISTANT" (case insensitive)
+        role = 'user' if sender.lower() == 'human' else 'assistant'
+
+        # Extract attachments (UUIDs)
+        attachments = []
+        file_att_uuids = resp.get('file_attachments', [])
+        for uuid in file_att_uuids:
+            attachments.append({
+                "name": f"grok_asset_{uuid[:8]}",
+                "size": 0,
+                "mime_type": "application/octet-stream",
+                "type": "grok_asset",
+                "uuid": uuid,
+            })
+
+        # Extract thinking trace
+        thinking = resp.get('thinking_trace', '')
+
+        # Extract web search steps
+        steps = resp.get('steps', [])
+
+        # Build message object
+        msg = {
+            "role": role,
+            "text": text.strip() if text else '',
+            "timestamp": ts,
+            "attachments": attachments,
+            "model": model,
+            "_response_id": resp_id,
+            "_parent_id": resp.get('parent_response_id'),
+        }
+
+        # Store metadata and tools
+        metadata = {}
+        tools = []
+
+        if thinking:
+            metadata['thinking_trace'] = thinking
+
+        if steps:
+            for step in steps:
+                if isinstance(step, dict):
+                    tools.append({
+                        "type": "web_search",
+                        "input": step,
+                    })
+
+        msg['_metadata'] = metadata
+        msg['_tools'] = tools
+
+        messages.append(msg)
+
+    # First pass: Find root messages (no parent or parent not in map)
+    roots = []
+    for resp in response_map.values():
+        parent_id = resp.get('parent_response_id')
+        if not parent_id or parent_id not in response_map:
+            roots.append(resp)
+
+    # Sort roots by timestamp
+    roots.sort(key=lambda r: ensure_iso(r.get('create_time')) or '')
+
+    # Process tree in BFS order (depth-first would also work)
+    # For simplicity, we'll process in the order parent_response_id chains suggest
+    for root in roots:
+        queue = [root]
+        while queue:
+            current = queue.pop(0)
+            add_message(current)
+
+            # Find children (responses with parent_response_id == current._id)
+            current_id = current.get('_id') or current.get('response_id')
+            children = [r for r in response_map.values()
+                       if r.get('parent_response_id') == current_id]
+            # Sort children by timestamp
+            children.sort(key=lambda r: ensure_iso(r.get('create_time')) or '')
+            queue.extend(children)
+
+    # Group into exchanges with tool extraction
+    exchanges = _group_into_exchanges_with_tools_and_metadata(messages, 'grok')
+
+    # Detect model from first assistant message with model field
+    detected_model = ''
+    for msg in messages:
+        if msg.get('role') == 'assistant' and msg.get('model'):
+            detected_model = msg['model']
+            break
+
+    return _build_result('grok', conv_id, title, detected_model, filepath, created, updated, exchanges)
+
+
+def _parse_grok_format_a(data: Dict, filepath: str) -> Optional[Dict]:
+    """Grok Format A: responses[] array (conversations_old files)."""
+    conv_meta = data.get('conversation', {})
+    conv_id = conv_meta.get('conversation_id') or conv_meta.get('id') or make_id('grok', filepath)
+    title = conv_meta.get('title', 'Untitled')
+    created = ensure_iso(conv_meta.get('create_time'))
+    updated = ensure_iso(conv_meta.get('modify_time'))
 
     messages = []
     for resp_wrapper in data.get('responses', []):
         resp = resp_wrapper.get('response', resp_wrapper)
         text = resp.get('message', '')
         sender = resp.get('sender', '')
-        ts = unix_to_iso(resp.get('create_time'))
+        ts = ensure_iso(resp.get('create_time'))
+        model = resp.get('model', '')
 
         role = 'user' if sender.lower() == 'human' else 'assistant'
 
-        # Handle sub-messages (Grok delimiter)
+        # Extract attachments
+        attachments = []
+        for uuid in resp.get('file_attachments', []):
+            attachments.append({
+                "name": f"grok_asset_{uuid[:8]}",
+                "size": 0,
+                "mime_type": "application/octet-stream",
+                "type": "grok_asset",
+                "uuid": uuid,
+            })
+
+        # Extract thinking trace and steps
+        thinking = resp.get('thinking_trace', '')
+        steps = resp.get('steps', [])
+
+        metadata = {}
+        tools = []
+        if thinking:
+            metadata['thinking_trace'] = thinking
+        if steps:
+            for step in steps:
+                if isinstance(step, dict):
+                    tools.append({"type": "web_search", "input": step})
+
+        # Handle sub-messages (Grok delimiter) - but preserve metadata on first
         sub_msgs = text.split('\n\n---\n\n') if '\n\n---\n\n' in text else [text]
-        for sub in sub_msgs:
+        for idx, sub in enumerate(sub_msgs):
             sub = sub.strip()
             if sub:
-                messages.append({
+                msg = {
                     "role": role,
                     "text": sub,
                     "timestamp": ts,
-                    "attachments": [],
-                })
+                    "attachments": attachments if idx == 0 else [],
+                    "model": model,
+                    "_metadata": metadata if idx == 0 else {},
+                    "_tools": tools if idx == 0 else [],
+                }
+                messages.append(msg)
 
-    exchanges = _group_into_exchanges(messages, 'grok')
-    return _build_result('grok', conv_id, title, '', filepath, created, updated, exchanges)
+    exchanges = _group_into_exchanges_with_tools_and_metadata(messages, 'grok')
+
+    # Detect model
+    detected_model = ''
+    for msg in messages:
+        if msg.get('model'):
+            detected_model = msg['model']
+            break
+
+    return _build_result('grok', conv_id, title, detected_model, filepath, created, updated, exchanges)
 
 
 def _parse_grok_format_b(data: Dict, filepath: str) -> Optional[Dict]:
@@ -448,10 +1234,183 @@ def _parse_grok_format_b(data: Dict, filepath: str) -> Optional[Dict]:
             "text": text.strip(),
             "timestamp": ts,
             "attachments": [],
+            "_metadata": {},
+            "_tools": [],
         })
 
-    exchanges = _group_into_exchanges(messages, 'grok')
+    exchanges = _group_into_exchanges_with_tools_and_metadata(messages, 'grok')
     return _build_result('grok', conv_id, title, '', filepath, '', '', exchanges)
+
+
+# =============================================================================
+# GROK TEXT PARSER - Plain text UI exports (JESSE/GROK speaker format)
+# =============================================================================
+
+# UI chrome patterns to filter from Grok text exports
+_GROK_UI_PATTERNS = [
+    re.compile(r'^To view keyboard shortcuts', re.IGNORECASE),
+    re.compile(r'^View keyboard shortcuts', re.IGNORECASE),
+    re.compile(r'^See new posts', re.IGNORECASE),
+    re.compile(r'^Grok \d', re.IGNORECASE),
+    re.compile(r'^DeepSearch$', re.IGNORECASE),
+    re.compile(r'^Think$', re.IGNORECASE),
+    re.compile(r'^Edit Image$', re.IGNORECASE),
+    re.compile(r'^Expand for details', re.IGNORECASE),
+    re.compile(r'^\d+ web pages?$', re.IGNORECASE),
+    re.compile(r'^\d+ sources?$', re.IGNORECASE),
+    re.compile(r'^Tap to read', re.IGNORECASE),
+    re.compile(r'^Show thinking', re.IGNORECASE),
+    re.compile(r'^Completed DeepSearch', re.IGNORECASE),
+    re.compile(r'^Thought for', re.IGNORECASE),
+    re.compile(r'^Searching for', re.IGNORECASE),
+    re.compile(r'^Browsing', re.IGNORECASE),
+    re.compile(r'^\d+\+$'),
+    re.compile(r'^File$'),
+]
+
+
+def parse_grok_text(filepath: str) -> List[Dict]:
+    """Parse Grok plain text transcript (UI export with speaker labels or alternating format)."""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    fname = Path(filepath).stem
+
+    # Extract conversation ID from filename (e.g., 01_grok-1888708959684735414.txt)
+    conv_id_match = re.search(r'grok-(\d+)', fname)
+    conv_id = f"grok-{conv_id_match.group(1)}" if conv_id_match else make_id('grok', fname)
+
+    lines = content.split('\n')
+
+    # Filter UI chrome
+    filtered = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            filtered.append('')
+            continue
+        is_noise = any(p.match(stripped) for p in _GROK_UI_PATTERNS)
+        if not is_noise:
+            filtered.append(stripped)
+
+    # Try speaker-label format first (JESSE: / GROK:)
+    messages = _try_speaker_label_parse(filtered)
+
+    # Fall back to alternating block heuristic
+    if not messages:
+        messages = _grok_alternating_blocks(filtered)
+
+    exchanges = _group_into_exchanges(messages, 'grok')
+
+    # Title from first user message
+    title = fname
+    if messages and messages[0].get('role') == 'user':
+        title = messages[0]['text'].split('\n')[0][:80]
+
+    return [_build_result('grok', conv_id, title, '', filepath, '', '', exchanges)]
+
+
+def _try_speaker_label_parse(lines: List[str]) -> List[Dict]:
+    """Parse lines with explicit JESSE:/GROK: speaker labels."""
+    messages = []
+    current_role = None
+    current_text = []
+    label_re = re.compile(r'^(JESSE|GROK|Jesse|Grok)\s*:\s*(.*)', re.IGNORECASE)
+
+    label_count = sum(1 for line in lines if label_re.match(line))
+    if label_count < 4:
+        return []  # Not speaker-label format
+
+    for line in lines:
+        m = label_re.match(line)
+        if m:
+            # Save previous message
+            if current_role and current_text:
+                messages.append({
+                    "role": current_role,
+                    "text": '\n'.join(current_text).strip(),
+                    "timestamp": "",
+                    "attachments": [],
+                })
+            speaker = m.group(1).upper()
+            current_role = 'user' if speaker == 'JESSE' else 'assistant'
+            rest = m.group(2).strip()
+            current_text = [rest] if rest else []
+        elif line.strip():
+            current_text.append(line)
+        # blank lines: continue current message
+
+    if current_role and current_text:
+        messages.append({
+            "role": current_role,
+            "text": '\n'.join(current_text).strip(),
+            "timestamp": "",
+            "attachments": [],
+        })
+
+    return messages
+
+
+def _grok_alternating_blocks(lines: List[str]) -> List[Dict]:
+    """Parse alternating user/Grok blocks separated by blank lines."""
+    blocks = []
+    current = []
+    for line in lines:
+        if line.strip():
+            current.append(line)
+        else:
+            if current:
+                blocks.append('\n'.join(current))
+                current = []
+    if current:
+        blocks.append('\n'.join(current))
+
+    messages = []
+    role = 'user'
+    current_text = []
+
+    for block in blocks:
+        if not block.strip():
+            continue
+
+        is_short_question = len(block) < 300 and '?' in block
+        starts_grok = block.startswith(('Jesse,', 'Hello', 'Alright', 'Given', 'Below'))
+
+        if role == 'user':
+            if starts_grok or (current_text and not is_short_question):
+                if current_text:
+                    messages.append({
+                        "role": "user",
+                        "text": '\n\n'.join(current_text).strip(),
+                        "timestamp": "",
+                        "attachments": [],
+                    })
+                current_text = [block]
+                role = 'assistant'
+            else:
+                current_text.append(block)
+        else:
+            if is_short_question and not block.startswith(('Yes', 'No', 'However')):
+                messages.append({
+                    "role": "assistant",
+                    "text": '\n\n'.join(current_text).strip(),
+                    "timestamp": "",
+                    "attachments": [],
+                })
+                current_text = [block]
+                role = 'user'
+            else:
+                current_text.append(block)
+
+    if current_text:
+        messages.append({
+            "role": role,
+            "text": '\n\n'.join(current_text).strip(),
+            "timestamp": "",
+            "attachments": [],
+        })
+
+    return messages
 
 
 # =============================================================================
@@ -676,6 +1635,267 @@ def _group_into_exchanges(messages: List[Dict], platform: str) -> List[Dict]:
     return exchanges
 
 
+def _group_into_exchanges_with_tools_and_metadata(messages: List[Dict], platform: str) -> List[Dict]:
+    """Group messages with tool and metadata extraction (for Grok, Claude Code).
+
+    Handles consecutive same-role messages by merging metadata properly:
+    - Consecutive assistant messages: merge into single response but preserve all metadata
+    - Orphaned assistant at start: create exchange with empty user prompt
+    - Orphaned user at end: create exchange with empty response
+    """
+    exchanges = []
+    current_user = None
+    current_responses = []
+    current_attachments = []
+    current_timestamp = ''
+    idx = 0
+
+    for msg in messages:
+        role = msg.get('role', '')
+
+        if role == 'user':
+            # Save previous exchange (if any) before starting new user message
+            if current_user is not None:
+                if current_responses:
+                    # Save previous user->assistant exchange
+                    resp_texts = []
+                    all_tools = []
+                    all_metadata = {}
+                    all_resp_attachments = []
+
+                    for r in current_responses:
+                        if r.get('text'):
+                            resp_texts.append(r['text'])
+                        all_tools.extend(r.get('_tools', []))
+                        all_resp_attachments.extend(r.get('attachments', []))
+
+                        # Merge metadata - preserve all thinking traces
+                        meta = r.get('_metadata', {})
+                        for k, v in meta.items():
+                            if k == 'thinking_trace':
+                                # Concatenate thinking traces if multiple
+                                if k in all_metadata:
+                                    all_metadata[k] += '\n\n---\n\n' + v
+                                else:
+                                    all_metadata[k] = v
+                            elif k not in all_metadata:
+                                all_metadata[k] = v
+
+                    resp_text = '\n'.join(resp_texts)
+                    file_refs = extract_file_references(current_user + '\n' + resp_text)
+
+                    # Extract file refs from tool inputs
+                    for tool in all_tools:
+                        inp = tool.get('input', {})
+                        fp = inp.get('file_path', '') or inp.get('path', '') or inp.get('command', '')
+                        if fp:
+                            refs = extract_file_references(fp)
+                            file_refs.extend(refs)
+                    file_refs = sorted(set(file_refs))
+
+                    # Combine user attachments and response attachments
+                    all_attachments = current_attachments + all_resp_attachments
+
+                    response_obj = {
+                        "text": resp_text,
+                        "tools": all_tools,
+                        "artifacts": extract_artifacts(resp_text),
+                    }
+                    if all_metadata:
+                        response_obj['metadata'] = all_metadata
+
+                    exchanges.append({
+                        "index": idx,
+                        "timestamp": current_timestamp,
+                        "user_prompt": current_user,
+                        "responses": [response_obj],
+                        "attachments": all_attachments,
+                        "file_references": file_refs,
+                    })
+                    idx += 1
+
+                else:
+                    # Consecutive user messages with no assistant response between
+                    # Save orphaned user message with empty response
+                    file_refs = extract_file_references(current_user)
+                    exchanges.append({
+                        "index": idx,
+                        "timestamp": current_timestamp,
+                        "user_prompt": current_user,
+                        "responses": [{"text": "", "tools": [], "artifacts": []}],
+                        "attachments": current_attachments,
+                        "file_references": file_refs,
+                    })
+                    idx += 1
+
+            elif not current_user and current_responses:
+                # Orphaned assistant messages at start - create exchange with empty user
+                resp_texts = []
+                all_tools = []
+                all_metadata = {}
+                all_resp_attachments = []
+
+                for r in current_responses:
+                    if r.get('text'):
+                        resp_texts.append(r['text'])
+                    all_tools.extend(r.get('_tools', []))
+                    all_resp_attachments.extend(r.get('attachments', []))
+                    meta = r.get('_metadata', {})
+                    for k, v in meta.items():
+                        if k == 'thinking_trace':
+                            if k in all_metadata:
+                                all_metadata[k] += '\n\n---\n\n' + v
+                            else:
+                                all_metadata[k] = v
+                        elif k not in all_metadata:
+                            all_metadata[k] = v
+
+                resp_text = '\n'.join(resp_texts)
+                file_refs = extract_file_references(resp_text)
+                for tool in all_tools:
+                    inp = tool.get('input', {})
+                    fp = inp.get('file_path', '') or inp.get('path', '') or inp.get('command', '')
+                    if fp:
+                        file_refs.extend(extract_file_references(fp))
+                file_refs = sorted(set(file_refs))
+
+                response_obj = {
+                    "text": resp_text,
+                    "tools": all_tools,
+                    "artifacts": extract_artifacts(resp_text),
+                }
+                if all_metadata:
+                    response_obj['metadata'] = all_metadata
+
+                exchanges.append({
+                    "index": idx,
+                    "timestamp": current_timestamp,
+                    "user_prompt": "",
+                    "responses": [response_obj],
+                    "attachments": all_resp_attachments,
+                    "file_references": file_refs,
+                })
+                idx += 1
+
+            # Start new user message
+            current_user = msg.get('text', '')
+            current_responses = []
+            current_attachments = msg.get('attachments', [])
+            current_timestamp = msg.get('timestamp', '')
+
+        elif role == 'assistant':
+            current_responses.append(msg)
+
+    # Save last exchange
+    if current_user is not None and current_responses:
+        resp_texts = []
+        all_tools = []
+        all_metadata = {}
+        all_resp_attachments = []
+
+        for r in current_responses:
+            if r.get('text'):
+                resp_texts.append(r['text'])
+            all_tools.extend(r.get('_tools', []))
+            all_resp_attachments.extend(r.get('attachments', []))
+            meta = r.get('_metadata', {})
+            for k, v in meta.items():
+                if k == 'thinking_trace':
+                    if k in all_metadata:
+                        all_metadata[k] += '\n\n---\n\n' + v
+                    else:
+                        all_metadata[k] = v
+                elif k not in all_metadata:
+                    all_metadata[k] = v
+
+        resp_text = '\n'.join(resp_texts)
+        file_refs = extract_file_references(current_user + '\n' + resp_text)
+        for tool in all_tools:
+            inp = tool.get('input', {})
+            fp = inp.get('file_path', '') or inp.get('path', '') or inp.get('command', '')
+            if fp:
+                file_refs.extend(extract_file_references(fp))
+        file_refs = sorted(set(file_refs))
+
+        all_attachments = current_attachments + all_resp_attachments
+
+        response_obj = {
+            "text": resp_text,
+            "tools": all_tools,
+            "artifacts": extract_artifacts(resp_text),
+        }
+        if all_metadata:
+            response_obj['metadata'] = all_metadata
+
+        exchanges.append({
+            "index": idx,
+            "timestamp": current_timestamp,
+            "user_prompt": current_user,
+            "responses": [response_obj],
+            "attachments": all_attachments,
+            "file_references": file_refs,
+        })
+    elif not current_user and current_responses:
+        # Orphaned assistant at end
+        resp_texts = []
+        all_tools = []
+        all_metadata = {}
+        all_resp_attachments = []
+
+        for r in current_responses:
+            if r.get('text'):
+                resp_texts.append(r['text'])
+            all_tools.extend(r.get('_tools', []))
+            all_resp_attachments.extend(r.get('attachments', []))
+            meta = r.get('_metadata', {})
+            for k, v in meta.items():
+                if k == 'thinking_trace':
+                    if k in all_metadata:
+                        all_metadata[k] += '\n\n---\n\n' + v
+                    else:
+                        all_metadata[k] = v
+                elif k not in all_metadata:
+                    all_metadata[k] = v
+
+        resp_text = '\n'.join(resp_texts)
+        file_refs = extract_file_references(resp_text)
+        for tool in all_tools:
+            inp = tool.get('input', {})
+            fp = inp.get('file_path', '') or inp.get('path', '') or inp.get('command', '')
+            if fp:
+                file_refs.extend(extract_file_references(fp))
+        file_refs = sorted(set(file_refs))
+
+        response_obj = {
+            "text": resp_text,
+            "tools": all_tools,
+            "artifacts": extract_artifacts(resp_text),
+        }
+        if all_metadata:
+            response_obj['metadata'] = all_metadata
+
+        exchanges.append({
+            "index": idx,
+            "timestamp": current_timestamp or (current_responses[0].get('timestamp', '') if current_responses else ''),
+            "user_prompt": "",
+            "responses": [response_obj],
+            "attachments": all_resp_attachments,
+            "file_references": file_refs,
+        })
+    elif current_user and not current_responses:
+        # Orphaned user message at end - create exchange with empty response
+        exchanges.append({
+            "index": idx,
+            "timestamp": current_timestamp,
+            "user_prompt": current_user,
+            "responses": [{"text": "", "tools": [], "artifacts": []}],
+            "attachments": current_attachments,
+            "file_references": extract_file_references(current_user),
+        })
+
+    return exchanges
+
+
 def _group_into_exchanges_with_tools(messages: List[Dict], platform: str) -> List[Dict]:
     """Group messages with tool extraction (for Claude Code)."""
     exchanges = []
@@ -803,6 +2023,18 @@ def detect_and_parse(filepath: str) -> List[Dict]:
     if fp.suffix == '.jsonl':
         return parse_claude_code_jsonl(filepath)
 
+    # Plain text Grok transcripts
+    if fp.suffix == '.txt':
+        # Check if it's a Grok text transcript
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                first_lines = f.read(2000)
+            if 'grok' in fname or 'GROK' in first_lines[:500] or 'Grok' in first_lines[:500]:
+                return parse_grok_text(filepath)
+        except Exception:
+            pass
+        return []
+
     # Must be JSON
     if fp.suffix != '.json':
         return []
@@ -831,6 +2063,9 @@ def detect_and_parse(filepath: str) -> List[Dict]:
 
     # Single conversation object
     if isinstance(data, dict):
+        # Grok master bulk: {"conversations": [...]}
+        if 'conversations' in data:
+            return parse_grok_bulk(filepath)
         # Individual export: has 'messages' and 'title'
         if 'messages' in data and 'title' in data:
             return parse_individual_export(filepath)
