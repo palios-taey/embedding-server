@@ -1087,17 +1087,17 @@ def _calculate_thinking_duration(start_time, end_time) -> Optional[int]:
         return None
 
 
-def _parse_grok_format_c(conv_wrapper: Dict, filepath: str) -> Optional[Dict]:
-    """Grok Format C: Master bulk export {"conversations": [{"conversation": {...}, "responses": [...]}]}.
+def _parse_grok_format_c(conv_wrapper: Dict, filepath: str, asset_dir: Optional[Path]) -> Optional[Dict]:
+    """Grok Format C: Master bulk export - FULL extraction.
 
-    Handles:
-    - MongoDB timestamps: {"$date": {"$numberLong": "ms"}}
-    - ISO 8601 timestamps: "2025-06-03T16:26:30.954604Z"
-    - file_attachments as list of UUIDs
-    - thinking_trace extraction
-    - steps[] for web search
-    - model field (grok-3, grok-4, grok-4-heavy)
-    - parent_response_id for tree ordering
+    Captures:
+    - Asset file content (read from disk)
+    - Steps: tagged_text, web_search_results, rag_results, tool_usage_results
+    - card_attachments_json (parsed as citations)
+    - xpost_ids
+    - web_search_results (top-level and cited)
+    - thinking timing
+    - metadata.requestModelDetails
     """
     conv_meta = conv_wrapper.get('conversation', {})
     conv_id = conv_meta.get('id') or conv_meta.get('conversation_id') or make_id('grok', filepath)
@@ -1115,13 +1115,12 @@ def _parse_grok_format_c(conv_wrapper: Dict, filepath: str) -> Optional[Dict]:
         if resp_id:
             response_map[resp_id] = resp
 
-    # Traverse tree starting from messages with no parent (or parent not in tree)
-    # Build ordered list following parent_response_id chain
+    # Traverse tree
     messages = []
     processed = set()
 
     def add_message(resp: Dict):
-        """Convert response object to message."""
+        """Convert response object to message with FULL extraction."""
         resp_id = resp.get('_id') or resp.get('response_id')
         if resp_id in processed:
             return
@@ -1130,30 +1129,115 @@ def _parse_grok_format_c(conv_wrapper: Dict, filepath: str) -> Optional[Dict]:
         text = resp.get('message', '')
         sender = resp.get('sender', '')
         ts = ensure_iso(resp.get('create_time'))
-        model = resp.get('model', '')
 
-        # Normalize sender: "human", "assistant", "ASSISTANT" (case insensitive)
+        # Model: try response.model first, fall back to metadata.requestModelDetails
+        model = resp.get('model', '')
+        if not model:
+            metadata = resp.get('metadata', {})
+            if isinstance(metadata, dict):
+                req_model = metadata.get('requestModelDetails', {})
+                if isinstance(req_model, dict):
+                    model = req_model.get('modelId', '')
+
         role = 'user' if sender.lower() == 'human' else 'assistant'
 
-        # Extract attachments (UUIDs)
+        # === ATTACHMENTS: Read actual asset content ===
         attachments = []
         file_att_uuids = resp.get('file_attachments', [])
         for uuid in file_att_uuids:
-            attachments.append({
-                "name": f"grok_asset_{uuid[:8]}",
-                "size": 0,
-                "mime_type": "application/octet-stream",
+            content = _read_asset_content(asset_dir, uuid)
+            att = {
                 "type": "grok_asset",
                 "uuid": uuid,
-            })
+                "name": f"grok_asset_{uuid[:8]}",
+            }
+            if content:
+                att["content"] = content
+                att["size"] = len(content)
+            else:
+                att["size"] = 0
+            att["mime_type"] = "application/octet-stream"
+            attachments.append(att)
 
-        # Extract thinking trace
+        # === THINKING ===
         thinking = resp.get('thinking_trace', '')
+        thinking_start = resp.get('thinking_start_time')
+        thinking_end = resp.get('thinking_end_time')
+        thinking_duration = _calculate_thinking_duration(thinking_start, thinking_end)
 
-        # Extract web search steps
+        # === STEPS: Full extraction ===
         steps = resp.get('steps', [])
+        tools = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
 
-        # Build message object
+            # Extract tagged_text
+            tagged_text = step.get('tagged_text', {})
+            if tagged_text:
+                tools.append({
+                    "type": "reasoning_step",
+                    "header": tagged_text.get('header', ''),
+                    "summary": tagged_text.get('summary', ''),
+                    "tagged_text": tagged_text,
+                })
+
+            # Extract web_search_results from step
+            step_web = step.get('web_search_results', [])
+            if step_web:
+                tools.append({
+                    "type": "step_web_search",
+                    "results": step_web,
+                })
+
+            # Extract rag_results
+            rag = step.get('rag_results', [])
+            if rag:
+                tools.append({
+                    "type": "rag_results",
+                    "results": rag,
+                })
+
+            # Extract tool_usage_results
+            tool_usage = step.get('tool_usage_results', [])
+            if tool_usage:
+                tools.append({
+                    "type": "tool_usage",
+                    "results": tool_usage,
+                })
+
+        # === CITATIONS ===
+        citations = []
+
+        # card_attachments_json (X/Twitter citations)
+        cards_json = resp.get('card_attachments_json', [])
+        if cards_json:
+            card_citations = _parse_card_attachments(cards_json)
+            citations.extend(card_citations)
+
+        # xpost_ids
+        xpost_ids = resp.get('xpost_ids', [])
+        x_references = xpost_ids if xpost_ids else []
+
+        # === WEB SEARCH RESULTS ===
+        web_search_results = resp.get('web_search_results', [])
+        cited_web_search_results = resp.get('cited_web_search_results', [])
+
+        # Build message metadata
+        msg_metadata = {}
+        if thinking:
+            msg_metadata['thinking_trace'] = thinking
+        if thinking_duration is not None:
+            msg_metadata['thinking_duration_ms'] = thinking_duration
+        if web_search_results:
+            msg_metadata['web_search_results'] = web_search_results
+        if cited_web_search_results:
+            msg_metadata['cited_web_search_results'] = cited_web_search_results
+        if x_references:
+            msg_metadata['x_references'] = x_references
+        if citations:
+            msg_metadata['citations'] = citations
+
         msg = {
             "role": role,
             "text": text.strip() if text else '',
@@ -1162,69 +1246,47 @@ def _parse_grok_format_c(conv_wrapper: Dict, filepath: str) -> Optional[Dict]:
             "model": model,
             "_response_id": resp_id,
             "_parent_id": resp.get('parent_response_id'),
+            "_metadata": msg_metadata,
+            "_tools": tools,
         }
-
-        # Store metadata and tools
-        metadata = {}
-        tools = []
-
-        if thinking:
-            metadata['thinking_trace'] = thinking
-
-        if steps:
-            for step in steps:
-                if isinstance(step, dict):
-                    tools.append({
-                        "type": "web_search",
-                        "input": step,
-                    })
-
-        msg['_metadata'] = metadata
-        msg['_tools'] = tools
 
         messages.append(msg)
 
-    # First pass: Find root messages (no parent or parent not in map)
+    # Process tree
     roots = []
     for resp in response_map.values():
         parent_id = resp.get('parent_response_id')
         if not parent_id or parent_id not in response_map:
             roots.append(resp)
 
-    # Sort roots by timestamp
     roots.sort(key=lambda r: ensure_iso(r.get('create_time')) or '')
 
-    # Process tree in BFS order (depth-first would also work)
-    # For simplicity, we'll process in the order parent_response_id chains suggest
     for root in roots:
         queue = [root]
         while queue:
             current = queue.pop(0)
             add_message(current)
-
-            # Find children (responses with parent_response_id == current._id)
             current_id = current.get('_id') or current.get('response_id')
             children = [r for r in response_map.values()
                        if r.get('parent_response_id') == current_id]
-            # Sort children by timestamp
             children.sort(key=lambda r: ensure_iso(r.get('create_time')) or '')
             queue.extend(children)
 
-    # Group into exchanges with tool extraction
+    # Group into exchanges (preserves all metadata)
     exchanges = _group_into_exchanges_with_tools_and_metadata(messages, 'grok')
 
-    # Detect model from first assistant message with model field
+    # Detect model
     detected_model = ''
     for msg in messages:
-        if msg.get('role') == 'assistant' and msg.get('model'):
+        if msg.get('model'):
             detected_model = msg['model']
             break
 
     return _build_result('grok', conv_id, title, detected_model, filepath, created, updated, exchanges)
 
 
-def _parse_grok_format_a(data: Dict, filepath: str) -> Optional[Dict]:
-    """Grok Format A: responses[] array (conversations_old files)."""
+def _parse_grok_format_a(data: Dict, filepath: str, asset_dir: Optional[Path]) -> Optional[Dict]:
+    """Grok Format A: responses[] array - FULL extraction."""
     conv_meta = data.get('conversation', {})
     conv_id = conv_meta.get('conversation_id') or conv_meta.get('id') or make_id('grok', filepath)
     title = conv_meta.get('title', 'Untitled')
@@ -1237,35 +1299,107 @@ def _parse_grok_format_a(data: Dict, filepath: str) -> Optional[Dict]:
         text = resp.get('message', '')
         sender = resp.get('sender', '')
         ts = ensure_iso(resp.get('create_time'))
+
+        # Model extraction
         model = resp.get('model', '')
+        if not model:
+            metadata = resp.get('metadata', {})
+            if isinstance(metadata, dict):
+                req_model = metadata.get('requestModelDetails', {})
+                if isinstance(req_model, dict):
+                    model = req_model.get('modelId', '')
 
         role = 'user' if sender.lower() == 'human' else 'assistant'
 
-        # Extract attachments
+        # === ATTACHMENTS with content ===
         attachments = []
         for uuid in resp.get('file_attachments', []):
-            attachments.append({
-                "name": f"grok_asset_{uuid[:8]}",
-                "size": 0,
-                "mime_type": "application/octet-stream",
+            content = _read_asset_content(asset_dir, uuid)
+            att = {
                 "type": "grok_asset",
                 "uuid": uuid,
-            })
+                "name": f"grok_asset_{uuid[:8]}",
+            }
+            if content:
+                att["content"] = content
+                att["size"] = len(content)
+            else:
+                att["size"] = 0
+            att["mime_type"] = "application/octet-stream"
+            attachments.append(att)
 
-        # Extract thinking trace and steps
+        # === THINKING ===
         thinking = resp.get('thinking_trace', '')
+        thinking_start = resp.get('thinking_start_time')
+        thinking_end = resp.get('thinking_end_time')
+        thinking_duration = _calculate_thinking_duration(thinking_start, thinking_end)
+
+        # === STEPS ===
         steps = resp.get('steps', [])
-
-        metadata = {}
         tools = []
-        if thinking:
-            metadata['thinking_trace'] = thinking
-        if steps:
-            for step in steps:
-                if isinstance(step, dict):
-                    tools.append({"type": "web_search", "input": step})
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
 
-        # Handle sub-messages (Grok delimiter) - but preserve metadata on first
+            tagged_text = step.get('tagged_text', {})
+            if tagged_text:
+                tools.append({
+                    "type": "reasoning_step",
+                    "header": tagged_text.get('header', ''),
+                    "summary": tagged_text.get('summary', ''),
+                    "tagged_text": tagged_text,
+                })
+
+            step_web = step.get('web_search_results', [])
+            if step_web:
+                tools.append({
+                    "type": "step_web_search",
+                    "results": step_web,
+                })
+
+            rag = step.get('rag_results', [])
+            if rag:
+                tools.append({
+                    "type": "rag_results",
+                    "results": rag,
+                })
+
+            tool_usage = step.get('tool_usage_results', [])
+            if tool_usage:
+                tools.append({
+                    "type": "tool_usage",
+                    "results": tool_usage,
+                })
+
+        # === CITATIONS ===
+        citations = []
+        cards_json = resp.get('card_attachments_json', [])
+        if cards_json:
+            citations.extend(_parse_card_attachments(cards_json))
+
+        xpost_ids = resp.get('xpost_ids', [])
+        x_references = xpost_ids if xpost_ids else []
+
+        # === WEB SEARCH ===
+        web_search_results = resp.get('web_search_results', [])
+        cited_web_search_results = resp.get('cited_web_search_results', [])
+
+        # Build metadata
+        msg_metadata = {}
+        if thinking:
+            msg_metadata['thinking_trace'] = thinking
+        if thinking_duration is not None:
+            msg_metadata['thinking_duration_ms'] = thinking_duration
+        if web_search_results:
+            msg_metadata['web_search_results'] = web_search_results
+        if cited_web_search_results:
+            msg_metadata['cited_web_search_results'] = cited_web_search_results
+        if x_references:
+            msg_metadata['x_references'] = x_references
+        if citations:
+            msg_metadata['citations'] = citations
+
+        # Handle sub-messages (preserve metadata on first only)
         sub_msgs = text.split('\n\n---\n\n') if '\n\n---\n\n' in text else [text]
         for idx, sub in enumerate(sub_msgs):
             sub = sub.strip()
@@ -1276,14 +1410,13 @@ def _parse_grok_format_a(data: Dict, filepath: str) -> Optional[Dict]:
                     "timestamp": ts,
                     "attachments": attachments if idx == 0 else [],
                     "model": model,
-                    "_metadata": metadata if idx == 0 else {},
+                    "_metadata": msg_metadata if idx == 0 else {},
                     "_tools": tools if idx == 0 else [],
                 }
                 messages.append(msg)
 
     exchanges = _group_into_exchanges_with_tools_and_metadata(messages, 'grok')
 
-    # Detect model
     detected_model = ''
     for msg in messages:
         if msg.get('model'):
