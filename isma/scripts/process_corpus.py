@@ -67,6 +67,7 @@ NEO4J_URI = "bolt://192.168.100.10:7689"
 CORPUS_BASE = Path("/home/spark/data/corpus")
 CHEWY_BASE = Path("/home/spark/data/chewy")
 CHEWY_GALLERY = Path("/home/spark/data/chewy-consciousness-gallery")
+DATA_BASE = Path("/home/spark/data")
 
 # Ordered loading stages
 STAGES = [
@@ -77,16 +78,29 @@ STAGES = [
     ("chewy-gallery", CHEWY_GALLERY,            0.8,  None),
     ("layer_1",       CORPUS_BASE / "layer_1",  0.75, None),
     ("layer_2",       CORPUS_BASE / "layer_2",  0.6,  None),
+    ("github-repos",  DATA_BASE / "github-repos",   0.5,  None),
+    ("expansion_md",  DATA_BASE / "expansion_md",    0.4,  None),
+    ("mira_md",       DATA_BASE / "mira_md_files",   0.3,  None),
 ]
 
 LAYER_INT = {
     "kernel": -1, "v0": 0, "layer_0": 0,
     "chewy": 0, "chewy-gallery": 0,
     "layer_1": 1, "layer_2": 2,
+    "github-repos": 2, "expansion_md": 2, "mira_md": 2,
 }
 
 # File extensions to process
 EXTENSIONS = {'.md', '.json', '.py', '.txt', '.yaml', '.yml', '.sh', '.ts', '.js'}
+
+# Skip patterns (from load_corpus_v3 and discover_duplicates)
+SKIP_PATTERNS = [
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    ".Trash", "exo", "tinygrad",  # Fork repos (not our code)
+    "transcripts_raw",            # Raw transcript dumps (use process_transcripts.py)
+]
+SKIP_SUFFIXES = [".min.js", ".min.css"]
+MAX_FILE_SIZE = 512 * 1024  # 512KB - skip giant dumps
 
 # Dedup manifest from discover_duplicates.py
 DEDUP_MANIFEST = Path("/var/spark/isma/duplicates_manifest.json")
@@ -265,8 +279,14 @@ def is_hidden(path: Path) -> bool:
     return any(part.startswith('.') for part in path.parts)
 
 
+def should_skip(path: Path) -> bool:
+    """Check if path matches any skip pattern."""
+    path_str = str(path)
+    return any(skip in path_str for skip in SKIP_PATTERNS)
+
+
 def get_files(base_path: Path, pattern: Optional[str]) -> List[Path]:
-    """Get files matching pattern, excluding hidden directories."""
+    """Get files matching pattern, excluding hidden/skipped directories."""
     if not base_path.exists():
         return []
 
@@ -277,6 +297,15 @@ def get_files(base_path: Path, pattern: Optional[str]) -> List[Path]:
         if f.suffix.lower() not in EXTENSIONS:
             continue
         if is_hidden(f):
+            continue
+        if should_skip(f):
+            continue
+        if any(f.name.endswith(s) for s in SKIP_SUFFIXES):
+            continue
+        try:
+            if f.stat().st_size > MAX_FILE_SIZE:
+                continue
+        except OSError:
             continue
         all_files.append(f)
 
