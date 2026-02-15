@@ -969,6 +969,15 @@ def _group_into_exchanges_claude_enhanced(messages: List[Dict], platform: str) -
 #   A: responses[] with conversation metadata (conversations_old files)
 #   B: conversation.messages[] array (alternative individual format)
 #   C: {"conversations": [...]} master bulk export (prod-grok-backend.json)
+#
+# Enhanced to capture ALL data:
+#   - Asset file content (read from prod-mc-asset-server/{uuid}/content)
+#   - Steps tagged_text, web_search_results, rag_results, tool_usage_results
+#   - card_attachments_json (X/Twitter citations)
+#   - xpost_ids (X post references)
+#   - web_search_results (top-level and cited)
+#   - thinking timing (start/end timestamps)
+#   - metadata.requestModelDetails
 # =============================================================================
 
 def parse_grok_bulk(filepath: str) -> List[Dict]:
@@ -976,11 +985,19 @@ def parse_grok_bulk(filepath: str) -> List[Dict]:
     with open(filepath) as f:
         data = json.load(f)
 
+    # Determine asset directory (if it exists)
+    asset_dir = None
+    file_path = Path(filepath)
+    # Check for prod-mc-asset-server in parent directories
+    potential_asset_dir = file_path.parent / 'prod-mc-asset-server'
+    if potential_asset_dir.exists() and potential_asset_dir.is_dir():
+        asset_dir = potential_asset_dir
+
     # Format C: Master bulk export with {"conversations": [...]}
     if isinstance(data, dict) and 'conversations' in data:
         results = []
         for conv_wrapper in data['conversations']:
-            result = _parse_grok_format_c(conv_wrapper, filepath)
+            result = _parse_grok_format_c(conv_wrapper, filepath, asset_dir)
             if result:
                 results.append(result)
         return results
@@ -997,7 +1014,7 @@ def parse_grok_bulk(filepath: str) -> List[Dict]:
     for conv_data in conversations:
         # Format A: responses[] with conversation metadata
         if 'responses' in conv_data:
-            result = _parse_grok_format_a(conv_data, filepath)
+            result = _parse_grok_format_a(conv_data, filepath, asset_dir)
             if result:
                 results.append(result)
         # Format B: conversation.messages[]
@@ -1009,6 +1026,65 @@ def parse_grok_bulk(filepath: str) -> List[Dict]:
                     results.append(result)
 
     return results
+
+
+def _read_asset_content(asset_dir: Optional[Path], uuid: str) -> Optional[str]:
+    """Read asset file content from prod-mc-asset-server/{uuid}/content."""
+    if not asset_dir or not uuid:
+        return None
+
+    content_path = asset_dir / uuid / 'content'
+    if not content_path.exists():
+        return None
+
+    try:
+        with open(content_path, 'r', encoding='utf-8', errors='ignore') as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _parse_card_attachments(cards_json_list: List[str]) -> List[Dict]:
+    """Parse card_attachments_json (list of JSON strings) into structured data."""
+    citations = []
+    for card_str in cards_json_list:
+        try:
+            card = json.loads(card_str) if isinstance(card_str, str) else card_str
+            if isinstance(card, dict):
+                citations.append({
+                    "id": card.get('id', ''),
+                    "type": card.get('cardType', ''),
+                    "url": card.get('url', ''),
+                })
+        except json.JSONDecodeError:
+            continue
+    return citations
+
+
+def _calculate_thinking_duration(start_time, end_time) -> Optional[int]:
+    """Calculate thinking duration in milliseconds from MongoDB timestamps."""
+    if not start_time or not end_time:
+        return None
+
+    try:
+        # Extract milliseconds from MongoDB format
+        if isinstance(start_time, dict) and '$date' in start_time:
+            start_ms = int(start_time['$date']['$numberLong'])
+        elif isinstance(start_time, (int, float)):
+            start_ms = int(start_time)
+        else:
+            return None
+
+        if isinstance(end_time, dict) and '$date' in end_time:
+            end_ms = int(end_time['$date']['$numberLong'])
+        elif isinstance(end_time, (int, float)):
+            end_ms = int(end_time)
+        else:
+            return None
+
+        return end_ms - start_ms
+    except (KeyError, ValueError, TypeError):
+        return None
 
 
 def _parse_grok_format_c(conv_wrapper: Dict, filepath: str) -> Optional[Dict]:
