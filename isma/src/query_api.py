@@ -28,6 +28,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from dataclasses import asdict
+import json
+import logging
+import os
+import sys
+import tempfile
 import time
 
 from isma.src.retrieval import ISMARetrieval, TileResult, SearchResult
@@ -106,6 +111,12 @@ class BM25Request(BaseModel):
     top_k: int = Field(default=10, ge=1, le=100)
     platform: Optional[str] = None
     source_type: Optional[str] = None
+
+
+class HMMStoreRequest(BaseModel):
+    platform: str
+    content: str
+    pkg_id: Optional[str] = None
 
 
 # ── Helpers ─────────────────────────────────────────────────────
@@ -317,3 +328,86 @@ def list_documents(
         "limit": limit,
         "documents": [asdict(d) for d in docs],
     }
+
+
+# ── HMM Store Endpoint ────────────────────────────────────────
+
+_hmm_store_imported = False
+_process_response = None
+
+def _get_process_response():
+    """Lazy import of hmm_store_results.process_response."""
+    global _hmm_store_imported, _process_response
+    if not _hmm_store_imported:
+        scripts_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "scripts",
+        )
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from hmm_store_results import process_response
+        _process_response = process_response
+        _hmm_store_imported = True
+    return _process_response
+
+
+@app.post("/hmm/store-response")
+def hmm_store_response(req: HMMStoreRequest):
+    """Store HMM enrichment response in Weaviate + Neo4j + Redis.
+
+    Accepts raw AI response JSON from enrichment runs and calls
+    hmm_store_results.process_response() for the triple-write.
+    """
+    log = logging.getLogger("hmm-store")
+
+    # Validate content is parseable JSON
+    try:
+        parsed = json.loads(req.content)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Content is not valid JSON: {e}"}
+
+    # Extract pkg_id from response if not provided
+    pkg_id = req.pkg_id or parsed.get("package_id", f"api_{int(time.time())}")
+
+    # Write to temp file (process_response expects a file path)
+    response_dir = "/var/spark/isma/hmm_responses"
+    os.makedirs(response_dir, exist_ok=True)
+
+    # Also save a permanent copy for audit trail
+    safe_pkg = pkg_id.replace("/", "_")[:60]
+    permanent_path = os.path.join(response_dir, f"{safe_pkg}_{req.platform}.json")
+
+    try:
+        with open(permanent_path, "w") as f:
+            json.dump(parsed, f)
+        log.info(f"Saved response to {permanent_path}")
+    except Exception as e:
+        log.warning(f"Failed to save permanent copy: {e}")
+        # Fall back to temp file
+        fd, permanent_path = tempfile.mkstemp(suffix=".json", dir=response_dir)
+        with os.fdopen(fd, "w") as f:
+            json.dump(parsed, f)
+
+    # Call the triple-write
+    try:
+        process_fn = _get_process_response()
+        result = process_fn(
+            permanent_path,
+            platform=req.platform,
+            pkg_id=pkg_id,
+        )
+        log.info(f"HMM store result: {result}")
+        return {
+            "success": result.get("success", False),
+            "parsed": result.get("parsed", 0),
+            "stored": result.get("stored", 0),
+            "pkg_id": pkg_id,
+            "file": permanent_path,
+        }
+    except Exception as e:
+        log.error(f"HMM store failed: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "file": permanent_path,
+        }
