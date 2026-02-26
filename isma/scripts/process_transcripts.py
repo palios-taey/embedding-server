@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-ISMA File-Based Transcript Processor
+ISMA File-Based Transcript Processor v2
 
-Reads converted JSON transcript files from disk, normalizes schemas,
+Reads enriched parsed transcript files from disk, normalizes schemas,
 tiles exchanges, embeds tiles independently, stores to Weaviate.
 
 Architecture:
@@ -12,10 +12,14 @@ Architecture:
   No session batching. Nothing held on GPUs. Once processed, it leaves.
 
 Input schemas handled:
-  Schema A (ChatGPT, Gemini, Grok, Claude Chat web):
-    - sessionId, exchanges[].user_prompt, exchanges[].responses[].text
-  Schema B (Claude Code, Perplexity):
-    - conversation_id, exchanges[].prompt, exchanges[].response (singular)
+  Schema A (ChatGPT, Gemini, Grok, Claude Chat):
+    - platform, conversation_id, exchanges[].user_prompt, exchanges[].responses[]
+    - responses[] contains: text, artifacts[], tools[], metadata{}
+  Schema B (Perplexity):
+    - source, conversation_id, exchanges[].prompt, exchanges[].response
+  Schema C (Claude Code):
+    - platform, conversation_id, exchanges[].role, exchanges[].content
+    - Flat message list - pair consecutive user/assistant into exchanges
 
 Usage:
     python3 process_transcripts.py --check
@@ -45,7 +49,7 @@ from urllib3.util.retry import Retry
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -59,16 +63,16 @@ EMBEDDING_URL = "http://192.168.100.10:8091/v1/embeddings"
 EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
 WEAVIATE_URL = "http://192.168.100.10:8088"
 
-# Default transcript directory
-DEFAULT_TRANSCRIPT_DIR = "/home/spark/builder-taey/family_transcripts/converted"
+# Default transcript directory (updated to new enriched format)
+DEFAULT_TRANSCRIPT_DIR = "/home/spark/data/transcripts/parsed"
 
 # Pipeline sizing - maximize GPU saturation across 3 Sparks
 READER_THREADS = 4       # File readers feeding tiles into queue
 EMBED_WORKERS = 8        # Threads pulling from tile_queue, posting to 3 GPUs via LB
-EMBED_BATCH = 32         # Tiles per GPU request (small, fast, no holds)
+EMBED_BATCH = 16         # Tiles per GPU request (vLLM v1 engine bugs out at >20)
 STORE_WORKERS = 2        # Threads pulling from store_queue, writing Weaviate
 WEAVIATE_BATCH = 100     # Objects per Weaviate batch insert
-MAX_EMBED_CHARS = 8192 * 4  # Safety limit per tile text
+MAX_EMBED_CHARS = None       # No truncation - vLLM max_model_len handles limits
 
 # Queue sizes (backpressure: readers block when queues are full)
 TILE_QUEUE_SIZE = 512    # Tiles waiting to be embedded
@@ -79,8 +83,8 @@ TILE_UUID_NAMESPACE = uuid.UUID('a1b2c3d4-e5f6-7890-abcd-ef1234567890')
 
 # Progress
 PROGRESS_DIR = Path("/var/spark/isma")
-PROGRESS_FILE = PROGRESS_DIR / "transcript_progress.json"
-HASHES_FILE = PROGRESS_DIR / "transcript_hashes.json"
+PROGRESS_FILE = PROGRESS_DIR / "transcript_progress_v2.json"
+HASHES_FILE = PROGRESS_DIR / "transcript_hashes_v2.json"
 
 # =============================================================================
 # SHUTDOWN / FATAL
@@ -111,19 +115,105 @@ signal.signal(signal.SIGINT, _handle_signal)
 # Sentinel
 _POISON = None
 
+
+# =============================================================================
+# CIRCUIT BREAKER - shared across all embed workers
+# =============================================================================
+
+class _CircuitBreaker:
+    """When one worker detects backend down, all workers wait together."""
+    def __init__(self, recovery_time=150.0):
+        self._lock = threading.Lock()
+        self._down_since = None
+        self._recovery_time = recovery_time  # > 120s container restart
+
+    def report_down(self):
+        with self._lock:
+            if self._down_since is None:
+                self._down_since = time.monotonic()
+                print("  [circuit] OPEN - backend down, workers will wait", flush=True)
+
+    def report_up(self):
+        with self._lock:
+            if self._down_since is not None:
+                elapsed = time.monotonic() - self._down_since
+                self._down_since = None
+                print(f"  [circuit] CLOSED - backend recovered after {elapsed:.0f}s", flush=True)
+
+    def wait_if_open(self, probe_interval=15.0):
+        """If circuit open, sleep until near end of recovery window."""
+        with self._lock:
+            if self._down_since is None:
+                return
+            elapsed = time.monotonic() - self._down_since
+            remaining = self._recovery_time - elapsed
+        if remaining > probe_interval:
+            time.sleep(remaining - probe_interval)
+
+_circuit = _CircuitBreaker(recovery_time=150.0)
+
+
+def _embed_batch_with_retry(session, texts, batch, name, stats, stats_lock):
+    """Embed a batch. Any non-200 is retried. Nothing is ever skipped."""
+    try:
+        r = session.post(EMBEDDING_URL, json={
+            "model": EMBEDDING_MODEL, "input": texts,
+        }, timeout=120)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        return "retry", batch
+    except Exception as e:
+        return "error", batch
+
+    if r.status_code == 200:
+        _circuit.report_up()
+        data = r.json()["data"]
+        embeddings = [item["embedding"]
+                      for item in sorted(data, key=lambda x: x["index"])]
+        return embeddings, batch
+    elif r.status_code in (400, 502, 503, 504):
+        if r.status_code == 400:
+            try:
+                msg = r.json().get("error", {}).get("message", "")[:100]
+            except Exception:
+                msg = r.text[:100]
+            print(f"  [{name}] Embed 400: {msg} - will retry", flush=True)
+        return "retry", batch
+    else:
+        return "fatal", batch
+
+
 # =============================================================================
 # DATA TYPES
 # =============================================================================
 
 
 @dataclass
+class EnrichedExchange:
+    """Normalized exchange with all searchable content."""
+    user_text: str
+    assistant_text: str
+    artifacts: List[Dict[str, Any]] = field(default_factory=list)
+    thinking: str = ""
+    tools: List[Dict[str, Any]] = field(default_factory=list)
+    model: str = ""
+    timestamp: str = ""
+    has_artifacts: bool = False
+    artifact_count: int = 0
+    has_thinking: bool = False
+
+
+@dataclass
 class TileWork:
     """A tile ready to be embedded."""
     tile: MultiScaleTile
-    session_id: str
+    conversation_id: str
     platform: str
     content_hash: str
     source_file: str
+    model: str
+    has_artifacts: bool
+    artifact_count: int
+    has_thinking: bool
 
 
 @dataclass
@@ -131,10 +221,14 @@ class EmbeddedTile:
     """A tile with its embedding, ready to be stored."""
     tile: MultiScaleTile
     embedding: List[float]
-    session_id: str
+    conversation_id: str
     platform: str
     content_hash: str
     source_file: str
+    model: str
+    has_artifacts: bool
+    artifact_count: int
+    has_thinking: bool
 
 # =============================================================================
 # HTTP (thread-local sessions - requests.Session is NOT thread-safe)
@@ -161,15 +255,29 @@ def tile_uuid(content_hash: str, scale: str, index: int) -> str:
     """Deterministic UUID for a tile. Same content → same UUID (idempotent)."""
     return str(uuid.uuid5(TILE_UUID_NAMESPACE, f"{content_hash}:{scale}:{index}"))
 
+
+def make_uuid(text: str) -> str:
+    """Convert non-UUID string to deterministic UUID using uuid5."""
+    try:
+        uuid.UUID(text)
+        return text
+    except (ValueError, AttributeError):
+        return str(uuid.uuid5(TILE_UUID_NAMESPACE, text or "unknown"))
+
 # =============================================================================
 # SCHEMA NORMALIZATION
 # =============================================================================
 
 
-def detect_platform(filepath: str) -> str:
-    """Detect platform from directory path."""
+def detect_platform(filepath: str, data: dict) -> str:
+    """Detect platform from directory path or data."""
+    # Check data first
+    platform = data.get('platform') or data.get('source')
+    if platform:
+        return platform.lower()
+
+    # Fall back to directory name
     parts = Path(filepath).parts
-    # Look for known platform directory names
     known = {'chatgpt', 'claude_code', 'claude_chat', 'gemini', 'grok', 'perplexity'}
     for part in parts:
         if part in known:
@@ -177,70 +285,194 @@ def detect_platform(filepath: str) -> str:
     return 'unknown'
 
 
-def normalize_exchanges(data: dict, filepath: str) -> List[Tuple[str, str]]:
-    """Normalize JSON transcript into (user_text, assistant_text) pairs.
+def normalize_exchanges(data: dict, filepath: str) -> List[EnrichedExchange]:
+    """Normalize JSON transcript into enriched exchange objects.
 
-    Returns list of (user, assistant) tuples. Either can be empty string.
-    Handles both Schema A and Schema B transparently.
+    Returns list of EnrichedExchange objects with all searchable content.
+    Handles Schema A (ChatGPT/Gemini/Grok/Claude Chat), Schema B (Perplexity),
+    and Schema C (Claude Code) transparently.
     """
     exchanges = data.get('exchanges', [])
     if not exchanges:
         return []
 
-    pairs = []
-    for ex in exchanges:
-        # Schema B: prompt/response (Claude Code, Perplexity)
-        if 'prompt' in ex:
+    platform = detect_platform(filepath, data)
+    top_level_model = data.get('model', '')
+
+    results = []
+
+    # Schema C: Claude Code (flat role/content messages)
+    if exchanges and 'role' in exchanges[0]:
+        # Pair consecutive user+assistant messages
+        i = 0
+        while i < len(exchanges):
+            ex = exchanges[i]
+            if ex.get('role') == 'user':
+                user_text = ex.get('content', '').strip()
+                assistant_text = ""
+                timestamp = ex.get('timestamp', '')
+
+                # Look for following assistant message
+                if i + 1 < len(exchanges) and exchanges[i + 1].get('role') == 'assistant':
+                    assistant_text = exchanges[i + 1].get('content', '').strip()
+                    i += 2
+                else:
+                    i += 1
+
+                results.append(EnrichedExchange(
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    timestamp=timestamp,
+                    model='claude_code',
+                ))
+            else:
+                i += 1
+        return results
+
+    # Schema B: Perplexity (prompt/response)
+    if exchanges and 'prompt' in exchanges[0]:
+        for ex in exchanges:
             user = ex.get('prompt', '') or ''
             resp = ex.get('response', '') or ''
+            timestamp = ex.get('timestamp', '')
+
             if isinstance(resp, dict):
                 resp = resp.get('text', '') or ''
-            pairs.append((user.strip(), resp.strip()))
-            continue
 
-        # Schema A: user_prompt/responses[] (ChatGPT, Gemini, Grok, Claude Chat)
+            results.append(EnrichedExchange(
+                user_text=user.strip(),
+                assistant_text=resp.strip(),
+                timestamp=timestamp,
+                model='perplexity',
+            ))
+        return results
+
+    # Schema A: ChatGPT/Gemini/Grok/Claude Chat (user_prompt/responses[])
+    for ex in exchanges:
         user = ex.get('user_prompt', '') or ''
+        timestamp = ex.get('timestamp', '')
 
-        # Responses is a list of dicts with 'text' and optionally 'tools'
+        # Responses is a list of dicts with text, artifacts, tools, metadata
         responses = ex.get('responses', [])
         resp_parts = []
+        all_artifacts = []
+        all_tools = []
+        thinking = ""
+        model = ""
+
         for r in responses:
             if isinstance(r, str):
                 resp_parts.append(r)
-            elif isinstance(r, dict):
-                text = r.get('text', '') or ''
-                if text:
-                    resp_parts.append(text)
-                # Include tool results if present and substantial
-                tools = r.get('tools', [])
-                for tool in tools:
-                    if isinstance(tool, dict):
-                        tool_text = tool.get('output', '') or tool.get('result', '') or ''
-                        if len(tool_text) > 50:
-                            resp_parts.append(f"[Tool: {tool.get('type', 'unknown')}]: {tool_text}")
+                continue
 
-        resp = '\n'.join(resp_parts).strip()
-        pairs.append((user.strip(), resp))
+            if not isinstance(r, dict):
+                continue
 
-    return pairs
+            # Main response text
+            text = r.get('text', '') or ''
+            if text:
+                resp_parts.append(text)
+
+            # Artifacts
+            artifacts = r.get('artifacts', [])
+            if artifacts:
+                all_artifacts.extend(artifacts)
+
+            # Tools
+            tools = r.get('tools', [])
+            if tools:
+                all_tools.extend(tools)
+
+            # Metadata (thinking trace, model, etc.)
+            metadata = r.get('metadata', {})
+            if metadata:
+                if not thinking and 'thinking_trace' in metadata:
+                    thinking = metadata['thinking_trace']
+                if not model and 'model' in metadata:
+                    model = metadata['model']
+
+            # Model at response level (ChatGPT format)
+            if not model and 'model' in r:
+                model = r['model']
+
+        # Use top-level model if not found in responses
+        if not model:
+            model = top_level_model
+
+        assistant = '\n'.join(resp_parts).strip()
+
+        results.append(EnrichedExchange(
+            user_text=user.strip(),
+            assistant_text=assistant,
+            artifacts=all_artifacts,
+            thinking=thinking,
+            tools=all_tools,
+            model=model,
+            timestamp=timestamp,
+            has_artifacts=len(all_artifacts) > 0,
+            artifact_count=len(all_artifacts),
+            has_thinking=bool(thinking),
+        ))
+
+    return results
 
 
-def get_session_id(data: dict) -> str:
-    """Extract session ID from either schema."""
-    return (data.get('sessionId')
-            or data.get('conversation_id')
+def get_conversation_id(data: dict) -> str:
+    """Extract conversation ID from any schema."""
+    return (data.get('conversation_id')
+            or data.get('sessionId')
             or data.get('session_id')
             or '')
 
 
-def format_exchange(user: str, assistant: str, session_id: str,
+def format_exchange(exchange: EnrichedExchange, conversation_id: str,
                     platform: str) -> str:
-    """Format an exchange for embedding."""
-    parts = [f"[Platform: {platform}] [Session: {session_id[:12]}]"]
-    if user:
-        parts.append(f"\n[User]: {user}")
-    if assistant:
-        parts.append(f"\n[Assistant]: {assistant}")
+    """Format an enriched exchange for embedding.
+
+    Includes all searchable content: user prompt, assistant response,
+    artifacts (full content), thinking traces (truncated), tool results.
+    """
+    parts = [
+        f"[Platform: {platform}] [Session: {conversation_id[:12]}]"
+    ]
+
+    if exchange.model:
+        parts.append(f"[Model: {exchange.model}]")
+
+    if exchange.user_text:
+        parts.append(f"\n[User]: {exchange.user_text}")
+
+    if exchange.assistant_text:
+        parts.append(f"\n[Assistant]: {exchange.assistant_text}")
+
+    # Include thinking trace (first 2000 chars - can be huge)
+    if exchange.thinking:
+        thinking_trunc = exchange.thinking[:2000]
+        if len(exchange.thinking) > 2000:
+            thinking_trunc += "... (truncated)"
+        parts.append(f"\n[Thinking]: {thinking_trunc}")
+
+    # Include full artifact content - multi_scale_tile will chunk appropriately
+    for artifact in exchange.artifacts:
+        atype = artifact.get('type', 'unknown')
+        lang = artifact.get('language', '')
+        content = artifact.get('content', '')
+
+        if content:
+            header = f"[Artifact {atype}"
+            if lang:
+                header += f"/{lang}"
+            header += "]:"
+            parts.append(f"\n{header}\n{content}")
+
+    # Include substantial tool results
+    for tool in exchange.tools:
+        if isinstance(tool, dict):
+            tool_output = tool.get('output', '') or tool.get('result', '') or ''
+            if len(tool_output) > 50:
+                tool_type = tool.get('type', 'unknown')
+                parts.append(f"\n[Tool {tool_type}]: {tool_output}")
+
     return "\n".join(parts)
 
 # =============================================================================
@@ -252,6 +484,7 @@ def discover_files(base_dir: str) -> List[Tuple[str, str]]:
     """Discover all JSON transcript files.
 
     Returns list of (filepath, platform) tuples sorted by path.
+    Detects platform from directory name (fast - no file I/O).
     """
     files = []
     base = Path(base_dir)
@@ -260,8 +493,15 @@ def discover_files(base_dir: str) -> List[Tuple[str, str]]:
         print(f"ERROR: Directory not found: {base_dir}", flush=True)
         return files
 
+    known = {'chatgpt', 'claude_code', 'claude_chat', 'gemini', 'grok', 'perplexity'}
+
     for json_file in sorted(base.rglob("*.json")):
-        platform = detect_platform(str(json_file))
+        # Detect platform from directory structure (fast)
+        platform = 'unknown'
+        for part in json_file.parts:
+            if part in known:
+                platform = part
+                break
         files.append((str(json_file), platform))
 
     return files
@@ -331,24 +571,23 @@ def _reader_loop(file_list, tile_queue, seen_hashes, hash_lock,
                 stats["errors"] += 1
             continue
 
-        session_id = get_session_id(data) or Path(filepath).stem
-        pairs = normalize_exchanges(data, filepath)
+        conversation_id = get_conversation_id(data) or Path(filepath).stem
+        exchanges = normalize_exchanges(data, filepath)
 
         file_tiles = 0
         file_tokens = 0
         file_skipped = 0
 
-        for user_text, assistant_text in pairs:
+        for exchange in exchanges:
             if _SHUTDOWN or _FATAL:
                 break
 
             # Skip empty exchanges
-            if len(user_text) + len(assistant_text) < 20:
+            if len(exchange.user_text) + len(exchange.assistant_text) < 20:
                 file_skipped += 1
                 continue
 
-            exchange_text = format_exchange(user_text, assistant_text,
-                                           session_id, platform)
+            exchange_text = format_exchange(exchange, conversation_id, platform)
             ch = hashlib.sha256(exchange_text.encode()).hexdigest()[:16]
 
             with hash_lock:
@@ -368,24 +607,35 @@ def _reader_loop(file_list, tile_queue, seen_hashes, hash_lock,
                     seen_hashes.add(ch)
                 continue
 
-            # Feed tiles one at a time into queue - no batching
+            # Feed tiles one at a time into queue with timeout to avoid deadlock
             for tile in tiles:
                 if _SHUTDOWN or _FATAL:
                     break
-                tile_queue.put(TileWork(
+                work = TileWork(
                     tile=tile,
-                    session_id=session_id,
+                    conversation_id=conversation_id,
                     platform=platform,
                     content_hash=ch,
                     source_file=Path(filepath).name,
-                ))
+                    model=exchange.model,
+                    has_artifacts=exchange.has_artifacts,
+                    artifact_count=exchange.artifact_count,
+                    has_thinking=exchange.has_thinking,
+                )
+                # Timeout on put() prevents deadlock if embed workers die
+                while not (_SHUTDOWN or _FATAL):
+                    try:
+                        tile_queue.put(work, timeout=2.0)
+                        break
+                    except queue.Full:
+                        continue
 
             with hash_lock:
                 seen_hashes.add(ch)
 
         with stats_lock:
             stats["files"] += 1
-            stats["exchanges"] += len(pairs)
+            stats["exchanges"] += len(exchanges)
             stats["tiles"] += file_tiles
             stats["tokens"] += file_tokens
             stats["skipped"] += file_skipped
@@ -437,45 +687,76 @@ def _embed_loop(tile_queue, store_queue, stats, stats_lock, name):
         if not batch:
             continue
 
-        # Embed
-        texts = [tw.tile.text[:MAX_EMBED_CHARS] for tw in batch]
-        try:
+        # Embed with circuit-breaker retry - survives 2-min container restarts
+        texts = [tw.tile.text for tw in batch]
+        embeddings = None
+        attempt = 0
+        while not (_FATAL or _SHUTDOWN):
+            attempt += 1
+            _circuit.wait_if_open()
+
             session = get_session()
-            r = session.post(EMBEDDING_URL, json={
-                "model": EMBEDDING_MODEL,
-                "input": texts,
-            }, timeout=120)
-        except requests.exceptions.Timeout:
-            set_fatal(f"[{name}] Embedding timeout (120s) for {len(texts)} texts")
-            break
-        except requests.exceptions.ConnectionError as e:
-            set_fatal(f"[{name}] Embedding server unreachable: {e}")
-            break
-        except Exception as e:
-            set_fatal(f"[{name}] Embedding error: {type(e).__name__}: {e}")
-            break
+            result, good_batch = _embed_batch_with_retry(
+                session, texts, batch, name, stats, stats_lock)
 
-        if r.status_code != 200:
-            set_fatal(f"[{name}] Embedding {r.status_code}: {r.text[:300]}")
-            break
+            if isinstance(result, list):
+                embeddings = result
+                batch = good_batch
+                break
+            elif result == "retry":
+                _circuit.report_down()
+                wait = min(30, 2 ** min(attempt, 5))
+                if attempt % 8 == 1:
+                    print(f"  [{name}] Embed unreachable (attempt {attempt}), "
+                          f"waiting {wait}s...", flush=True)
+                time.sleep(wait)
+                continue
+            elif result == "fatal":
+                set_fatal(f"[{name}] Embed unexpected error")
+                break
+            elif result == "error":
+                set_fatal(f"[{name}] Embed connection error")
+                break
 
-        data = r.json()["data"]
-        embeddings = [item["embedding"]
-                      for item in sorted(data, key=lambda x: x["index"])]
+        if _FATAL:
+            break
+        if not batch or embeddings is None:
+            continue
 
         if len(embeddings) != len(batch):
             set_fatal(f"[{name}] Mismatch: sent {len(batch)}, got {len(embeddings)}")
             break
 
         for tw, emb in zip(batch, embeddings):
-            store_queue.put(EmbeddedTile(
-                tile=tw.tile,
-                embedding=emb,
-                session_id=tw.session_id,
-                platform=tw.platform,
-                content_hash=tw.content_hash,
-                source_file=tw.source_file,
-            ))
+            try:
+                store_queue.put(EmbeddedTile(
+                    tile=tw.tile,
+                    embedding=emb,
+                    conversation_id=tw.conversation_id,
+                    platform=tw.platform,
+                    content_hash=tw.content_hash,
+                    source_file=tw.source_file,
+                    model=tw.model,
+                    has_artifacts=tw.has_artifacts,
+                    artifact_count=tw.artifact_count,
+                    has_thinking=tw.has_thinking,
+                ), timeout=30)
+            except queue.Full:
+                if _FATAL or _SHUTDOWN:
+                    break
+                print(f"  [{name}] Store queue full, waiting...", flush=True)
+                store_queue.put(EmbeddedTile(
+                    tile=tw.tile,
+                    embedding=emb,
+                    conversation_id=tw.conversation_id,
+                    platform=tw.platform,
+                    content_hash=tw.content_hash,
+                    source_file=tw.source_file,
+                    model=tw.model,
+                    has_artifacts=tw.has_artifacts,
+                    artifact_count=tw.artifact_count,
+                    has_thinking=tw.has_thinking,
+                ))
 
         with stats_lock:
             stats["embedded"] += len(batch)
@@ -530,6 +811,10 @@ def _store_loop(store_queue, stats, stats_lock, name):
         objects = []
         for et in batch:
             uid = tile_uuid(et.content_hash, et.tile.scale, et.tile.index)
+
+            # Convert conversation_id to valid UUID if needed
+            session_uuid = make_uuid(et.conversation_id)
+
             objects.append({
                 "class": "ISMA_Quantum",
                 "id": uid,
@@ -539,7 +824,7 @@ def _store_loop(store_queue, stats, stats_lock, name):
                     "source_file": et.source_file,
                     "layer": 2,
                     "platform": et.platform,
-                    "session_id": et.session_id,
+                    "session_id": session_uuid,
                     "scale": et.tile.scale,
                     "parent_tile_id": "",
                     "tile_index": et.tile.index,
@@ -549,7 +834,12 @@ def _store_loop(store_queue, stats, stats_lock, name):
                     "content_hash": et.content_hash,
                     "loaded_at": now,
                     "timestamp": now,
-                    "actor": "process_transcripts",
+                    "actor": "process_transcripts_v2",
+                    "model": et.model,
+                    "has_artifacts": et.has_artifacts,
+                    "artifact_count": et.artifact_count,
+                    "has_thinking": et.has_thinking,
+                    "conversation_id": et.conversation_id,
                 },
                 "vector": et.embedding,
             })
@@ -811,7 +1101,7 @@ def run(transcript_dir: str, limit: int = 0, dry_run: bool = False,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ISMA Transcript Processor")
+    parser = argparse.ArgumentParser(description="ISMA Transcript Processor v2 (Enriched Format)")
     parser.add_argument("--check", action="store_true",
                         help="Check infrastructure only")
     parser.add_argument("--dry-run", action="store_true",

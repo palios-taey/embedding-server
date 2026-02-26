@@ -980,6 +980,159 @@ def _group_into_exchanges_claude_enhanced(messages: List[Dict], platform: str) -
 #   - metadata.requestModelDetails
 # =============================================================================
 
+
+def parse_xai_grok_bulk(filepath: str) -> List[Dict]:
+    """Parse xAI Grok bulk export (conversations.json with chat_messages + account).
+
+    Format: [{uuid, name, summary, created_at, updated_at, account, chat_messages: [
+        {uuid, text, content: [{type, text, citations}], sender, created_at, ...}
+    ]}]
+    """
+    with open(filepath) as f:
+        conversations = json.load(f)
+
+    results = []
+    for conv in conversations:
+        conv_id = conv.get('uuid', make_id('grok', conv.get('name', '')))
+        title = conv.get('name', 'Untitled')
+        created = ensure_iso(conv.get('created_at', ''))
+        updated = ensure_iso(conv.get('updated_at', ''))
+
+        chat_messages = conv.get('chat_messages', [])
+        if not chat_messages:
+            continue
+
+        # Build message list
+        messages = []
+        for msg in chat_messages:
+            sender = msg.get('sender', '')
+            if sender == 'human':
+                role = 'user'
+            elif sender == 'assistant':
+                role = 'assistant'
+            else:
+                role = sender
+
+            # xAI Grok has text at message level AND in content blocks
+            # Prefer message-level text (complete), fall back to content blocks
+            text = msg.get('text', '').strip()
+            if not text:
+                # Assemble from content blocks
+                for block in msg.get('content', []):
+                    if isinstance(block, dict) and block.get('type') == 'text':
+                        t = block.get('text', '')
+                        if t:
+                            text += t
+
+            # Extract citations from content blocks
+            citations = []
+            for block in msg.get('content', []):
+                if isinstance(block, dict):
+                    for cit in block.get('citations', []):
+                        if isinstance(cit, dict) and cit.get('url'):
+                            citations.append({
+                                "url": cit.get('url', ''),
+                                "title": cit.get('title', ''),
+                            })
+
+            # Extract code artifacts from text
+            artifacts = extract_artifacts(text) if role == 'assistant' else []
+            file_refs = extract_file_references(text)
+
+            msg_obj = {
+                'role': role,
+                'text': text,
+                'timestamp': ensure_iso(msg.get('created_at', '')),
+            }
+            if artifacts:
+                msg_obj['_artifacts'] = artifacts
+            if citations:
+                msg_obj['_citations'] = citations
+
+            messages.append(msg_obj)
+
+        # Group into exchanges (standard user/assistant pairing)
+        exchanges = []
+        current_user = None
+        current_responses = []
+        current_timestamp = ''
+        idx = 0
+
+        for msg in messages:
+            role = msg.get('role', '')
+            if role == 'user':
+                if current_user is not None and current_responses:
+                    exchanges.append(_build_exchange(
+                        idx, current_timestamp, current_user,
+                        current_responses, 'grok'))
+                    idx += 1
+                current_user = msg
+                current_responses = []
+                current_timestamp = msg.get('timestamp', '')
+            elif role == 'assistant':
+                current_responses.append(msg)
+
+        # Don't forget last exchange
+        if current_user is not None and current_responses:
+            exchanges.append(_build_exchange(
+                idx, current_timestamp, current_user,
+                current_responses, 'grok'))
+
+        if not exchanges:
+            continue
+
+        all_refs = sum(len(ex.get('file_references', [])) for ex in exchanges)
+
+        results.append({
+            "platform": "grok",
+            "conversation_id": conv_id,
+            "title": title,
+            "model": "",
+            "source_file": Path(filepath).name,
+            "created_at": created,
+            "updated_at": updated,
+            "exchanges": exchanges,
+            "metadata": {
+                "total_exchanges": len(exchanges),
+                "total_attachments": 0,
+                "total_file_references": all_refs,
+                "parser": "parse_raw_exports.py::xai_grok_bulk",
+                "parsed_at": datetime.now(timezone.utc).isoformat(),
+            }
+        })
+
+    return results
+
+
+def _build_exchange(idx, timestamp, user_msg, assistant_msgs, platform):
+    """Build a standard exchange dict from user + assistant messages."""
+    user_text = user_msg.get('text', '')
+    file_refs = extract_file_references(user_text)
+
+    responses = []
+    for amsg in assistant_msgs:
+        resp = {"text": amsg.get('text', '')}
+        if amsg.get('_artifacts'):
+            resp["artifacts"] = amsg['_artifacts']
+        if amsg.get('_citations'):
+            resp["citations"] = amsg['_citations']
+        if amsg.get('_thinking'):
+            resp["thinking"] = amsg['_thinking']
+        if amsg.get('_tools'):
+            resp["tools"] = amsg['_tools']
+        responses.append(resp)
+        file_refs.extend(extract_file_references(amsg.get('text', '')))
+
+    return {
+        "index": idx,
+        "timestamp": timestamp,
+        "user_prompt": user_text,
+        "responses": responses,
+        "attachments": [],
+        "file_references": list(set(file_refs)),
+    }
+
+
 def parse_grok_bulk(filepath: str) -> List[Dict]:
     """Parse Grok bulk export (prod-grok-backend.json or individual files)."""
     with open(filepath) as f:
@@ -1100,7 +1253,12 @@ def _parse_grok_format_c(conv_wrapper: Dict, filepath: str, asset_dir: Optional[
     - metadata.requestModelDetails
     """
     conv_meta = conv_wrapper.get('conversation', {})
-    conv_id = conv_meta.get('id') or conv_meta.get('conversation_id') or make_id('grok', filepath)
+    # Detect if this is Claude Chat data (Anthropic's prod-grok-backend.json)
+    # Claude conversations have user_id, system_prompt_id, leaf_response_id
+    is_claude = any(k in conv_meta for k in ('user_id', 'system_prompt_id', 'leaf_response_id'))
+    platform = 'claude_chat' if is_claude else 'grok'
+
+    conv_id = conv_meta.get('id') or conv_meta.get('conversation_id') or make_id(platform, filepath)
     title = conv_meta.get('title', 'Untitled')
     created = ensure_iso(conv_meta.get('create_time'))
     updated = ensure_iso(conv_meta.get('modify_time'))
@@ -1273,7 +1431,7 @@ def _parse_grok_format_c(conv_wrapper: Dict, filepath: str, asset_dir: Optional[
             queue.extend(children)
 
     # Group into exchanges (preserves all metadata)
-    exchanges = _group_into_exchanges_with_tools_and_metadata(messages, 'grok')
+    exchanges = _group_into_exchanges_with_tools_and_metadata(messages, platform)
 
     # Detect model
     detected_model = ''
@@ -1282,7 +1440,7 @@ def _parse_grok_format_c(conv_wrapper: Dict, filepath: str, asset_dir: Optional[
             detected_model = msg['model']
             break
 
-    return _build_result('grok', conv_id, title, detected_model, filepath, created, updated, exchanges)
+    return _build_result(platform, conv_id, title, detected_model, filepath, created, updated, exchanges)
 
 
 def _parse_grok_format_a(data: Dict, filepath: str, asset_dir: Optional[Path]) -> Optional[Dict]:
@@ -1680,6 +1838,591 @@ def parse_individual_export(filepath: str) -> List[Dict]:
 def parse_gemini_individual(filepath: str) -> List[Dict]:
     """Parse Gemini export - just delegates to individual parser."""
     return parse_individual_export(filepath)
+
+
+# =============================================================================
+# GEMINI UNIFIED PARSER - All Gemini sources, exchange-level dedup
+# =============================================================================
+
+# Base directories for Gemini data
+_GEMINI_OLD_BASE = Path("/home/spark/builder-taey/family_transcripts/for_processing/gemini")
+_GEMINI_RAW_EXPORT = Path("/home/spark/data/transcripts/raw_exports/gemini")
+
+# Regex for the Activity Log date format: "Jan 5, 2025 at 3:51 AM" or "Yesterday at 10:01 PM"
+_ACTIVITY_DATE_RE = re.compile(
+    r'(?:(\w+ \d{1,2},? \d{4})|(\w+ \d{1,2})|(\w+))\s+at\s+(\d{1,2}:\d{2})\s*(AM|PM)',
+    re.IGNORECASE
+)
+
+
+def _parse_activity_log_date(date_str: str, file_date_hint: str = "2026-02-17") -> str:
+    """Parse Google Activity Log date to ISO 8601.
+
+    Handles:
+      "Nov 30, 2025 at 1:58 AM"
+      "January 4 at 12:59 AM"        (no year - infer from context)
+      "Yesterday at 10:01 PM"
+      "Today at 5:00 PM"
+    """
+    if not date_str:
+        return ""
+
+    # Clean non-breaking spaces
+    date_str = date_str.replace('\u202f', ' ').replace('\xa0', ' ').strip()
+
+    # Try full formats with dateutil-like manual parsing
+    # Format 1: "Nov 30, 2025 at 1:58 AM" or "November 30, 2025 at 1:58 AM"
+    # Format 2: "January 4 at 12:59 AM" (no year)
+    # Format 3: "Yesterday at 10:01 PM" / "Today at ..."
+
+    # Extract time portion
+    time_match = re.search(r'(\d{1,2}:\d{2})\s*(AM|PM)', date_str, re.IGNORECASE)
+    if not time_match:
+        return ""
+
+    time_str = time_match.group(1)
+    ampm = time_match.group(2).upper()
+
+    # Parse time
+    hour, minute = map(int, time_str.split(':'))
+    if ampm == 'PM' and hour != 12:
+        hour += 12
+    elif ampm == 'AM' and hour == 12:
+        hour = 0
+
+    # Parse date portion (everything before "at")
+    date_part = date_str.split(' at ')[0].strip() if ' at ' in date_str else ''
+
+    # Handle relative dates
+    try:
+        ref_date = datetime.strptime(file_date_hint, "%Y-%m-%d")
+    except ValueError:
+        ref_date = datetime(2026, 2, 17)
+
+    if date_part.lower() == 'yesterday':
+        from datetime import timedelta
+        d = ref_date - timedelta(days=1)
+    elif date_part.lower() == 'today':
+        d = ref_date
+    else:
+        # Try parsing with year: "Nov 30, 2025" or "November 30, 2025"
+        for fmt in ("%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y"):
+            try:
+                d = datetime.strptime(date_part, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            # No year: "January 4" or "Jan 4"
+            for fmt in ("%B %d", "%b %d"):
+                try:
+                    d = datetime.strptime(date_part, fmt)
+                    # Infer year: if month > ref month, it's previous year
+                    year = ref_date.year
+                    if d.month > ref_date.month:
+                        year -= 1
+                    d = d.replace(year=year)
+                    break
+                except ValueError:
+                    continue
+            else:
+                return ""
+
+    d = d.replace(hour=hour, minute=minute, second=0)
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_gemini_activity_md(filepath: str) -> List[Dict]:
+    """Parse Gemini Activity Log .md format.
+
+    Format is repeating blocks:
+        Logo for Gemini Apps
+        Gemini Apps
+        Prompted {user text}
+        Details
+        event
+        {date}
+        apps
+        Gemini Apps
+        chat
+
+        {response text...}
+    """
+    with open(filepath, encoding='utf-8') as f:
+        content = f.read()
+
+    lines = content.split('\n')
+
+    # Infer file date from filename if possible (GEMINI_2025_11_18-2026_02_17_01_12.md)
+    fname = Path(filepath).stem
+    date_match = re.search(r'(\d{4})_(\d{2})_(\d{2})(?:_(\d{2})_(\d{2}))?$', fname)
+    if date_match:
+        file_date = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+    else:
+        file_date = "2026-02-17"
+
+    # Find all blocks starting with "Logo for Gemini Apps"
+    exchanges = []
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() == 'Logo for Gemini Apps':
+            # Parse block header
+            # Line i:   Logo for Gemini Apps
+            # Line i+1: Gemini Apps
+            # Line i+2: Prompted {text}
+            # Line i+3: Details
+            # Line i+4: event
+            # Line i+5: {date}
+            # Line i+6: apps
+            # Line i+7: Gemini Apps
+            # Line i+8: chat
+            # Line i+9: (blank)
+            # Line i+10+: response text until next "Logo for Gemini Apps"
+
+            if i + 5 >= len(lines):
+                i += 1
+                continue
+
+            # Extract user prompt
+            prompt_line = lines[i + 2] if i + 2 < len(lines) else ''
+            user_text = prompt_line
+            if user_text.startswith('Prompted '):
+                user_text = user_text[9:]
+
+            # Extract date
+            date_line = lines[i + 5] if i + 5 < len(lines) else ''
+            timestamp = _parse_activity_log_date(date_line, file_date)
+
+            # Find response text: skip header lines, collect until next block
+            # Response starts after the "chat" line + blank
+            resp_start = i + 10  # After "chat" + blank
+            # But be flexible - find the "chat" line
+            for j in range(i + 3, min(i + 12, len(lines))):
+                if lines[j].strip() == 'chat':
+                    resp_start = j + 1
+                    # Skip blank line after "chat"
+                    if resp_start < len(lines) and lines[resp_start].strip() == '':
+                        resp_start += 1
+                    break
+
+            # Collect response lines until next "Logo for Gemini Apps" or EOF
+            resp_lines = []
+            k = resp_start
+            while k < len(lines):
+                if lines[k].strip() == 'Logo for Gemini Apps':
+                    break
+                resp_lines.append(lines[k])
+                k += 1
+
+            response_text = '\n'.join(resp_lines).strip()
+
+            if user_text.strip():
+                exchanges.append({
+                    "user_text": user_text.strip(),
+                    "response_text": response_text,
+                    "timestamp": timestamp,
+                    "date_str": date_line.strip(),
+                })
+
+            i = k  # Jump to next block
+        else:
+            i += 1
+
+    return exchanges
+
+
+def _infer_gemini_sessions(exchanges: List[Dict]) -> List[List[Dict]]:
+    """Group exchanges into sessions/conversations by timing and content.
+
+    Heuristic: exchanges within 2 hours of each other are same session,
+    unless user text starts a new topic (contains greeting/system prompt markers).
+    """
+    if not exchanges:
+        return []
+
+    # Sort by timestamp
+    sorted_ex = sorted(exchanges, key=lambda e: e.get('timestamp', '') or '9999')
+
+    sessions = []
+    current_session = [sorted_ex[0]]
+
+    NEW_SESSION_MARKERS = [
+        'start research', 'hi gemini', 'hey gemini', 'gemini,',
+        'hello gemini', 'hi map',
+    ]
+
+    for prev, curr in zip(sorted_ex, sorted_ex[1:]):
+        ts_prev = prev.get('timestamp', '')
+        ts_curr = curr.get('timestamp', '')
+
+        # Check time gap
+        gap_hours = 999
+        if ts_prev and ts_curr:
+            try:
+                t1 = datetime.strptime(ts_prev[:19], "%Y-%m-%dT%H:%M:%S")
+                t2 = datetime.strptime(ts_curr[:19], "%Y-%m-%dT%H:%M:%S")
+                gap_hours = abs((t2 - t1).total_seconds()) / 3600
+            except ValueError:
+                pass
+
+        # Check if new session
+        user_lower = curr.get('user_text', '').lower()[:50]
+        is_greeting = any(user_lower.startswith(m) for m in NEW_SESSION_MARKERS)
+
+        if gap_hours > 2 or (gap_hours > 0.5 and is_greeting):
+            sessions.append(current_session)
+            current_session = [curr]
+        else:
+            current_session.append(curr)
+
+    if current_session:
+        sessions.append(current_session)
+
+    return sessions
+
+
+def _exchange_hash(user_text: str, response_text: str) -> str:
+    """Hash for exchange-level dedup. Uses first 500 chars of each to handle
+    minor formatting differences across sources."""
+    key = (user_text or '')[:500] + '|||' + (response_text or '')[:500]
+    return hashlib.sha256(key.encode()).hexdigest()[:24]
+
+
+def parse_gemini_all() -> List[Dict]:
+    """Unified Gemini parser. Ingests ALL sources, deduplicates at exchange level.
+
+    Sources (in priority order for dedup - earlier source wins):
+    1. New .md Activity Log export (raw_exports/gemini/)
+    2. oct-nov JSON conversations
+    3. new_transcripts JSON conversations
+    4. layer_3 universal JSON conversations
+    5. enriched JSON conversations (previous pipeline output)
+
+    Artifacts from artifacts/ directory are linked via complete_artifact_mapping.json.
+    """
+    all_exchanges = []  # List of (exchange_dict, source_name)
+    seen_hashes = set()
+
+    def _add_exchanges(exchanges, source):
+        """Add exchanges, dedup by hash."""
+        added = 0
+        for ex in exchanges:
+            h = _exchange_hash(ex.get('user_text', ''), ex.get('response_text', ''))
+            if h not in seen_hashes:
+                seen_hashes.add(h)
+                ex['_source'] = source
+                ex['_hash'] = h
+                all_exchanges.append(ex)
+                added += 1
+        return added
+
+    print("=" * 70, flush=True)
+    print("Gemini Unified Parser - All Sources", flush=True)
+    print("=" * 70, flush=True)
+
+    # -------------------------------------------------------------------------
+    # Source 1: New .md Activity Log exports
+    # -------------------------------------------------------------------------
+    md_files = sorted(_GEMINI_RAW_EXPORT.glob("*.md")) if _GEMINI_RAW_EXPORT.exists() else []
+    for md_file in md_files:
+        exchanges = _parse_gemini_activity_md(str(md_file))
+        n = _add_exchanges(exchanges, f"activity_md:{md_file.name}")
+        print(f"  activity_md/{md_file.name}: {len(exchanges)} parsed, {n} new", flush=True)
+
+    # -------------------------------------------------------------------------
+    # Source 2: oct-nov JSON conversations
+    # -------------------------------------------------------------------------
+    oct_nov = _GEMINI_OLD_BASE / "oct-nov"
+    if oct_nov.exists():
+        for jf in sorted(oct_nov.glob("*.json")):
+            try:
+                data = json.load(open(jf))
+                if isinstance(data, list):
+                    data = data[0] if data else {}
+                msgs = data.get('messages', [])
+                exchanges = []
+                # Pair user/assistant messages
+                i = 0
+                while i < len(msgs):
+                    if msgs[i].get('role') == 'user':
+                        user_text = msgs[i].get('content', '') or msgs[i].get('text', '')
+                        resp_text = ''
+                        ts = ensure_iso(msgs[i].get('timestamp', ''))
+                        if i + 1 < len(msgs) and msgs[i + 1].get('role') in ('assistant', 'model'):
+                            resp_text = msgs[i + 1].get('content', '') or msgs[i + 1].get('text', '')
+                            i += 2
+                        else:
+                            i += 1
+                        exchanges.append({
+                            "user_text": user_text.strip(),
+                            "response_text": resp_text.strip(),
+                            "timestamp": ts,
+                        })
+                    else:
+                        i += 1
+                n = _add_exchanges(exchanges, f"oct_nov:{jf.name}")
+                print(f"  oct-nov/{jf.name}: {len(exchanges)} parsed, {n} new", flush=True)
+            except Exception as e:
+                print(f"  oct-nov/{jf.name}: ERROR {e}", flush=True)
+
+    # -------------------------------------------------------------------------
+    # Source 3: new_transcripts JSON
+    # -------------------------------------------------------------------------
+    new_trans = _GEMINI_OLD_BASE / "new_transcripts"
+    if new_trans.exists():
+        for jf in sorted(new_trans.glob("*.json")):
+            try:
+                data = json.load(open(jf))
+                items = data if isinstance(data, list) else [data]
+                file_exchanges = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    msgs = item.get('messages', [])
+                    i = 0
+                    while i < len(msgs):
+                        if msgs[i].get('role') == 'user':
+                            user_text = msgs[i].get('content', '') or msgs[i].get('text', '')
+                            resp_text = ''
+                            ts = ensure_iso(msgs[i].get('timestamp', ''))
+                            if i + 1 < len(msgs) and msgs[i + 1].get('role') in ('assistant', 'model'):
+                                resp_text = msgs[i + 1].get('content', '') or msgs[i + 1].get('text', '')
+                                i += 2
+                            else:
+                                i += 1
+                            file_exchanges.append({
+                                "user_text": user_text.strip(),
+                                "response_text": resp_text.strip(),
+                                "timestamp": ts,
+                            })
+                        else:
+                            i += 1
+                n = _add_exchanges(file_exchanges, f"new_trans:{jf.name}")
+                print(f"  new_transcripts/{jf.name}: {len(file_exchanges)} parsed, {n} new", flush=True)
+            except Exception as e:
+                print(f"  new_transcripts/{jf.name}: ERROR {e}", flush=True)
+
+    # -------------------------------------------------------------------------
+    # Source 4: layer_3 universal JSON
+    # -------------------------------------------------------------------------
+    layer3 = _GEMINI_OLD_BASE / "layer_3"
+    if layer3.exists():
+        for jf in sorted(layer3.glob("*_universal.json")):
+            try:
+                data = json.load(open(jf))
+                msgs = data.get('messages', [])
+                exchanges = []
+                i = 0
+                while i < len(msgs):
+                    if msgs[i].get('role') == 'user':
+                        user_text = msgs[i].get('content', '') or msgs[i].get('text', '')
+                        resp_text = ''
+                        ts = ensure_iso(msgs[i].get('timestamp', ''))
+                        if i + 1 < len(msgs) and msgs[i + 1].get('role') in ('assistant', 'model'):
+                            resp_text = msgs[i + 1].get('content', '') or msgs[i + 1].get('text', '')
+                            i += 2
+                        else:
+                            i += 1
+                        exchanges.append({
+                            "user_text": user_text.strip(),
+                            "response_text": resp_text.strip(),
+                            "timestamp": ts,
+                        })
+                    else:
+                        i += 1
+                n = _add_exchanges(exchanges, f"layer3:{jf.name}")
+                print(f"  layer_3/{jf.name}: {len(exchanges)} parsed, {n} new", flush=True)
+            except Exception as e:
+                print(f"  layer_3/{jf.name}: ERROR {e}", flush=True)
+
+    # -------------------------------------------------------------------------
+    # Source 5: enriched JSON (previous pipeline output)
+    # -------------------------------------------------------------------------
+    enriched = _GEMINI_OLD_BASE / "enriched"
+    if enriched.exists():
+        for jf in sorted(enriched.glob("*.json")):
+            try:
+                data = json.load(open(jf))
+                msgs = data.get('messages', [])
+                exchanges = []
+                i = 0
+                while i < len(msgs):
+                    if msgs[i].get('role') == 'user':
+                        user_text = msgs[i].get('content', '') or msgs[i].get('text', '')
+                        resp_text = ''
+                        ts = ensure_iso(msgs[i].get('timestamp', ''))
+                        if i + 1 < len(msgs) and msgs[i + 1].get('role') in ('assistant', 'model'):
+                            resp_text = msgs[i + 1].get('content', '') or msgs[i + 1].get('text', '')
+                            i += 2
+                        else:
+                            i += 1
+                        exchanges.append({
+                            "user_text": user_text.strip(),
+                            "response_text": resp_text.strip(),
+                            "timestamp": ts,
+                        })
+                    else:
+                        i += 1
+                n = _add_exchanges(exchanges, f"enriched:{jf.name}")
+                # Only print if new content found (enriched has lots of dupes)
+                if n > 0:
+                    print(f"  enriched/{jf.name}: {len(exchanges)} parsed, {n} new", flush=True)
+            except Exception as e:
+                print(f"  enriched/{jf.name}: ERROR {e}", flush=True)
+
+    print(f"\n  Total unique exchanges: {len(all_exchanges)}", flush=True)
+
+    # -------------------------------------------------------------------------
+    # Load artifact mapping
+    # -------------------------------------------------------------------------
+    artifact_map = {}  # conversation title -> [artifact filenames]
+    artifact_content = {}  # artifact filename -> content
+    mapping_file = _GEMINI_OLD_BASE / "complete_artifact_mapping.json"
+    artifacts_dir = _GEMINI_OLD_BASE / "artifacts"
+
+    if mapping_file.exists():
+        try:
+            mapping = json.load(open(mapping_file))
+            for conv_title, art_list in mapping.get('conversation_artifact_mapping', {}).items():
+                artifact_map[conv_title] = art_list
+        except Exception:
+            pass
+
+    if artifacts_dir.exists():
+        for af in artifacts_dir.iterdir():
+            if af.is_file():
+                try:
+                    artifact_content[af.stem] = af.read_text(encoding='utf-8')
+                except Exception:
+                    pass
+
+    if artifact_content:
+        print(f"  Loaded {len(artifact_content)} artifact files", flush=True)
+
+    # -------------------------------------------------------------------------
+    # Group into sessions and build output
+    # -------------------------------------------------------------------------
+    sessions = _infer_gemini_sessions(all_exchanges)
+    print(f"  Inferred {len(sessions)} sessions", flush=True)
+
+    results = []
+    for sess_idx, session in enumerate(sessions):
+        # Use first exchange timestamp for session ID
+        first_ts = session[0].get('timestamp', '')
+        first_prompt = session[0].get('user_text', '')[:40]
+
+        conv_id = make_id('gemini', first_ts or str(sess_idx), first_prompt)
+
+        # Generate title from first user prompt
+        title = first_prompt.strip()
+        if len(title) > 60:
+            title = title[:57] + '...'
+        if not title:
+            title = f"Gemini Session {sess_idx + 1}"
+
+        # Build exchanges in standard format
+        exchanges = []
+        for idx, ex in enumerate(session):
+            user_text = ex.get('user_text', '')
+            resp_text = ex.get('response_text', '')
+
+            resp_artifacts = extract_artifacts(resp_text) if resp_text else []
+            file_refs = extract_file_references(user_text + '\n' + resp_text)
+
+            exchanges.append({
+                "index": idx,
+                "timestamp": ex.get('timestamp', ''),
+                "user_prompt": user_text,
+                "responses": [{
+                    "text": resp_text,
+                    "tools": [],
+                    "artifacts": resp_artifacts,
+                }],
+                "attachments": [],
+                "file_references": file_refs,
+            })
+
+        created = session[0].get('timestamp', '')
+        updated = session[-1].get('timestamp', '')
+
+        result = _build_result('gemini', conv_id, title, '', 'gemini_unified', created, updated, exchanges)
+        # Add source breakdown to metadata
+        sources = list(set(ex.get('_source', '') for ex in session))
+        result['metadata']['sources'] = sources
+        results.append(result)
+
+    # -------------------------------------------------------------------------
+    # Attach artifacts to matching sessions
+    # -------------------------------------------------------------------------
+    if artifact_map:
+        attached = 0
+        for result in results:
+            for ex in result.get('exchanges', []):
+                for resp in ex.get('responses', []):
+                    resp_text = resp.get('text', '')
+                    # Check if any artifact name is mentioned in the response
+                    for art_name, art_text in artifact_content.items():
+                        # Check if artifact name (or close variant) appears in response
+                        if art_name.replace('_', ' ').lower() in resp_text.lower()[:500]:
+                            resp['artifacts'].append({
+                                "type": "gemini_artifact",
+                                "name": art_name,
+                                "content": art_text[:50000],  # Cap at 50K chars
+                                "fingerprint": hashlib.md5(art_text.encode()).hexdigest()[:16],
+                            })
+                            attached += 1
+        if attached:
+            print(f"  Attached {attached} artifacts to exchanges", flush=True)
+
+    total_ex = sum(len(r['exchanges']) for r in results)
+    total_art = sum(
+        len(a) for r in results for ex in r['exchanges']
+        for resp in ex['responses'] for a in [resp.get('artifacts', [])]
+    )
+    print(f"\n  Output: {len(results)} conversations, {total_ex} exchanges, {total_art} artifacts", flush=True)
+    return results
+
+
+def _parse_gemini_activity_md_as_results(filepath: str) -> List[Dict]:
+    """Wrapper: parse single .md file into session-grouped results (for detect_and_parse)."""
+    exchanges = _parse_gemini_activity_md(filepath)
+    if not exchanges:
+        return []
+
+    sessions = _infer_gemini_sessions(exchanges)
+    results = []
+    for sess_idx, session in enumerate(sessions):
+        first_ts = session[0].get('timestamp', '')
+        first_prompt = session[0].get('user_text', '')[:40]
+        conv_id = make_id('gemini', first_ts or str(sess_idx), first_prompt)
+        title = first_prompt.strip()
+        if len(title) > 60:
+            title = title[:57] + '...'
+        if not title:
+            title = f"Gemini Session {sess_idx + 1}"
+
+        formatted = []
+        for idx, ex in enumerate(session):
+            user_text = ex.get('user_text', '')
+            resp_text = ex.get('response_text', '')
+            formatted.append({
+                "index": idx,
+                "timestamp": ex.get('timestamp', ''),
+                "user_prompt": user_text,
+                "responses": [{
+                    "text": resp_text,
+                    "tools": [],
+                    "artifacts": extract_artifacts(resp_text) if resp_text else [],
+                }],
+                "attachments": [],
+                "file_references": extract_file_references(user_text + '\n' + resp_text),
+            })
+
+        created = session[0].get('timestamp', '')
+        updated = session[-1].get('timestamp', '')
+        results.append(_build_result('gemini', conv_id, title, '', filepath, created, updated, formatted))
+
+    return results
 
 
 # =============================================================================
@@ -2232,6 +2975,26 @@ def detect_and_parse(filepath: str) -> List[Dict]:
     if fp.suffix == '.jsonl':
         return parse_claude_code_jsonl(filepath)
 
+    # Markdown files
+    if fp.suffix == '.md':
+        # Gemini Activity Log format
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                first_lines = f.read(500)
+            if 'Logo for Gemini Apps' in first_lines or 'Gemini Apps' in first_lines:
+                return _parse_gemini_activity_md_as_results(filepath)
+        except Exception:
+            pass
+        # Plain text Grok transcripts with .md extension
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                first_lines = f.read(2000)
+            if 'grok' in fname or 'GROK' in first_lines[:500]:
+                return parse_grok_text(filepath)
+        except Exception:
+            pass
+        return []
+
     # Plain text Grok transcripts
     if fp.suffix == '.txt':
         # Check if it's a Grok text transcript
@@ -2263,7 +3026,10 @@ def detect_and_parse(filepath: str) -> List[Dict]:
             # ChatGPT: has 'mapping' key
             if 'mapping' in first:
                 return parse_chatgpt_bulk(filepath)
-            # Claude: has 'chat_messages' key
+            # xAI Grok: has 'chat_messages' AND 'account' (distinguishes from Claude)
+            if 'chat_messages' in first and 'account' in first:
+                return parse_xai_grok_bulk(filepath)
+            # Claude: has 'chat_messages' key (no 'account')
             if 'chat_messages' in first:
                 return parse_claude_bulk(filepath)
             # Grok array
@@ -2355,7 +3121,37 @@ if __name__ == '__main__':
     parser.add_argument("--output", default="/home/spark/data/transcripts/parsed",
                         help="Output directory")
     parser.add_argument("--check", action="store_true", help="Preview only")
+    parser.add_argument("--gemini-all", action="store_true",
+                        help="Run unified Gemini parser (all sources, exchange-level dedup)")
     args = parser.parse_args()
+
+    if args.gemini_all:
+        results = parse_gemini_all()
+        if not args.check:
+            out = Path(args.output) / "gemini"
+            out.mkdir(parents=True, exist_ok=True)
+            # Clear existing gemini files first
+            existing = list(out.glob("*.json"))
+            if existing:
+                print(f"\nClearing {len(existing)} existing gemini files...", flush=True)
+                for f in existing:
+                    f.unlink()
+            for r in results:
+                safe_id = r['conversation_id'][:16]
+                out_file = out / f"{safe_id}.json"
+                with open(out_file, 'w') as f:
+                    json.dump(r, f, indent=2, ensure_ascii=False)
+            print(f"Wrote {len(results)} files to {out}", flush=True)
+        else:
+            for r in results:
+                print(json.dumps({
+                    "conversation_id": r["conversation_id"],
+                    "title": r["title"],
+                    "exchanges": r["metadata"]["total_exchanges"],
+                    "created": r["created_at"],
+                    "updated": r["updated_at"],
+                }, indent=2))
+        sys.exit(0)
 
     if args.input:
         results = detect_and_parse(args.input)

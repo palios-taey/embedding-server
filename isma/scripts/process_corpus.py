@@ -81,6 +81,8 @@ STAGES = [
     ("github-repos",  DATA_BASE / "github-repos",   0.5,  None),
     ("expansion_md",  DATA_BASE / "expansion_md",    0.4,  None),
     ("mira_md",       DATA_BASE / "mira_md_files",   0.3,  None),
+    ("mac_all_md",    CORPUS_BASE / "mac_all_md",    0.2,  None),
+    ("spark_loose",   CORPUS_BASE / "spark_loose",   0.2,  None),
 ]
 
 LAYER_INT = {
@@ -88,6 +90,7 @@ LAYER_INT = {
     "chewy": 0, "chewy-gallery": 0,
     "layer_1": 1, "layer_2": 2,
     "github-repos": 2, "expansion_md": 2, "mira_md": 2,
+    "mac_all_md": 2, "spark_loose": 2,
 }
 
 # File extensions to process
@@ -98,19 +101,25 @@ SKIP_PATTERNS = [
     ".git", "__pycache__", "node_modules", ".venv", "venv",
     ".Trash", "exo", "tinygrad",  # Fork repos (not our code)
     "transcripts_raw",            # Raw transcript dumps (use process_transcripts.py)
+    "converted_transcripts",      # Already-processed transcripts
+    "chatgpt_", "claude_chat_", "gemini_",  # Conversation exports in repos
+    "grok_export", "claude_full_export",    # Bulk exports
+    "family_transcripts",
+    "mira_transcripts_staging",
 ]
-SKIP_SUFFIXES = [".min.js", ".min.css"]
-MAX_FILE_SIZE = 512 * 1024  # 512KB - skip giant dumps
+SKIP_SUFFIXES = [".min.js", ".min.css", ".jsonl"]
+MAX_FILE_SIZE = 512 * 1024   # 512KB - skip giant dumps
+MAX_FILE_TOKENS = None       # No file size limit - everything gets tiled and embedded
 
 # Dedup manifest from discover_duplicates.py
 DEDUP_MANIFEST = Path("/var/spark/isma/duplicates_manifest.json")
 
 # Pipeline sizing
 EMBED_WORKERS = 8
-EMBED_BATCH = 32
+EMBED_BATCH = 16         # vLLM v1 engine bugs out at >20
 STORE_WORKERS = 2
 WEAVIATE_BATCH = 100
-MAX_EMBED_CHARS = 8192 * 4
+MAX_EMBED_CHARS = None       # No truncation - vLLM max_model_len handles limits
 TILE_QUEUE_SIZE = 512
 STORE_QUEUE_SIZE = 256
 
@@ -149,6 +158,69 @@ signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
 
 _POISON = None
+
+
+class _CircuitBreaker:
+    """When one worker detects backend down, all workers wait together."""
+    def __init__(self, recovery_time=150.0):
+        self._lock = threading.Lock()
+        self._down_since = None
+        self._recovery_time = recovery_time
+
+    def report_down(self):
+        with self._lock:
+            if self._down_since is None:
+                self._down_since = time.monotonic()
+                print("  [circuit] OPEN - backend down, workers will wait", flush=True)
+
+    def report_up(self):
+        with self._lock:
+            if self._down_since is not None:
+                elapsed = time.monotonic() - self._down_since
+                self._down_since = None
+                print(f"  [circuit] CLOSED - backend recovered after {elapsed:.0f}s", flush=True)
+
+    def wait_if_open(self, probe_interval=15.0):
+        with self._lock:
+            if self._down_since is None:
+                return
+            elapsed = time.monotonic() - self._down_since
+            remaining = self._recovery_time - elapsed
+        if remaining > probe_interval:
+            time.sleep(remaining - probe_interval)
+
+_circuit = _CircuitBreaker(recovery_time=150.0)
+
+
+def _embed_batch_with_retry(session, texts, batch, name, stats, stats_lock):
+    """Embed a batch. Any non-200 is retried. Nothing is ever skipped."""
+    try:
+        r = session.post(EMBEDDING_URL, json={
+            "model": EMBEDDING_MODEL, "input": texts,
+        }, timeout=120)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        return "retry", batch
+    except Exception as e:
+        return "error", batch
+
+    if r.status_code == 200:
+        _circuit.report_up()
+        data = r.json()["data"]
+        embeddings = [item["embedding"]
+                      for item in sorted(data, key=lambda x: x["index"])]
+        return embeddings, batch
+    elif r.status_code in (400, 502, 503, 504):
+        # All treated as transient - retry everything
+        if r.status_code == 400:
+            try:
+                msg = r.json().get("error", {}).get("message", "")[:100]
+            except Exception:
+                msg = r.text[:100]
+            print(f"  [{name}] Embed 400: {msg} - will retry", flush=True)
+        return "retry", batch
+    else:
+        return "fatal", batch
+
 
 # =============================================================================
 # DATA TYPES
@@ -362,34 +434,63 @@ def _embed_loop(tile_queue, store_queue, stats, stats_lock, name):
         if not batch:
             continue
 
-        texts = [tw.tile.text[:MAX_EMBED_CHARS] for tw in batch]
-        try:
+        # Embed with circuit-breaker retry - survives 2-min container restarts
+        texts = [tw.tile.text for tw in batch]
+        embeddings = None
+        attempt = 0
+        while not (_FATAL or _SHUTDOWN):
+            attempt += 1
+            _circuit.wait_if_open()
+
             session = get_session()
-            r = session.post(EMBEDDING_URL, json={
-                "model": EMBEDDING_MODEL, "input": texts,
-            }, timeout=120)
-        except Exception as e:
-            set_fatal(f"[{name}] Embed error: {type(e).__name__}: {e}")
-            break
+            result, good_batch = _embed_batch_with_retry(
+                session, texts, batch, name, stats, stats_lock)
 
-        if r.status_code != 200:
-            set_fatal(f"[{name}] Embed {r.status_code}: {r.text[:300]}")
-            break
+            if isinstance(result, list):
+                # Success (possibly with some oversized tiles filtered out)
+                embeddings = result
+                batch = good_batch
+                break
+            elif result == "retry":
+                _circuit.report_down()
+                wait = min(30, 2 ** min(attempt, 5))
+                if attempt % 8 == 1:
+                    print(f"  [{name}] Embed unreachable (attempt {attempt}), "
+                          f"waiting {wait}s...", flush=True)
+                time.sleep(wait)
+                continue
+            elif result == "fatal":
+                set_fatal(f"[{name}] Embed unexpected error")
+                break
+            elif result == "error":
+                set_fatal(f"[{name}] Embed connection error")
+                break
 
-        data = r.json()["data"]
-        embeddings = [item["embedding"]
-                      for item in sorted(data, key=lambda x: x["index"])]
+        if _FATAL:
+            break
+        if not batch or embeddings is None:
+            continue
 
         if len(embeddings) != len(batch):
             set_fatal(f"[{name}] Mismatch: sent {len(batch)}, got {len(embeddings)}")
             break
 
         for tw, emb in zip(batch, embeddings):
-            store_queue.put(EmbeddedTile(
-                tile=tw.tile, embedding=emb,
-                content_hash=tw.content_hash, filename=tw.filename,
-                stage=tw.stage, priority=tw.priority,
-            ))
+            try:
+                store_queue.put(EmbeddedTile(
+                    tile=tw.tile, embedding=emb,
+                    content_hash=tw.content_hash, filename=tw.filename,
+                    stage=tw.stage, priority=tw.priority,
+                ), timeout=30)
+            except queue.Full:
+                if _FATAL or _SHUTDOWN:
+                    break
+                print(f"  [{name}] Store queue full, waiting...", flush=True)
+                store_queue.put(EmbeddedTile(
+                    tile=tw.tile, embedding=emb,
+                    content_hash=tw.content_hash, filename=tw.filename,
+                    stage=tw.stage, priority=tw.priority,
+                ))
 
         with stats_lock:
             stats["embedded"] += len(batch)
@@ -624,12 +725,18 @@ def run(stage_filter: str = None, dry_run: bool = False):
             mtime = datetime.fromtimestamp(filepath.stat().st_mtime).isoformat()
 
             # Multi-scale tile
-            tiles = multi_scale_tile(content,
-                                     source_file=filepath.name,
-                                     layer=stage_name)
+            try:
+                tiles = multi_scale_tile(content,
+                                         source_file=filepath.name,
+                                         layer=stage_name)
+            except Exception as e:
+                print(f"  WARN: Tiling failed for {filepath.name}: {e}", flush=True)
+                continue
 
             tile_count = len(tiles)
             token_count = sum(t.estimated_tokens for t in tiles)
+
+            # No file size limit - all files get tiled and embedded regardless of size
 
             # Create Neo4j Document node (even in dry run for preview)
             if not dry_run:
@@ -661,17 +768,23 @@ def run(stage_filter: str = None, dry_run: bool = False):
             if dry_run:
                 continue
 
-            # Feed tiles into queue
+            # Feed tiles into queue with timeout to avoid deadlock
             for tile in tiles:
                 if _SHUTDOWN or _FATAL:
                     break
-                tile_queue_obj.put(TileWork(
+                work = TileWork(
                     tile=tile,
                     content_hash=content_hash,
                     filename=filepath.name,
                     stage=stage_name,
                     priority=priority,
-                ))
+                )
+                while not (_SHUTDOWN or _FATAL):
+                    try:
+                        tile_queue_obj.put(work, timeout=2.0)
+                        break
+                    except queue.Full:
+                        continue
 
     # Drain pipeline
     if not dry_run:
