@@ -317,10 +317,14 @@ def enrich_tile(
     event_log: EventLog,
 ) -> Tuple[int, str]:
     """Enrich a single tile. Returns (tiles_enriched, error_or_empty)."""
-    # Normalize tile_id (strip hmm_tile_ prefix if present from P0 test data)
+    # Normalize tile_id: strip hmm_tile_ prefix and platform suffixes
     clean_id = tile_id
     if clean_id.startswith("hmm_tile_"):
         clean_id = clean_id[len("hmm_tile_"):]
+    for suffix in ("_chatgpt", "_claude", "_gemini", "_grok", "_perplexity"):
+        if clean_id.endswith(suffix):
+            clean_id = clean_id[: -len(suffix)]
+            break
 
     # 1. Get motif assignments from Neo4j
     motifs = get_tile_motifs(neo4j, tile_id)

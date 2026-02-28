@@ -23,7 +23,7 @@ Endpoints:
     GET  /tile/{hash}         - Get all tiles for content hash
 """
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -364,7 +364,7 @@ def hmm_store_response(req: HMMStoreRequest):
     try:
         parsed = json.loads(req.content)
     except json.JSONDecodeError as e:
-        return {"success": False, "error": f"Content is not valid JSON: {e}"}
+        raise HTTPException(status_code=400, detail=f"Content is not valid JSON: {e}")
 
     # Extract pkg_id from response if not provided
     pkg_id = req.pkg_id or parsed.get("package_id", f"api_{int(time.time())}")
@@ -388,7 +388,7 @@ def hmm_store_response(req: HMMStoreRequest):
         with os.fdopen(fd, "w") as f:
             json.dump(parsed, f)
 
-    # Call the triple-write
+    # Call the triple-write — 6SIGMA: HTTP 500 on failure, never hide errors
     try:
         process_fn = _get_process_response()
         result = process_fn(
@@ -397,17 +397,26 @@ def hmm_store_response(req: HMMStoreRequest):
             pkg_id=pkg_id,
         )
         log.info(f"HMM store result: {result}")
+
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Storage failed: {result.get('stored',0)}/{result.get('parsed',0)} stored, "
+                       f"{result.get('failed',0)} failed. File: {permanent_path}",
+            )
+
         return {
-            "success": result.get("success", False),
+            "success": True,
             "parsed": result.get("parsed", 0),
             "stored": result.get("stored", 0),
             "pkg_id": pkg_id,
             "file": permanent_path,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         log.error(f"HMM store failed: {e}", exc_info=True)
-        return {
-            "success": False,
-            "error": str(e),
-            "file": permanent_path,
-        }
+        raise HTTPException(
+            status_code=500,
+            detail=f"HMM store error: {str(e)}. File: {permanent_path}",
+        )

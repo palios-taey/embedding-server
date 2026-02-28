@@ -285,7 +285,21 @@ def parse_response(text: str) -> dict:
         log.warning(f"Extracted {len(items)} items via regex fallback")
         return {"items": items}
 
-    log.error("All 5 parse strategies failed")
+    # Strategy 6: Single-item wrapper format {content_hash, platform, response: "..."}
+    try:
+        outer = json.loads(text)
+        if isinstance(outer, dict) and "response" in outer:
+            inner_text = outer["response"]
+            inner = json.loads(inner_text) if isinstance(inner_text, str) else inner_text
+            if isinstance(inner, dict) and "rosetta_summary" in inner:
+                if "hash" not in inner and "content_hash" in outer:
+                    inner["hash"] = outer["content_hash"][:12]
+                log.info("Parsed via strategy 6 (single-item wrapper)")
+                return {"items": [inner]}
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
+
+    log.error("All 6 parse strategies failed")
     return {}
 
 
@@ -403,10 +417,16 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
 
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+    # Track success of each store — 6SIGMA: fail-loud, never hide errors
+    weaviate_ok = False
+    neo4j_ok = False
+    redis_ok = False
+
     # --- Weaviate: PATCH all tiles for this content_hash ---
     tile_ids = _get_tile_ids(full_hash)
     if not tile_ids:
-        log.warning(f"  No tiles found for {full_hash[:12]} — skipping Weaviate")
+        log.warning(f"  No tiles found for {full_hash[:12]} — skipping Weaviate PATCH")
+        weaviate_ok = True  # Not a failure if tiles don't exist yet
     else:
         props = {
             "rosetta_summary": rosetta,
@@ -424,6 +444,7 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
             if weaviate_patch(tid, props):
                 patched += 1
         log.info(f"  Weaviate: patched {patched}/{len(tile_ids)} tiles")
+        weaviate_ok = patched > 0
 
     # --- Weaviate: Embed rosetta summary and create searchable rosetta tile ---
     source_file = ""
@@ -488,8 +509,9 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
                     now=now, platform=platform)
 
         log.info(f"  Neo4j: HMMTile + {len(valid_motifs)} EXPRESSES edges")
+        neo4j_ok = True
     except Exception as e:
-        log.error(f"  Neo4j error: {e}")
+        log.error(f"  NEO4J FAILED for {full_hash[:16]}: {e}")
 
     # --- Redis: inverted index ---
     try:
@@ -501,9 +523,14 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
                  json.dumps(valid_motifs), ex=7 * 86400)  # 7-day TTL
         pipe.execute()
         log.info(f"  Redis: {len(valid_motifs)} inverted index entries")
+        redis_ok = True
     except Exception as e:
-        log.error(f"  Redis error: {e}")
+        log.error(f"  REDIS FAILED for {full_hash[:16]}: {e}")
 
+    # 6SIGMA: report ALL failures, never hide partial success
+    if not (weaviate_ok and neo4j_ok and redis_ok):
+        log.error(f"  STORE FAILED for {full_hash[:16]}: weaviate={weaviate_ok} neo4j={neo4j_ok} redis={redis_ok}")
+        return False
     return True
 
 
@@ -643,8 +670,19 @@ def process_response(response_path: str, platform: str = "unknown", pkg_id: str 
     # Store cross-references
     store_cross_refs(items, hash_map, platform)
 
-    log.info(f"\nDone: {stored}/{len(valid_items)} items stored")
-    return {"success": True, "parsed": len(items), "stored": stored}
+    failed = len(valid_items) - stored
+    if failed > 0:
+        log.error(f"\nPARTIAL FAILURE: {stored}/{len(valid_items)} items stored, {failed} FAILED")
+    else:
+        log.info(f"\nDone: {stored}/{len(valid_items)} items stored")
+
+    return {
+        "success": stored == len(valid_items) and len(valid_items) > 0,
+        "parsed": len(items),
+        "validated": len(valid_items),
+        "stored": stored,
+        "failed": failed,
+    }
 
 
 # ============================================================================

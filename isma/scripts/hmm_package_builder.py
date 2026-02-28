@@ -46,22 +46,26 @@ STATE_PATH = "/var/spark/isma/hmm_pkg_state.json"
 PFX = "hmm:pkg:"
 
 # Platform token budgets (usable content, leaving room for prompt + response)
+# Large packages = richer cross-references + faster corpus completion
 PLATFORM_BUDGETS = {
-    "chatgpt": 80_000,
-    "claude": 60_000,  # Reduced for paste approach (clipboard limit ~200KB)
+    "chatgpt": 100_000,  # GPT-4o: 128K context, reserve 28K for response
+    "claude": 100_000,   # Claude: 200K context, reserve 100K for response
     "perplexity": 80_000,
-    "grok": 260_000,
-    "gemini": 350_000,
+    "grok": 200_000,     # Grok: 256K+ context, reserve for response
+    "gemini": 200_000,   # Gemini: 1M+ context, but diminishing returns past 200K
 }
 
 CHARS_PER_TOKEN = 3.8  # Conservative: tiktoken audit shows actual avg is 3.81
 
 # How many items per package (soft limits — actual count depends on content size)
 MIN_ITEMS_PER_PKG = 3
-MAX_ITEMS_PER_PKG = 20
+MAX_ITEMS_PER_PKG = 500  # Let token budget be the constraint, not item count
 
-# Anchors per package
-MAX_ANCHORS = 5
+# Platform-specific max items (overrides MAX_ITEMS_PER_PKG)
+PLATFORM_MAX_ITEMS = {}  # No per-platform caps — token budget controls size
+
+# Anchors per package (kernel/layer seeds for context grounding)
+MAX_ANCHORS = 10
 
 # ============================================================================
 # Connections
@@ -300,16 +304,23 @@ def estimate_full_tokens(content_hash: str) -> int:
 # Package Building
 # ============================================================================
 
-def select_theme() -> tuple:
+def select_theme(exclude_ids: set = None) -> tuple:
     """Select the next theme to work on. Returns (theme_key, theme_data) or (None, None).
 
     Samples 50 items per theme to estimate availability. Fast even over network.
+
+    Args:
+        exclude_ids: Theme IDs to skip (already tried in this package build).
     """
     index = load_index()
     best_key = None
     best_available = 0
+    exclude = exclude_ids or set()
 
     for key, theme in index.items():
+        if theme.get("theme_id") in exclude:
+            continue
+
         all_items = theme.get("unenriched_corpus", []) + theme.get("unenriched_exchanges", [])
         if not all_items:
             continue
@@ -333,39 +344,27 @@ def select_theme() -> tuple:
     return None, None
 
 
-def build_package(platform: str) -> str:
-    """Build next package for a platform. Returns path to markdown file."""
-    budget_tokens = PLATFORM_BUDGETS.get(platform)
-    if not budget_tokens:
-        log.error(f"Unknown platform: {platform}")
-        return ""
-
-    # Reserve tokens for prompt (~2K) and anchors (~1K)
-    content_budget = budget_tokens - 3000
-
-    # Select theme
-    theme_key, theme_data = select_theme()
-    if not theme_data:
-        log.info("No themes with available items remaining.")
-        return ""
-
-    theme_id = theme_data["theme_id"]
-    theme_name = theme_data["display_name"]
-    log.info(f"Building package for {platform} — Theme {theme_id} ({theme_name})")
-
-    # Batch check availability for candidates (shuffle to avoid first-200 bias)
+def _gather_candidates_from_theme(theme_data: dict, seen_hashes: set) -> list:
+    """Get available candidates from a theme, excluding already-seen hashes."""
     import random as _rng
     corpus_all = theme_data.get("unenriched_corpus", [])
     exchange_all = theme_data.get("unenriched_exchanges", [])
     _rng.shuffle(corpus_all)
     _rng.shuffle(exchange_all)
-    corpus_raw = corpus_all[:200]
-    exchange_raw = exchange_all[:200]
-    all_hashes = [it["content_hash"] for it in corpus_raw + exchange_raw]
-    available_set = batch_check_available(all_hashes)
+    corpus_raw = corpus_all[:1000]
+    exchange_raw = exchange_all[:1000]
 
-    corpus_items = [it for it in corpus_raw if it["content_hash"] in available_set]
-    exchange_items = [it for it in exchange_raw if it["content_hash"] in available_set]
+    # Filter out already-seen items before checking Redis
+    new_hashes = [it["content_hash"] for it in corpus_raw + exchange_raw
+                  if it["content_hash"] not in seen_hashes]
+    if not new_hashes:
+        return []
+
+    available_set = batch_check_available(new_hashes)
+    corpus_items = [it for it in corpus_raw
+                    if it["content_hash"] in available_set and it["content_hash"] not in seen_hashes]
+    exchange_items = [it for it in exchange_raw
+                      if it["content_hash"] in available_set and it["content_hash"] not in seen_hashes]
 
     # Interleave corpus and exchanges — 2 corpus : 1 exchange ratio
     candidates = []
@@ -380,75 +379,116 @@ def build_package(platform: str) -> str:
         if ei < len(exchange_items):
             candidates.append(("TRANSCRIPT", exchange_items[ei]))
             ei += 1
+    return candidates
 
-    if not candidates:
-        log.info(f"No available items for theme {theme_id}")
+
+def build_package(platform: str) -> str:
+    """Build next package for a platform. Returns path to markdown file.
+
+    Pulls from multiple themes to fill the token budget. Stops when
+    budget is full or no more items are available across all themes.
+    """
+    budget_tokens = PLATFORM_BUDGETS.get(platform)
+    if not budget_tokens:
+        log.error(f"Unknown platform: {platform}")
         return ""
 
-    # Fetch content and select items that fit the budget
-    # We fetch during selection to get accurate token counts
+    # Reserve tokens for prompt (~2K) and anchors (~1K)
+    content_budget = budget_tokens - 3000
+
+    # Collect items across themes until budget is filled
     pkg_items = []
     actual_tokens = 0
     seen_hashes = set()
     skipped_large = 0
+    themes_used = []
+    tried_themes = set()
+    primary_theme_data = None
 
-    for item_type, item in candidates:
-        ch = item["content_hash"]
-        if ch in seen_hashes:
+    while actual_tokens < content_budget * 0.8:  # Keep filling until 80%+ of budget
+        theme_key, theme_data = select_theme(exclude_ids=tried_themes)
+        if not theme_data:
+            break
+        theme_id = theme_data["theme_id"]
+        tried_themes.add(theme_id)
+
+        if not primary_theme_data:
+            primary_theme_data = theme_data
+
+        theme_name = theme_data["display_name"]
+        log.info(f"Adding from Theme {theme_id} ({theme_name}) — {actual_tokens:,}/{content_budget:,} tokens so far")
+
+        candidates = _gather_candidates_from_theme(theme_data, seen_hashes)
+        if not candidates:
+            log.info(f"  No available items in theme {theme_id}, trying next")
             continue
-        seen_hashes.add(ch)
 
-        # Fetch full content to get actual size
-        content = fetch_full_content(ch)
-        if not content:
-            continue
+        themes_used.append(f"{theme_id} ({theme_name})")
+        added_this_theme = 0
 
-        content_tokens = int(len(content) / CHARS_PER_TOKEN)
+        for item_type, item in candidates:
+            ch = item["content_hash"]
+            if ch in seen_hashes:
+                continue
+            seen_hashes.add(ch)
 
-        # Skip items that exceed the FULL budget (can never fit in any package for this platform)
-        if content_tokens > content_budget:
-            skipped_large += 1
-            if skipped_large > 20:
+            content = fetch_full_content(ch)
+            if not content:
+                continue
+
+            content_tokens = int(len(content) / CHARS_PER_TOKEN)
+
+            # Skip items that exceed the FULL budget
+            if content_tokens > content_budget:
+                skipped_large += 1
+                if skipped_large > 20:
+                    break
+                continue
+
+            # Hard budget enforcement
+            remaining = content_budget - actual_tokens
+            if content_tokens > remaining:
+                if len(pkg_items) >= 1:
+                    break
+                skipped_large += 1
+                if skipped_large > 20:
+                    break
+                continue
+
+            # Soft skip: only skip if item uses >90% of remaining AND we have 5+ items
+            if content_tokens > remaining * 0.9 and len(pkg_items) >= 5:
+                skipped_large += 1
+                if skipped_large > 15:
+                    break
+                continue
+
+            meta = get_item_metadata(ch)
+            pkg_items.append({
+                "type": item_type,
+                "content_hash": ch,
+                "source_file": item.get("source_file", meta.get("source_file", "")),
+                "platform": meta.get("platform", ""),
+                "session_id": meta.get("session_id", ""),
+                "exchange_index": meta.get("exchange_index"),
+                "content": content,
+                "token_count": content_tokens,
+                "score": item.get("score", 0),
+            })
+            actual_tokens += content_tokens
+            added_this_theme += 1
+
+            if len(pkg_items) % 10 == 0:
+                log.info(f"  {len(pkg_items)} items, {actual_tokens:,} tokens so far")
+
+            if actual_tokens >= content_budget:
                 break
-            continue
 
-        # Hard budget enforcement — ALWAYS, even for first items
-        remaining = content_budget - actual_tokens
-        if content_tokens > remaining:
-            if len(pkg_items) >= 1:
-                # Have at least 1 item, stop adding
+            if len(pkg_items) >= PLATFORM_MAX_ITEMS.get(platform, MAX_ITEMS_PER_PKG):
                 break
-            # No items yet and this one doesn't fit — skip, try smaller
-            skipped_large += 1
-            if skipped_large > 20:
-                break
-            continue
 
-        # Soft skip: only skip if item uses >90% of remaining AND we have 5+ items already
-        if content_tokens > remaining * 0.9 and len(pkg_items) >= 5:
-            skipped_large += 1
-            if skipped_large > 15:
-                break
-            continue
+        log.info(f"  Added {added_this_theme} items from theme {theme_id}")
 
-        meta = get_item_metadata(ch)
-        pkg_items.append({
-            "type": item_type,
-            "content_hash": ch,
-            "source_file": item.get("source_file", meta.get("source_file", "")),
-            "platform": meta.get("platform", ""),
-            "session_id": meta.get("session_id", ""),
-            "exchange_index": meta.get("exchange_index"),
-            "content": content,
-            "token_count": content_tokens,
-            "score": item.get("score", 0),
-        })
-        actual_tokens += content_tokens
-
-        if len(pkg_items) % 10 == 0:
-            log.info(f"  {len(pkg_items)} items, {actual_tokens:,} tokens so far")
-
-        if len(pkg_items) >= MAX_ITEMS_PER_PKG:
+        if actual_tokens >= content_budget:
             break
 
     if skipped_large:
@@ -458,11 +498,19 @@ def build_package(platform: str) -> str:
         log.error("No content retrieved — package empty")
         return ""
 
-    # Get anchors
+    # Use primary theme for anchors and naming
+    theme_data = primary_theme_data
+    theme_id = theme_data["theme_id"]
+    theme_name = theme_data["display_name"]
+
+    # Get anchors from primary theme
     anchors = theme_data.get("anchor_rosettas", [])[:MAX_ANCHORS]
 
-    # Generate package ID
-    pkg_id = f"pkg_{theme_id}_{platform}_{int(time.time())}"
+    # Generate package ID (multi-theme gets "multi" suffix)
+    if len(themes_used) > 1:
+        pkg_id = f"pkg_{theme_id}_multi_{platform}_{int(time.time())}"
+    else:
+        pkg_id = f"pkg_{theme_id}_{platform}_{int(time.time())}"
 
     # Write markdown
     os.makedirs(PKG_DIR, exist_ok=True)
@@ -479,6 +527,7 @@ def build_package(platform: str) -> str:
         "pkg_id": pkg_id,
         "theme_id": theme_id,
         "theme_name": theme_name,
+        "themes": themes_used,
         "platform": platform,
         "content_hashes": content_hashes,
         "item_count": len(pkg_items),
@@ -488,7 +537,8 @@ def build_package(platform: str) -> str:
     })
 
     log.info(f"Package built: {pkg_path}")
-    log.info(f"  Items: {len(pkg_items)}, Tokens: {actual_tokens:,}, Anchors: {len(anchors)}")
+    log.info(f"  Items: {len(pkg_items)}, Tokens: {actual_tokens:,}, "
+             f"Themes: {len(themes_used)}, Anchors: {len(anchors)}")
 
     return pkg_path
 
@@ -730,8 +780,9 @@ def main():
     next_cmd = sub.add_parser("next", help="Build next package")
     next_cmd.add_argument("--platform", required=True, choices=list(PLATFORM_BUDGETS.keys()))
 
-    sub.add_parser("complete", help="Mark current package done").add_argument(
-        "--platform", choices=list(PLATFORM_BUDGETS.keys()))
+    complete_cmd = sub.add_parser("complete", help="Mark current package done")
+    complete_cmd.add_argument("--platform", choices=list(PLATFORM_BUDGETS.keys()))
+    complete_cmd.add_argument("--response-file", help="Path to AI response file — auto-processes via hmm_store_results")
 
     fail_cmd = sub.add_parser("fail", help="Mark current package failed")
     fail_cmd.add_argument("reason", nargs="?", default="unknown")
@@ -755,6 +806,42 @@ def main():
 
     elif args.command == "complete":
         platform = getattr(args, "platform", None)
+        response_file = getattr(args, "response_file", None)
+
+        # 6SIGMA: Process response file BEFORE marking complete.
+        # If storage fails, items go BACK to queue. Never mark complete on failure.
+        if response_file:
+            if not os.path.exists(response_file):
+                log.error(f"HALT: Response file not found: {response_file}")
+                sys.exit(1)
+
+            scripts_dir = os.path.dirname(os.path.abspath(__file__))
+            if scripts_dir not in sys.path:
+                sys.path.insert(0, scripts_dir)
+            from hmm_store_results import process_response
+
+            pkg = get_current_package(platform) if platform else None
+            pkg_id = pkg.get("pkg_id", "") if pkg else ""
+
+            result = process_response(
+                response_file,
+                platform=platform or "unknown",
+                pkg_id=pkg_id,
+            )
+
+            if not result.get("success"):
+                stored = result.get('stored', 0)
+                parsed = result.get('parsed', 0)
+                failed = result.get('failed', 0)
+                log.error(f"STORAGE FAILED: {stored}/{parsed} stored, {failed} failed")
+                log.error(f"Response file preserved: {response_file}")
+                # Requeue items — do NOT mark complete
+                fail_package(f"storage_failed: {stored}/{parsed} stored", platform)
+                log.error(f"Items requeued. Fix issue and rebuild package.")
+                sys.exit(1)
+
+            log.info(f"Response stored: {result.get('stored', 0)}/{result.get('parsed', 0)} items")
+
         if not complete_package(platform):
             sys.exit(1)
 
