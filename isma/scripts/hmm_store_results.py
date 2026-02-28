@@ -190,11 +190,11 @@ def embed_and_store_rosetta(content_hash: str, rosetta: str, dominant: list,
 
     try:
         if existing_tiles:
-            # Update existing rosetta tile
+            # Update existing rosetta tile (PATCH, not PUT — 'id' is immutable)
             oid = existing_tiles[0]["_additional"]["id"]
-            r = _wv_session.put(
+            r = _wv_session.patch(
                 f"{WEAVIATE_URL}/v1/objects/{WEAVIATE_CLASS}/{oid}",
-                json={"class": WEAVIATE_CLASS, "properties": props, "vector": vector},
+                json={"properties": props, "vector": vector},
                 timeout=30,
             )
         else:
@@ -205,7 +205,7 @@ def embed_and_store_rosetta(content_hash: str, rosetta: str, dominant: list,
                 timeout=30,
             )
 
-        if r.status_code not in (200, 201):
+        if r.status_code not in (200, 201, 204):
             log.error(f"  Rosetta tile store: HTTP {r.status_code} {r.text[:200]}")
             return False
         log.info(f"  Rosetta tile: {'updated' if existing_tiles else 'created'} for {content_hash[:12]}")
