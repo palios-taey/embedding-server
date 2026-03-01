@@ -461,7 +461,11 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
         src_tiles = src_data.get("Get", {}).get(WEAVIATE_CLASS, [])
         if src_tiles:
             source_file = src_tiles[0].get("source_file", "")
-    embed_and_store_rosetta(full_hash, rosetta, dominant, motif_data, platform, source_file)
+    rosetta_ok = embed_and_store_rosetta(full_hash, rosetta, dominant, motif_data, platform, source_file)
+    if not rosetta_ok:
+        log.error(f"  ROSETTA FAILED for {full_hash[:16]}: embedding or Weaviate store failed")
+        # Rosetta failure is a full failure — vectors are critical for search
+        weaviate_ok = False
 
     # --- Neo4j: HMMTile + EXPRESSES edges ---
     try:
@@ -660,8 +664,9 @@ def process_response(response_path: str, platform: str = "unknown", pkg_id: str 
             print(f"  {prefix}: {n_motifs} motifs, {n_xrefs} xrefs — {rosetta}...")
         return {"success": True, "parsed": len(valid_items), "stored": 0}
 
-    # Store each item
+    # Store each item — track which content hashes were actually stored
     stored = 0
+    stored_hashes = []
     for item in valid_items:
         prefix = item.get("hash", "")
         full_hash = hash_map[prefix]
@@ -669,6 +674,7 @@ def process_response(response_path: str, platform: str = "unknown", pkg_id: str 
 
         if store_item(item, full_hash, platform, pkg_id):
             stored += 1
+            stored_hashes.append(full_hash)
 
     # Store cross-references
     store_cross_refs(items, hash_map, platform)
@@ -685,6 +691,7 @@ def process_response(response_path: str, platform: str = "unknown", pkg_id: str 
         "validated": len(valid_items),
         "stored": stored,
         "failed": failed,
+        "stored_hashes": stored_hashes,
     }
 
 

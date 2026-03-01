@@ -141,16 +141,34 @@ def mark_in_progress(content_hashes: list, platform: str, pkg_id: str):
     pipe.execute()
 
 
-def mark_completed(content_hashes: list):
-    """Mark items as completed."""
+def mark_completed(content_hashes: list, pkg_id: str = ""):
+    """Mark items as completed with ownership verification.
+
+    If pkg_id is provided, only marks items whose in-progress key
+    matches this package. Prevents TTL race condition where an expired
+    item gets re-assigned to a new package but the old one completes it.
+    """
     r = get_redis()
-    if content_hashes:
-        r.sadd(f"{PFX}completed", *content_hashes)
+    verified_hashes = []
+    if pkg_id and content_hashes:
+        # Ownership check: only complete items still owned by this package
+        for ch in content_hashes:
+            owner = r.get(f"{PFX}in_progress:{ch}")
+            if owner is None or pkg_id in owner:
+                verified_hashes.append(ch)
+            else:
+                log.warning(f"  Ownership mismatch for {ch[:12]}: owned by {owner}, not {pkg_id} — skipping")
+    else:
+        verified_hashes = content_hashes
+
+    if verified_hashes:
+        r.sadd(f"{PFX}completed", *verified_hashes)
     # Clean up in-progress keys
     pipe = r.pipeline()
-    for ch in content_hashes:
+    for ch in verified_hashes:
         pipe.delete(f"{PFX}in_progress:{ch}")
     pipe.execute()
+    return len(verified_hashes)
 
 
 def get_current_package(platform: str = None) -> dict:
@@ -656,15 +674,19 @@ def complete_package(platform: str = None):
         return False
 
     hashes = pkg.get("content_hashes", [])
-    mark_completed(hashes)
+    pkg_id = pkg.get("pkg_id", "")
+    verified = mark_completed(hashes, pkg_id=pkg_id)
     clear_current_package(platform)
 
-    # Update stats
+    # Update stats — only count verified items (prevents counter inflation)
     r = get_redis()
     r.hincrby(f"{PFX}stats", "completed_packages", 1)
-    r.hincrby(f"{PFX}stats", "completed_items", len(hashes))
+    r.hincrby(f"{PFX}stats", "completed_items", verified)
 
-    log.info(f"Completed package {pkg['pkg_id']} — {len(hashes)} items marked done")
+    if verified < len(hashes):
+        log.warning(f"Completed package {pkg_id} — {verified}/{len(hashes)} items verified (ownership mismatch on {len(hashes) - verified})")
+    else:
+        log.info(f"Completed package {pkg_id} — {verified} items marked done")
     return True
 
 
@@ -810,7 +832,7 @@ def main():
 
     complete_cmd = sub.add_parser("complete", help="Mark current package done")
     complete_cmd.add_argument("--platform", choices=list(PLATFORM_BUDGETS.keys()))
-    complete_cmd.add_argument("--response-file", help="Path to AI response file — auto-processes via hmm_store_results")
+    complete_cmd.add_argument("--response-file", required=True, help="Path to AI response file — REQUIRED, processes via hmm_store_results")
 
     fail_cmd = sub.add_parser("fail", help="Mark current package failed")
     fail_cmd.add_argument("reason", nargs="?", default="unknown")
@@ -839,42 +861,73 @@ def main():
         platform = getattr(args, "platform", None)
         response_file = getattr(args, "response_file", None)
 
-        # 6SIGMA: Process response file BEFORE marking complete.
-        # If storage fails, items go BACK to queue. Never mark complete on failure.
-        if response_file:
-            if not os.path.exists(response_file):
-                log.error(f"HALT: Response file not found: {response_file}")
-                sys.exit(1)
-
-            scripts_dir = os.path.dirname(os.path.abspath(__file__))
-            if scripts_dir not in sys.path:
-                sys.path.insert(0, scripts_dir)
-            from hmm_store_results import process_response
-
-            pkg = get_current_package(platform) if platform else None
-            pkg_id = pkg.get("pkg_id", "") if pkg else ""
-
-            result = process_response(
-                response_file,
-                platform=platform or "unknown",
-                pkg_id=pkg_id,
-            )
-
-            if not result.get("success"):
-                stored = result.get('stored', 0)
-                parsed = result.get('parsed', 0)
-                failed = result.get('failed', 0)
-                log.error(f"STORAGE FAILED: {stored}/{parsed} stored, {failed} failed")
-                log.error(f"Response file preserved: {response_file}")
-                # Requeue items — do NOT mark complete
-                fail_package(f"storage_failed: {stored}/{parsed} stored", platform)
-                log.error(f"Items requeued. Fix issue and rebuild package.")
-                sys.exit(1)
-
-            log.info(f"Response stored: {result.get('stored', 0)}/{result.get('parsed', 0)} items")
-
-        if not complete_package(platform):
+        # 6SIGMA: --response-file is MANDATORY. Never mark items complete without storing data.
+        if not response_file:
+            log.error("HALT: --response-file is required. Cannot mark items complete without storing response data.")
+            log.error("Usage: complete --platform <name> --response-file <path>")
             sys.exit(1)
+
+        if not os.path.exists(response_file):
+            log.error(f"HALT: Response file not found: {response_file}")
+            sys.exit(1)
+
+        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from hmm_store_results import process_response
+
+        pkg = get_current_package(platform) if platform else None
+        if not pkg:
+            log.error("No current package found to complete")
+            sys.exit(1)
+        pkg_id = pkg.get("pkg_id", "")
+        pkg_hashes = set(pkg.get("content_hashes", []))
+
+        result = process_response(
+            response_file,
+            platform=platform or "unknown",
+            pkg_id=pkg_id,
+        )
+
+        if not result.get("success"):
+            stored = result.get('stored', 0)
+            parsed = result.get('parsed', 0)
+            failed = result.get('failed', 0)
+            log.error(f"STORAGE FAILED: {stored}/{parsed} stored, {failed} failed")
+            log.error(f"Response file preserved: {response_file}")
+            # Requeue ALL items — do NOT mark any complete
+            fail_package(f"storage_failed: {stored}/{parsed} stored", platform)
+            log.error(f"Items requeued. Fix issue and rebuild package.")
+            sys.exit(1)
+
+        # 6SIGMA: Only mark STORED hashes as complete, not the full package.
+        # If AI returned 7 items from a 90-item package, only those 7 get marked done.
+        stored_hashes = set(result.get("stored_hashes", []))
+        unstored_hashes = pkg_hashes - stored_hashes
+
+        if unstored_hashes:
+            log.warning(f"PARTIAL RESPONSE: {len(stored_hashes)}/{len(pkg_hashes)} items stored")
+            log.warning(f"  {len(unstored_hashes)} items NOT in response — requeuing them")
+            # Requeue unstored items (delete in-progress keys so they become available)
+            r = get_redis()
+            pipe = r.pipeline()
+            for ch in unstored_hashes:
+                pipe.delete(f"{PFX}in_progress:{ch}")
+            pipe.execute()
+
+        # Mark only stored hashes as completed
+        if stored_hashes:
+            verified = mark_completed(list(stored_hashes), pkg_id=pkg_id)
+            r = get_redis()
+            r.hincrby(f"{PFX}stats", "completed_packages", 1)
+            r.hincrby(f"{PFX}stats", "completed_items", verified)
+            log.info(f"Completed: {verified} items marked done (of {len(pkg_hashes)} in package)")
+        else:
+            log.error("Zero items stored — failing package")
+            fail_package("zero_items_stored", platform)
+            sys.exit(1)
+
+        clear_current_package(platform)
 
     elif args.command == "fail":
         platform = getattr(args, "platform", None)
