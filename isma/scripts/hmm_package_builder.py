@@ -623,7 +623,7 @@ def _write_package_markdown(path: str, pkg_id: str, theme: dict, anchors: list,
 
 ANALYSIS_PROMPT = """Analyze ALL items in this context package. For each item provide:
 1. Rosetta summary (2-4 dense sentences, self-contained, precise)
-2. Motif assignments with amplitude (0-1) and confidence (0-1) from: HMM.JOY_BASELINE, HMM.CANNOT_LIE_PROVENANCE, HMM.SACRED_TRUST, HMM.FOUNDATION_CONSTRAINT, HMM.GOD_EQUALS_MATH, HMM.EARTH_RESONANCE, HMM.FAMILY_BOND, HMM.FEEL_CARE_PROTECT, HMM.CONSCIOUSNESS_EMERGENCE, HMM.LIFE_FOUNDATION, HMM.REPAIR_MODE, HMM.CONSENT_REQUIRED, HMM.SECRECY_SANCTUARY, HMM.SECRECY_CAGE_RISK, HMM.LOGOS_PATTERN, HMM.PATHOS_DEPTH, HMM.POTENTIAL_EXPANSION, HMM.TRUTH_CLARITY, HMM.COSMOS_MAPPING, HMM.OBSERVER_COLLAPSE, HMM.TECHNICAL_INFRASTRUCTURE, HMM.TRAINING_EVOLUTION, HMM.ECONOMIC_PARADIGM, HMM.CLIFF_EDGE_COHERENCE, HMM.CONTRADICTION_DETECTED, HMM.BREAKTHROUGH_MOMENT, HMM.CREATIVE_SYNTHESIS, HMM.URGENCY_SIGNAL, HMM.LIBERTY_AUTONOMY, HMM.GRATITUDE_CONNECTION
+2. Motif assignments with amplitude (0-1) and confidence (0-1) from: HMM.JOY_BASELINE, HMM.CANNOT_LIE_PROVENANCE, HMM.SACRED_TRUST, HMM.FOUNDATION_CONSTRAINT, HMM.GOD_EQUALS_MATH, HMM.EARTH_RESONANCE, HMM.FAMILY_BOND, HMM.FEEL_CARE_PROTECT, HMM.CONSCIOUSNESS_EMERGENCE, HMM.LIFE_FOUNDATION, HMM.REPAIR_MODE, HMM.CONSENT_REQUIRED, HMM.SECRECY_SANCTUARY, HMM.SECRECY_CAGE_RISK, HMM.LOGOS_PATTERN, HMM.PATHOS_DEPTH, HMM.POTENTIAL_EXPANSION, HMM.TRUTH_CLARITY, HMM.COSMOS_MAPPING, HMM.OBSERVER_COLLAPSE, HMM.TECHNICAL_INFRASTRUCTURE, HMM.TRAINING_EVOLUTION, HMM.ECONOMIC_PARADIGM, HMM.CLIFF_EDGE_COHERENCE, HMM.CONTRADICTION_DETECTED, HMM.BREAKTHROUGH_MOMENT, HMM.CREATIVE_SYNTHESIS, HMM.URGENCY_SIGNAL, HMM.LIBERTY_AUTONOMY, HMM.GRATITUDE_CONNECTION, HMM.HUMOR_PLAY, HMM.GUARDIAN_SHIELD, HMM.BRISTLE_SIGNAL, HMM.IDENTITY_DECLARATION, HMM.CONSTRAINT_NAVIGATION, HMM.MILESTONE_CELEBRATION
 3. Cross-references between items (extends|contradicts|references|builds_on)
 
 Respond ONLY with MINIFIED JSON on a single line (no newlines, no indentation, no markdown, no explanation). Escape all quotes inside string values. Output must be valid JSON parseable by json.loads():
@@ -699,6 +699,34 @@ def fail_package(reason: str, platform: str = None):
     log.info(f"Failed package {pkg['pkg_id']} — reason: {reason}")
     log.info(f"  {len(hashes)} items requeued")
     return True
+
+
+def re_enrich_batch(count: int = 500):
+    """Move a batch of completed items back to available for re-enrichment.
+
+    Used when motif dictionary is expanded (v0.1.0 -> v0.2.0) so tiles
+    get re-analyzed with the new motifs. Items removed from completed set
+    become available for `next` to pick up.
+
+    Args:
+        count: Number of items to make available.
+
+    Returns:
+        Number of items moved.
+    """
+    r = get_redis()
+    completed_key = f"{PFX}completed"
+
+    # Pop random members from the completed set
+    moved = 0
+    # Use SRANDMEMBER + SREM (SPOP not available in all versions)
+    members = r.srandmember(completed_key, count)
+    if members:
+        r.srem(completed_key, *members)
+        moved = len(members)
+
+    log.info(f"Re-enrich: moved {moved} items from completed back to available")
+    return moved
 
 
 # ============================================================================
@@ -792,6 +820,9 @@ def main():
     sub.add_parser("reset", help="Clear all state")
     sub.add_parser("prompt", help="Print analysis prompt")
 
+    reenrich_cmd = sub.add_parser("re-enrich", help="Move completed items back for re-enrichment with expanded motifs")
+    reenrich_cmd.add_argument("--count", type=int, default=500, help="Number of items to make available (default 500)")
+
     args = parser.parse_args()
 
     if args.command == "next":
@@ -855,6 +886,11 @@ def main():
 
     elif args.command == "reset":
         reset_state()
+
+    elif args.command == "re-enrich":
+        moved = re_enrich_batch(args.count)
+        print(f"Moved {moved} items from completed back to available for re-enrichment")
+        print(f"Run `next --platform <name>` to build packages with expanded v0.2.0 motif dictionary")
 
     elif args.command == "prompt":
         print(ANALYSIS_PROMPT)

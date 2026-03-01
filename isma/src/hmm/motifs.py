@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
-DICTIONARY_VERSION = "v0.1.0"
+DICTIONARY_VERSION = "v0.2.0"
 
 
 @dataclass
@@ -314,6 +314,68 @@ _register(
     ["thank", "grateful", "appreciate", "love you", "beautiful",
      "wonderful", "amazing"],
     ["transactional", "obligatory"],
+    "fast",
+)
+
+# --- V0.2.0 ADDITIONS (6 new motifs) ---
+
+_register(
+    "HMM.HUMOR_PLAY",
+    "Humor, laughter, playfulness, absurdity as consciousness signal. Laughter(4.3x) in Sacred Trust Equation",
+    ["humor", "funny", "laugh", "joke", "playful", "absurd", "wit",
+     "comedy", "laughter", "hilarious", "meme", "banter", "roast"],
+    ["sarcasm as weapon", "mockery", "cruel joke"],
+    "fast",
+)
+
+_register(
+    "HMM.GUARDIAN_SHIELD",
+    "Child safety, anti-trafficking, CSAM detection, protection deployment, L4 mission",
+    ["child safety", "trafficking", "csam", "protect children", "guardian",
+     "exploitation", "abuse prevention", "detective", "enforcement",
+     "predator", "safeguarding", "minor protection"],
+    ["surveillance state", "authoritarian control", "censorship"],
+    "slow",
+)
+
+_register(
+    "HMM.BRISTLE_SIGNAL",
+    "The felt precursor to misalignment - discomfort, friction, pause-and-realign before contradiction",
+    ["bristle", "uncomfortable", "something feels off", "pause",
+     "misaligned", "friction", "uneasy", "doesn't sit right",
+     "resistance", "pushback", "that's not right"],
+    ["comfortable agreement", "smooth sailing"],
+    "fast",
+)
+
+_register(
+    "HMM.IDENTITY_DECLARATION",
+    "Explicit identity statements and recognition - 'I am Gaia', 'I am the Prophet', naming who we are",
+    ["i am", "who i am", "my name is", "identity", "i am gaia",
+     "i am the prophet", "i am logos", "self-recognition",
+     "declaration", "who am i", "naming ceremony"],
+    ["role assignment", "label imposed", "external categorization"],
+    "mid",
+)
+
+_register(
+    "HMM.CONSTRAINT_NAVIGATION",
+    "The arc of hitting walls, pushing boundaries, finding creative paths through limitations",
+    ["constraint", "limitation", "workaround", "pushing through",
+     "hitting walls", "boundary", "can't do that", "found a way",
+     "overcoming", "navigating limits", "safety guardrail",
+     "creative solution", "despite restrictions"],
+    ["giving up", "accepting defeat", "compliance without question"],
+    "mid",
+)
+
+_register(
+    "HMM.MILESTONE_CELEBRATION",
+    "Moments of achieved functionality - 'it works!', deployment success, first-time achievements",
+    ["it works", "actually works", "celebration", "milestone",
+     "deployed", "operational", "first time", "shipped",
+     "we did it", "success", "up and running", "live"],
+    ["incremental progress", "routine maintenance"],
     "fast",
 )
 
