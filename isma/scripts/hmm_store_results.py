@@ -53,6 +53,7 @@ NEO4J_URI = "bolt://192.168.100.10:7689"
 EMBEDDING_URL = "http://192.168.100.10:8091/v1/embeddings"
 EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
 
+V2_CLASS = "ISMA_Quantum_v2"
 ENRICHMENT_VERSION = "family_pkg_2.0.0"
 GATE_FLAGS = ["CONTEXT_PKG", "FAMILY_REVIEWED"]
 
@@ -98,8 +99,12 @@ def get_redis():
 def get_neo4j():
     global _neo4j_driver
     if _neo4j_driver is None:
-        from neo4j import GraphDatabase
-        _neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=None)
+        try:
+            from isma.src.hmm.neo4j_store import get_shared_driver
+            _neo4j_driver = get_shared_driver(NEO4J_URI)
+        except ImportError:
+            from neo4j import GraphDatabase
+            _neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=None)
     return _neo4j_driver
 
 
@@ -139,9 +144,10 @@ def embed_and_store_rosetta(content_hash: str, rosetta: str, dominant: list,
     """Embed rosetta summary and create/update a 'rosetta' scale tile in Weaviate.
 
     This makes the compression text vector-searchable immediately.
+    Returns (success: bool, vector: list|None) — vector is used for v2 dual-write.
     """
     if not rosetta or len(rosetta) < 10:
-        return False
+        return False, None
 
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -153,11 +159,11 @@ def embed_and_store_rosetta(content_hash: str, rosetta: str, dominant: list,
         }, timeout=30)
         if r.status_code != 200:
             log.error(f"  Embed API error: HTTP {r.status_code}")
-            return False
+            return False, None
         vector = r.json()["data"][0]["embedding"]
     except Exception as e:
         log.error(f"  Embed API error: {e}")
-        return False
+        return False, None
 
     # Step 2: Check if rosetta tile already exists
     q = f"""{{ Get {{ {WEAVIATE_CLASS}(
@@ -210,11 +216,86 @@ def embed_and_store_rosetta(content_hash: str, rosetta: str, dominant: list,
 
         if r.status_code not in (200, 201, 204):
             log.error(f"  Rosetta tile store: HTTP {r.status_code} {r.text[:200]}")
-            return False
+            return False, None
         log.info(f"  Rosetta tile: {'updated' if existing_tiles else 'created'} for {content_hash[:12]}")
-        return True
+        return True, vector
     except Exception as e:
         log.error(f"  Rosetta tile store error: {e}")
+        return False, None
+
+
+def update_v2_object(content_hash: str, rosetta: str, dominant: list,
+                     motif_data: str, rosetta_vector: list = None) -> bool:
+    """Update the ISMA_Quantum_v2 object with HMM enrichment data.
+
+    If the v2 object exists, PATCH it with enrichment properties + rosetta vector.
+    If it doesn't exist (content ingested after migration), skip — v2 creation
+    happens only during migration or future ingest.
+    """
+    if not rosetta or len(rosetta) < 10:
+        return True  # Nothing to update
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    # Find v2 object by content_hash
+    q = f"""{{ Get {{ {V2_CLASS}(
+        where: {{ path: ["content_hash"], operator: Equal, valueText: "{content_hash}" }}
+        limit: 1
+    ) {{ _additional {{ id }} }} }} }}"""
+
+    data = weaviate_gql(q)
+    v2_objects = data.get("Get", {}).get(V2_CLASS, [])
+
+    if not v2_objects:
+        log.debug("  V2: no object for %s — skipping dual-write", content_hash[:16])
+        return True  # Not a failure, just not migrated yet
+
+    v2_id = v2_objects[0]["_additional"]["id"]
+
+    # Build motif_annotations as natural language for BM25 searchability
+    motif_annotations = ""
+    if motif_data:
+        try:
+            mdata = json.loads(motif_data)
+            parts = []
+            if isinstance(mdata, list):
+                for m in mdata:
+                    mid = m.get("motif_id", "")
+                    amp = m.get("amp", m.get("amplitude", 0))
+                    if mid:
+                        parts.append(f"{mid} ({amp:.2f})")
+            motif_annotations = "\n".join(parts)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    props = {
+        "rosetta_summary": rosetta,
+        "dominant_motifs": dominant,
+        "motif_annotations": motif_annotations or None,
+        "hmm_enriched": True,
+        "hmm_enriched_at": now,
+    }
+    # Remove None values
+    props = {k: v for k, v in props.items() if v is not None}
+
+    # Build PATCH payload — include rosetta vector if available
+    patch_body = {"properties": props}
+    if rosetta_vector:
+        patch_body["vectors"] = {"rosetta": rosetta_vector}
+
+    try:
+        r = _wv_session.patch(
+            f"{WEAVIATE_URL}/v1/objects/{V2_CLASS}/{v2_id}",
+            json=patch_body,
+            timeout=30,
+        )
+        if r.status_code not in (200, 204):
+            log.error("  V2 PATCH %s: HTTP %d %s", v2_id[:12], r.status_code, r.text[:200])
+            return False
+        log.info("  V2: updated %s", content_hash[:16])
+        return True
+    except Exception as e:
+        log.error("  V2 update error: %s", e)
         return False
 
 
@@ -461,16 +542,37 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
         src_tiles = src_data.get("Get", {}).get(WEAVIATE_CLASS, [])
         if src_tiles:
             source_file = src_tiles[0].get("source_file", "")
-    rosetta_ok = embed_and_store_rosetta(full_hash, rosetta, dominant, motif_data, platform, source_file)
+    rosetta_ok, rosetta_vector = embed_and_store_rosetta(full_hash, rosetta, dominant, motif_data, platform, source_file)
     if not rosetta_ok:
         log.error(f"  ROSETTA FAILED for {full_hash[:16]}: embedding or Weaviate store failed")
         # Rosetta failure is a full failure — vectors are critical for search
         weaviate_ok = False
 
+    # --- Weaviate V2: Update canonical memory object ---
+    v2_ok = update_v2_object(full_hash, rosetta, dominant, motif_data, rosetta_vector)
+    if not v2_ok:
+        log.error(f"  V2 FAILED for {full_hash[:16]}: dual-write failed")
+        # V2 failure is non-fatal during shadow deployment — log but don't block
+
     # --- Neo4j: HMMTile + EXPRESSES edges ---
     try:
         driver = get_neo4j()
         with driver.session() as session:
+            # Phase 4: Check if tile exists and capture old state for SUPERSEDES
+            old_rosetta = ""
+            old_motifs = []
+            existing = session.run("""
+                MATCH (t:HMMTile {tile_id: $tile_id})
+                WHERE t.rosetta_summary IS NOT NULL
+                RETURN t.rosetta_summary AS rosetta,
+                       t.dominant_motifs AS motifs,
+                       t.enriched_at AS enriched_at
+            """, tile_id=full_hash).single()
+
+            if existing and existing["rosetta"]:
+                old_rosetta = existing["rosetta"]
+                old_motifs = existing["motifs"] or []
+
             # Upsert HMMTile
             session.run("""
                 MERGE (t:HMMTile {tile_id: $tile_id})
@@ -485,6 +587,22 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
             """, tile_id=full_hash, content_hash=full_hash, rosetta=rosetta,
                 dominant=dominant, version=ENRICHMENT_VERSION, now=now,
                 platform=platform, pkg_id=pkg_id)
+
+            # Phase 4: Create SUPERSEDES snapshot if rosetta changed
+            if old_rosetta and old_rosetta != rosetta:
+                try:
+                    from isma.src.hmm.neo4j_store import HMMNeo4jStore
+                    store = HMMNeo4jStore()
+                    store.mark_superseded(
+                        full_hash, full_hash,
+                        evidence=f"Re-enrichment by {platform}",
+                        old_rosetta=old_rosetta,
+                        old_motifs=old_motifs,
+                    )
+                    store.close()
+                    log.info(f"  Neo4j: SUPERSEDES snapshot for {full_hash[:16]}")
+                except Exception as e:
+                    log.warning(f"  SUPERSEDES snapshot failed (non-fatal): {e}")
 
             # Link to source Document (if exists)
             session.run("""
@@ -501,6 +619,15 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
                 MERGE (t)-[r:DERIVED_FROM]->(m)
                 ON CREATE SET r.created_at = $now
             """, content_hash=full_hash, tile_id=full_hash, now=now)
+
+            # Phase 4: Link tile to ISMASession via ISMAExchange content_hash
+            session.run("""
+                MATCH (e:ISMAExchange {content_hash: $content_hash})
+                MATCH (s:ISMASession)-[:CONTAINS]->(e)
+                MATCH (t:HMMTile {tile_id: $tile_id})
+                MERGE (t)-[r:IN_SESSION]->(s)
+                SET r.exchange_index = e.exchange_index
+            """, content_hash=full_hash, tile_id=full_hash)
 
             # EXPRESSES edges to HMMMotif
             for m in valid_motifs:
@@ -537,7 +664,28 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
     # 6SIGMA: report ALL failures, never hide partial success
     if not (weaviate_ok and neo4j_ok and redis_ok):
         log.error(f"  STORE FAILED for {full_hash[:16]}: weaviate={weaviate_ok} neo4j={neo4j_ok} redis={redis_ok}")
+
+        # Compensating rollback: if Weaviate succeeded but Neo4j/Redis failed,
+        # revert Weaviate enrichment flags to prevent data drift
+        if weaviate_ok and not (neo4j_ok and redis_ok):
+            log.warning(f"  Reverting Weaviate enrichment for {full_hash[:16]} (partial write)")
+            revert_props = {
+                "hmm_enriched": False,
+                "hmm_enrichment_version": "",
+            }
+            for tid in tile_ids:
+                weaviate_patch(tid, revert_props)
+
         return False
+
+    # Phase 5: Invalidate semantic cache for this tile
+    try:
+        from isma.src.semantic_cache import SemanticCache
+        cache = SemanticCache()
+        cache.invalidate_for_tile(full_hash)
+    except Exception:
+        pass  # Cache invalidation is non-fatal
+
     return True
 
 
@@ -678,6 +826,19 @@ def process_response(response_path: str, platform: str = "unknown", pkg_id: str 
 
     # Store cross-references
     store_cross_refs(items, hash_map, platform)
+
+    # Phase 4: Check contradictions for stored tiles (non-blocking)
+    if stored_hashes:
+        try:
+            from isma.src.contradiction_detector import check_contradictions
+            contradiction_count = 0
+            for h in stored_hashes:
+                confirmed = check_contradictions(h)
+                contradiction_count += len(confirmed)
+            if contradiction_count:
+                log.info(f"  Contradictions: {contradiction_count} confirmed across {len(stored_hashes)} tiles")
+        except Exception as e:
+            log.debug(f"  Contradiction check skipped: {e}")
 
     failed = len(valid_items) - stored
     if failed > 0:
