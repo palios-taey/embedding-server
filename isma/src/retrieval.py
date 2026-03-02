@@ -122,6 +122,8 @@ class TileResult:
     hmm_enriched_at: str = ""
     hmm_consensus: bool = False
     hmm_gate_flags: List[str] = field(default_factory=list)
+    # Temporal
+    loaded_at: str = ""
     # Expanded context (filled on demand)
     expanded_context: str = ""
 
@@ -459,6 +461,7 @@ def _parse_tile(obj: dict) -> TileResult:
         hmm_enriched_at=obj.get("hmm_enriched_at") or "",
         hmm_consensus=obj.get("hmm_consensus") or False,
         hmm_gate_flags=obj.get("hmm_gate_flags") or [],
+        loaded_at=obj.get("loaded_at") or "",
     )
 
 
@@ -1183,23 +1186,63 @@ class ISMARetrieval:
     def hmm_rerank(self, results: SearchResult,
                    query: str,
                    rosetta_weight: float = 0.3,
-                   motif_weight: float = 0.2) -> SearchResult:
-        """Rerank search results using HMM enrichment data.
+                   motif_weight: float = 0.2,
+                   query_type: str = "default",
+                   instruction: str = "") -> SearchResult:
+        """Rerank search results using neural cross-encoder or HMM formula fallback.
 
-        For each tile that has HMM enrichment:
-        - Embed the rosetta_summary and compute cosine similarity to query
-        - Count motif overlap between query-derived motifs and tile motifs
-        - Blend these signals with the original vector score
+        Primary path: Qwen3-Reranker-8B cross-encoder on Spark 2 (port 8085).
+        Fallback: Hand-tuned formula (0.5*base + 0.3*rosetta + 0.2*motif).
 
         Args:
             results: Original SearchResult from search()
-            query: The original query text (for motif compilation)
-            rosetta_weight: Weight for rosetta similarity boost (0..1)
-            motif_weight: Weight for motif overlap boost (0..1)
+            query: The original query text
+            rosetta_weight: Weight for rosetta similarity (fallback only)
+            motif_weight: Weight for motif overlap (fallback only)
+            query_type: Query category for instruction selection (reranker)
+            instruction: Custom reranker instruction (overrides query_type)
 
         Returns:
-            New SearchResult with reranked tiles. Original scores preserved
-            in the tiles; ordering reflects the blended score.
+            New SearchResult with reranked tiles.
+        """
+        if not results.tiles:
+            return results
+
+        # Try neural reranker first
+        try:
+            from isma.src.reranker import get_reranker
+            reranker = get_reranker()
+            if reranker.is_available():
+                reranked_tiles = reranker.rerank(
+                    query, results.tiles,
+                    instruction=instruction,
+                    query_type=query_type,
+                )
+                return SearchResult(
+                    query=results.query,
+                    tiles=reranked_tiles,
+                    total_tokens=results.total_tokens,
+                    search_time_ms=results.search_time_ms,
+                )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug("Reranker unavailable: %s", e)
+
+        # Fallback: original hand-tuned formula
+        return self._hmm_rerank_formula(
+            results, query,
+            rosetta_weight=rosetta_weight,
+            motif_weight=motif_weight,
+        )
+
+    def _hmm_rerank_formula(self, results: SearchResult,
+                            query: str,
+                            rosetta_weight: float = 0.3,
+                            motif_weight: float = 0.2) -> SearchResult:
+        """Fallback reranking using hand-tuned HMM formula.
+
+        Blends: base_score * 0.5 + rosetta_sim * 0.3 + motif_overlap * 0.2
+        Used when the neural reranker is unavailable.
         """
         from isma.src.hmm.motifs import assign_motifs
 
@@ -1348,41 +1391,47 @@ class ISMARetrieval:
                             expand_to_document: bool = False,
                             rosetta_weight: float = 0.3,
                             motif_weight: float = 0.2,
+                            query_type: str = "default",
+                            instruction: str = "",
                             **filters) -> Dict[str, Any]:
         """Full hybrid retrieval with HMM enrichment.
 
         Extends hybrid_retrieve() by:
         1. Running vector search (same as hybrid_retrieve)
-        2. Reranking with HMM rosetta summaries and motif overlap
+        2. Reranking via neural cross-encoder (or fallback formula)
         3. Optionally expanding top results via RELATES_TO graph edges
         4. Optionally expanding to sessions/documents
 
         Args:
             query: Natural language search query
             top_k: Number of results to return
-            hmm_rerank_enabled: Whether to apply HMM reranking
+            hmm_rerank_enabled: Whether to apply reranking
             expand_graph: Whether to expand top results via RELATES_TO
             graph_depth: Depth for graph expansion
             expand_to_session: Expand to full sessions via Neo4j
             expand_to_document: Expand to full documents via Neo4j
-            rosetta_weight: Weight for rosetta similarity in reranking
-            motif_weight: Weight for motif overlap in reranking
+            rosetta_weight: Weight for rosetta similarity (fallback)
+            motif_weight: Weight for motif overlap (fallback)
+            query_type: Query category for reranker instruction
+            instruction: Custom reranker instruction
             **filters: Additional Weaviate filters
         """
         import time
         t0 = time.time()
 
-        # Step 1: Vector search (fetch more than needed for reranking)
-        fetch_k = top_k * 2 if hmm_rerank_enabled else top_k
+        # Step 1: Vector search (fetch 3x for reranker candidate pool)
+        fetch_k = top_k * 3 if hmm_rerank_enabled else top_k
         search_result = self.search(query, top_k=fetch_k,
                                     expand_parents=True, **filters)
 
-        # Step 2: HMM reranking
+        # Step 2: Reranking (neural cross-encoder with formula fallback)
         if hmm_rerank_enabled and search_result.tiles:
             search_result = self.hmm_rerank(
                 search_result, query,
                 rosetta_weight=rosetta_weight,
                 motif_weight=motif_weight,
+                query_type=query_type,
+                instruction=instruction,
             )
             # Trim back to top_k after reranking
             search_result = SearchResult(

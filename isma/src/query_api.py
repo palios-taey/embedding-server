@@ -23,6 +23,8 @@ Endpoints:
     GET  /tile/{hash}         - Get all tiles for content hash
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -37,10 +39,21 @@ import time
 
 from isma.src.retrieval import ISMARetrieval, TileResult, SearchResult
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Increase thread pool for sync endpoints (default 40 is too low)."""
+    import anyio
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    limiter.total_tokens = 100
+    yield
+
+
 app = FastAPI(
     title="ISMA Query API",
     description="Semantic search over 993K embedded tiles with HMM enrichment",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

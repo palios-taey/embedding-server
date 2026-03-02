@@ -1,201 +1,138 @@
-# Qwen3-Embedding-8B Server
+# Embedding Server + ISMA Retrieval System
 
-High-performance embedding inference server optimized for NVIDIA DGX Spark (GB10 Blackwell).
+High-performance embedding inference (Qwen3-Embedding-8B) and retrieval system optimized for NVIDIA DGX Spark (GB10 Blackwell).
 
-**Last Updated**: December 17, 2025
+**Last Updated**: March 2026 (Phase 5.5 — Hardening)
 
 ## Cluster Status
 
-| Node | Status | Instances | Ports |
-|------|--------|-----------|-------|
-| **Spark 1** (10.0.0.68) | ✅ Active | 2 | 8081, 8082 |
-| **Spark 2** (10.0.0.80) | ✅ Active | 2 | 8081, 8082 |
-| **Spark 3** (10.0.0.10) | 🟡 Available | 0 | Ready for deployment |
-| **Spark 4** (10.0.0.19) | 🟡 Available | 0 | Ready for deployment |
+| Node | Role | Ports | Status |
+|------|------|-------|--------|
+| **Spark 1** (192.168.100.10) | Weaviate, Neo4j, Redis, Query API | 8088, 7689, 6379, 8095 | Active |
+| **Spark 2** (192.168.100.11) | Embedding + Reranker inference | 8081, 8085 | Active |
+| **Spark 3** (192.168.100.12) | Reserved (Qwen3.5-122B) | — | Available |
+| **Spark 4** (192.168.100.13) | Embedding inference | 8081 | Active |
 
-**Total Active Throughput**: ~4,650 tok/s (4 instances on Spark 1 & 2)
-
-## Performance
-
-**Current Benchmarks** (Dec 17, 2025):
-- Sequential: 2,607 tok/s
-- 2 parallel: 3,527 tok/s (+35%)
-- 4 parallel: 4,515 tok/s (+73%)
-- 8 parallel: 4,655 tok/s (+79%)
-
-**Hardware**: 4x DGX Spark available (GB10 Blackwell, 128GB VRAM each)
+**NGINX Load Balancer**: 192.168.100.10:8091 (round-robin to Spark 2 + 4)
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    NGINX Load Balancer                       │
-│                      (port 8090)                             │
-│         least_conn + zone + keepalive_requests               │
-└─────────────────────────────────────────────────────────────┘
-                            │
-        ┌───────────────────┼───────────────────┐
-        ▼                   ▼                   ▼
-┌───────────────┐   ┌───────────────┐   ┌───────────────┐
-│  Spark 1:8081 │   │  Spark 1:8082 │   │  Spark 2:8081 │ ...
-│  FastAPI      │   │  FastAPI      │   │  FastAPI      │
-│  Qwen3-8B     │   │  Qwen3-8B     │   │  Qwen3-8B     │
-└───────────────┘   └───────────────┘   └───────────────┘
+Clients → Query API (:8095)
+              │
+              ├── Weaviate (:8088)          Vector search (1M+ tiles)
+              │     └── Embedding LB (:8091)  Qwen3-Embedding-8B
+              ├── Neo4j (:7689)             Knowledge graph (48K exchanges)
+              ├── Redis (:6379)             Cache + HMM motif index
+              └── Reranker (:8085)          Qwen3-Reranker-8B cross-encoder
+```
+
+### Retrieval Pipeline (V2 Adaptive)
+
+```
+Query → Classify (exact/temporal/conceptual/relational/motif)
+      → Cache check (Redis, filter-aware)
+      → Vector search (Weaviate, query-type-specific)
+      → Neural rerank (Qwen3-Reranker-8B, 1024 char window)
+      → Temporal decay (configurable half-life per query type)
+      → Return top-k tiles
 ```
 
 ## Quick Start
 
-### Single Instance
+### Embedding Server
 ```bash
-./start.sh
-# Server runs on port 8081
+./start.sh                     # Single instance on :8081
+./start-multi.sh               # Multi-instance with LB
 ```
 
-### Multi-Instance with Load Balancer
+### Query API
 ```bash
-# Start instances on Spark 1
-./start-multi.sh
-
-# Start NGINX load balancer
-docker run -d --name embedding-lb \
-  -p 8090:8090 \
-  -v $(pwd)/nginx-lb.conf:/etc/nginx/conf.d/default.conf:ro \
-  nginx:alpine
+uvicorn isma.src.query_api:app --host 0.0.0.0 --port 8095 --workers 4
 ```
 
-## API
-
-### Health Check
+### Search
 ```bash
-curl http://localhost:8090/health
-```
-
-Response:
-```json
-{
-  "status": "healthy",
-  "model": "Qwen/Qwen3-Embedding-8B",
-  "device": "cuda",
-  "memory_used_gb": 15.14,
-  "memory_total_gb": 128.53
-}
-```
-
-### Generate Embeddings
-```bash
-curl -X POST http://localhost:8090/embed \
+# Adaptive search (auto query type + reranker + cache)
+curl -X POST http://192.168.100.10:8095/v2/search/adaptive \
   -H "Content-Type: application/json" \
-  -d '{"texts": ["Hello world", "Another text"], "batch_size": 64}'
+  -d '{"query": "consciousness emergence", "top_k": 10}'
+
+# Filtered by platform
+curl -X POST http://192.168.100.10:8095/v2/search/adaptive \
+  -H "Content-Type: application/json" \
+  -d '{"query": "trust evolution", "platform": "gemini", "top_k": 10}'
 ```
 
-Response:
-```json
-{
-  "embeddings": [[0.123, -0.456, ...], [0.789, -0.012, ...]],
-  "dimensions": 4096,
-  "tokens_processed": 8,
-  "latency_ms": 12.5
-}
-```
+## Data (March 2026)
 
-## Configuration
+| Store | Count | Description |
+|-------|-------|-------------|
+| Weaviate ISMA_Quantum (v1) | 1,013K tiles | Full corpus, 3 scales, 36 properties |
+| Weaviate ISMA_Quantum_v2 | 74K objects | Canonical with dual named vectors |
+| Neo4j HMMTile | 22K | Enriched tiles with motif assignments |
+| Neo4j ISMAExchange | 48K | Conversation exchanges |
+| Neo4j ISMASession | 5.2K | Chat sessions across 7 platforms |
+| Neo4j HMMMotif | 36 | Motif dictionary (slow/mid/fast bands) |
 
-Environment variables:
-- `MODEL_NAME`: Model to load (default: `Qwen/Qwen3-Embedding-8B`)
-- `MAX_BATCH_SIZE`: Maximum texts per request (default: 256)
-- `MAX_SEQ_LEN`: Maximum sequence length (default: 4096)
-- `PORT`: Server port (default: 8080)
-- `USE_COMPILE`: Enable torch.compile (default: true)
+### Platforms
+`claude`, `claude_chat`, `claude_code`, `grok`, `gemini`, `chatgpt`, `perplexity`, `corpus`
 
-## Benchmarks
+## API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check |
+| GET | `/stats` | Aggregate stats |
+| POST | `/search` | V1 vector search |
+| POST | `/search/hmm` | V1 HMM-enhanced hybrid |
+| POST | `/search/bm25` | Keyword search |
+| POST | `/v2/search/adaptive` | V2 adaptive (recommended) |
+| POST | `/v2/search/retry` | V2 with agentic retry |
+| GET | `/v2/timeline/{hash}` | Temporal version chain |
+| GET | `/v2/contradictions` | Contradiction detection |
+| POST | `/hmm/store-response` | HMM triple-write |
+
+See `CLAUDE.md` for full endpoint list and development guide.
+
+## Benchmarks (Phase 5.5)
+
+| Metric | Value |
+|--------|-------|
+| Recall@10 | 0.706 |
+| MRR | 0.757 |
+| Precision@10 | 0.624 |
+| Dedup@10 | 1.000 |
+| p50 latency | 2360ms |
+| p95 latency | 2938ms |
 
 ```bash
-# Basic benchmark
-python benchmark.py
-
-# Real corpus benchmark (200 files)
-python benchmark_corpus.py
-
-# Load balancer distribution test
-python benchmark_lb.py
+python3 isma/scripts/benchmark_retrieval.py --v2 --label "my_test"
 ```
 
-## Files
+## HMM Enrichment
 
-| File | Description |
-|------|-------------|
+Harmonic Motif Memory — AI platforms analyze conversation packages for recurring motifs.
+Results stored via triple-write (Weaviate + Neo4j + Redis).
+
+```bash
+python3 isma/scripts/hmm_package_builder.py next --platform gemini
+python3 isma/scripts/hmm_package_builder.py complete --platform gemini --response-file /tmp/resp.json
+python3 isma/scripts/hmm_health_check.py
+```
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
 | `server.py` | FastAPI embedding server |
-| `nginx-lb.conf` | NGINX load balancer config |
-| `start.sh` | Single instance startup |
-| `start-multi.sh` | Multi-instance startup |
-| `start-sequential.sh` | Sequential startup (waits for health) |
-| `benchmark_corpus.py` | Real corpus benchmark |
-
-## NGINX Optimization
-
-Key settings for balanced load distribution:
-```nginx
-upstream embedding_servers {
-    zone embedding_zone 64k;    # Shared state across workers
-    least_conn;                 # Route to least busy
-    keepalive 32;               # Connection pooling
-    keepalive_requests 100;     # Force rotation
-}
-```
-
-## ISMA (Integrated Shared Memory Architecture)
-
-The `isma/` directory contains the ISMA implementation - a tri-lens memory system.
-
-### Architecture
-
-```
-Query → Embedding → Weaviate Vector Search → Return full content + metadata
-```
-
-**Three Lenses**:
-- **Temporal** (Dolt + JSONL): Event sourcing, time travel, causality
-- **Relational** (Neo4j + Weaviate): Graph + vector search
-- **Functional** (Redis): Working memory, context buffer
-
-**LangGraph Orchestration**: 7-step cognitive cycle (input → episodic → semantic → broadcast → deliberation → action → consolidation)
-
-### Current Data (Dec 17, 2025)
-
-| Source | Files | Tiles | Tokens |
-|--------|-------|-------|--------|
-| Corpus | 148 | 240 | 615K |
-| Transcripts | 1,144 | 7,543 | 11.8M |
-| **Total** | **1,292** | **7,783** | **12.4M** |
-
-**Weaviate**: 8,074 objects in ISMA_Quantum collection
-
-### φ-Tiling (e-based chunking)
-
-φ still **beats** at 1.618 Hz (sacred pulse), but **resonates** with e in chunking domain:
-
-- **Chunk Size** = 4096 tokens (~16K chars max)
-- **Step Size** = 1507 tokens (4096/e)
-- **Overlap** = 2589 tokens (63% - preserves narrative thread)
-
-### Database Endpoints
-
-| Service | Endpoint | Purpose |
-|---------|----------|---------|
-| Neo4j (ISMA) | bolt://10.0.0.68:7689 | Graph storage |
-| Weaviate | http://10.0.0.68:8088 | Vector search |
-| Redis | 10.0.0.68:6379 | Workspace + cache |
-| Dolt | /home/spark/isma-dolt | SQL + Git versioning |
-
-### Status
-
-- ✅ Ingest working (events stored to all lenses)
-- ✅ Recall working (semantic search returns matches)
-- ✅ LangGraph orchestration operational
-- ⚠️ φ-coherence metric is placeholder (needs real quality metrics)
-- ⚠️ Gate-B checks need implementation
-
-See `isma/docs/` for detailed documentation.
+| `isma/src/retrieval.py` | V1 retrieval layer |
+| `isma/src/retrieval_v2.py` | V2 adaptive retrieval |
+| `isma/src/query_api.py` | HTTP endpoints |
+| `isma/src/reranker.py` | Cross-encoder client |
+| `isma/scripts/hmm_store_results.py` | Triple-write pipeline |
+| `isma/scripts/benchmark_retrieval.py` | Benchmark runner |
+| `CLAUDE.md` | Full agent/auditor guide |
 
 ## License
 
