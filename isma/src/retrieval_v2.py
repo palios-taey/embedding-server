@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from isma.src.retrieval import (
     EMBEDDING_MODEL,
@@ -40,6 +41,8 @@ V2_CLASS = "ISMA_Quantum_v2"
 
 # Connection-pooled session for Weaviate GraphQL queries
 _wv_session = requests.Session()
+_wv_session.mount("http://", HTTPAdapter(pool_connections=50, pool_maxsize=50))
+_wv_session.mount("https://", HTTPAdapter(pool_connections=50, pool_maxsize=50))
 
 # Properties to fetch from v2 objects
 V2_PROPERTIES = [
@@ -54,7 +57,11 @@ V2_PROPS_STR = " ".join(V2_PROPERTIES)
 
 
 def _graphql(query: str) -> dict:
-    """Execute a GraphQL query using connection-pooled session."""
+    """Execute a GraphQL query using connection-pooled session.
+
+    Raises ConnectionError/Timeout on infrastructure failures so callers
+    can surface them as 5xx rather than returning empty results.
+    """
     try:
         r = _wv_session.post(
             f"{WEAVIATE_URL}/v1/graphql",
@@ -62,6 +69,9 @@ def _graphql(query: str) -> dict:
             timeout=30,
         )
         return r.json()
+    except (requests.ConnectionError, requests.Timeout) as e:
+        log.error("Weaviate connection failure: %s", e)
+        raise
     except Exception as e:
         log.warning("GraphQL error: %s", e)
         return {}
@@ -77,6 +87,7 @@ def _v2_to_tile(obj: dict, score: float = 0.0) -> TileResult:
         source_file=obj.get("source_file", ""),
         session_id=obj.get("session_id", ""),
         document_id=obj.get("document_id", ""),
+        loaded_at=obj.get("loaded_at", ""),
         scale="canonical",  # v2 objects are document-level
         tile_id="",
         token_count=obj.get("total_tokens") or 0,
@@ -498,13 +509,21 @@ class ISMARetrievalV2:
             except Exception as e:
                 log.debug("Graph expansion failed: %s", e)
 
-        # Sort by RRF score and take top_k
+        # Batch-fetch content for graph-expanded tiles (content="")
+        empty_hashes = [
+            ch for ch, tile in obj_map.items()
+            if not tile.content and ch in rrf_scores
+        ]
+        if empty_hashes:
+            self._fill_content(empty_hashes, obj_map)
+
+        # Sort by RRF score and take top_k (immutable — use dataclass replace)
+        from dataclasses import replace as dc_replace
         sorted_hashes = sorted(rrf_scores.keys(), key=lambda ch: rrf_scores[ch], reverse=True)
         tiles = []
         for ch in sorted_hashes[:top_k * 3]:
             tile = obj_map[ch]
-            tile.score = rrf_scores[ch]
-            tiles.append(tile)
+            tiles.append(dc_replace(tile, score=rrf_scores[ch]))
 
         # Rerank merged results
         try:
@@ -530,6 +549,32 @@ class ISMARetrievalV2:
             "sub_queries": sub_queries,
             "graph_expanded": graph_expanded,
         }
+
+    # ── Content Backfill ───────────────────────────────────────
+
+    def _fill_content(self, content_hashes: List[str], obj_map: Dict[str, Any]):
+        """Batch-fetch content from v2 for tiles with empty content (graph-expanded)."""
+        from dataclasses import replace as dc_replace
+        for ch in content_hashes:
+            safe_ch = ch.replace("\\", "\\\\").replace('"', '\\"')
+            q = (
+                f'{{ Get {{ {V2_CLASS}('
+                f'where: {{ path: ["content_hash"], operator: Equal, valueText: "{safe_ch}" }}'
+                f' limit: 1'
+                f') {{ content rosetta_summary loaded_at }} }} }}'
+            )
+            data = _graphql(q)
+            results = data.get("data", {}).get("Get", {}).get(V2_CLASS, [])
+            if results:
+                fetched = results[0]
+                tile = obj_map[ch]
+                obj_map[ch] = dc_replace(
+                    tile,
+                    content=fetched.get("content", "") or tile.content,
+                    rosetta_summary=fetched.get("rosetta_summary", "") or tile.rosetta_summary,
+                    loaded_at=fetched.get("loaded_at", "") or tile.loaded_at,
+                )
+        log.debug("Backfilled content for %d graph-expanded tiles", len(content_hashes))
 
     # ── Passage Expansion ───────────────────────────────────────
 

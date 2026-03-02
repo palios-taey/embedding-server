@@ -6,17 +6,25 @@ Provides:
   - Resonance fields (multi-timescale amplitude vectors over motifs)
   - Tile motif cache (optional fast lookup)
   - Working set per session
+
+Phase 5 note: Inverted index READS (inv_get, inv_union, inv_intersect)
+are deprecated in favor of v2 adaptive search. Writes continue for
+backward compatibility. Read methods log deprecation warnings.
 """
 
 import json
+import logging
 import math
 import time
+import warnings
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass
 
 import redis
 
 from .motifs import MotifAssignment
+
+log = logging.getLogger(__name__)
 
 # Redis connection (shared ISMA instance)
 REDIS_HOST = "192.168.100.10"
@@ -62,18 +70,39 @@ class HMMRedisStore:
             self.r.sadd(f"{PREFIX}inv:{motif_id}", *tile_ids)
 
     def inv_get(self, motif_id: str) -> Set[str]:
-        """Get all tile_ids for a motif."""
+        """Get all tile_ids for a motif.
+
+        DEPRECATED: Use ISMARetrievalV2.adaptive_search() instead.
+        """
+        warnings.warn(
+            "inv_get is deprecated — use ISMARetrievalV2.adaptive_search()",
+            DeprecationWarning, stacklevel=2,
+        )
         return self.r.smembers(f"{PREFIX}inv:{motif_id}")
 
     def inv_union(self, motif_ids: List[str]) -> Set[str]:
-        """Union of tile sets for multiple motifs."""
+        """Union of tile sets for multiple motifs.
+
+        DEPRECATED: Use ISMARetrievalV2.adaptive_search() instead.
+        """
+        warnings.warn(
+            "inv_union is deprecated — use ISMARetrievalV2.adaptive_search()",
+            DeprecationWarning, stacklevel=2,
+        )
         if not motif_ids:
             return set()
         keys = [f"{PREFIX}inv:{mid}" for mid in motif_ids]
         return self.r.sunion(*keys)
 
     def inv_intersect(self, motif_ids: List[str]) -> Set[str]:
-        """Intersection of tile sets for multiple motifs."""
+        """Intersection of tile sets for multiple motifs.
+
+        DEPRECATED: Use ISMARetrievalV2.adaptive_search() instead.
+        """
+        warnings.warn(
+            "inv_intersect is deprecated — use ISMARetrievalV2.adaptive_search()",
+            DeprecationWarning, stacklevel=2,
+        )
         if not motif_ids:
             return set()
         keys = [f"{PREFIX}inv:{mid}" for mid in motif_ids]

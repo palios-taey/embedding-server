@@ -478,10 +478,15 @@ def resolve_hash(hash_prefix: str) -> str:
 # ============================================================================
 
 def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
-    """Store enrichment for one item. Triple-write to Weaviate + Neo4j + Redis."""
+    """Store enrichment for one item. Triple-write to Weaviate + Neo4j + Redis.
+
+    Uses saga pattern with full compensating rollback:
+    - Tracks ALL created/modified objects for rollback
+    - Neo4j uses explicit transactions (session.execute_write)
+    - Delete-replace for motifs/xrefs on re-enrichment
+    """
     rosetta = item["rosetta_summary"]
     motifs = item.get("motifs", [])
-    xrefs = item.get("cross_refs", [])
 
     # Filter motifs by threshold
     valid_motifs = []
@@ -506,6 +511,13 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
     neo4j_ok = False
     redis_ok = False
 
+    # Track ALL artifacts for rollback
+    patched_tile_ids = []
+    rosetta_tile_created = False
+    rosetta_tile_id = None
+    v2_patched = False
+    v2_id = None
+
     # --- Weaviate: PATCH all tiles for this content_hash ---
     tile_ids = _get_tile_ids(full_hash)
     if not tile_ids:
@@ -527,12 +539,12 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
         for tid in tile_ids:
             if weaviate_patch(tid, props):
                 patched += 1
+                patched_tile_ids.append(tid)
         log.info(f"  Weaviate: patched {patched}/{len(tile_ids)} tiles")
         weaviate_ok = patched > 0
 
     # --- Weaviate: Embed rosetta summary and create searchable rosetta tile ---
     source_file = ""
-    # Try to get source_file from existing tiles
     if tile_ids:
         src_q = f"""{{ Get {{ {WEAVIATE_CLASS}(
             where: {{ path: ["content_hash"], operator: Equal, valueText: "{full_hash}" }}
@@ -542,53 +554,139 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
         src_tiles = src_data.get("Get", {}).get(WEAVIATE_CLASS, [])
         if src_tiles:
             source_file = src_tiles[0].get("source_file", "")
-    rosetta_ok, rosetta_vector = embed_and_store_rosetta(full_hash, rosetta, dominant, motif_data, platform, source_file)
+
+    # Check if rosetta tile exists BEFORE creating (for rollback tracking)
+    existing_rosetta_q = f"""{{ Get {{ {WEAVIATE_CLASS}(
+        where: {{
+            operator: And,
+            operands: [
+                {{ path: ["content_hash"], operator: Equal, valueText: "{full_hash}" }},
+                {{ path: ["scale"], operator: Equal, valueText: "rosetta" }}
+            ]
+        }}
+        limit: 1
+    ) {{ _additional {{ id }} }} }} }}"""
+    existing_rosetta = weaviate_gql(existing_rosetta_q)
+    pre_existing_rosetta = bool(
+        existing_rosetta.get("Get", {}).get(WEAVIATE_CLASS, [])
+    )
+
+    rosetta_ok, rosetta_vector = embed_and_store_rosetta(
+        full_hash, rosetta, dominant, motif_data, platform, source_file
+    )
     if not rosetta_ok:
         log.error(f"  ROSETTA FAILED for {full_hash[:16]}: embedding or Weaviate store failed")
-        # Rosetta failure is a full failure — vectors are critical for search
         weaviate_ok = False
+    else:
+        rosetta_tile_created = not pre_existing_rosetta
+        # Get rosetta tile ID for rollback
+        rosetta_data = weaviate_gql(existing_rosetta_q)
+        rosetta_tiles = rosetta_data.get("Get", {}).get(WEAVIATE_CLASS, [])
+        if rosetta_tiles:
+            rosetta_tile_id = rosetta_tiles[0]["_additional"]["id"]
 
     # --- Weaviate V2: Update canonical memory object ---
+    # Find v2 ID first for rollback tracking
+    v2_find_q = f"""{{ Get {{ {V2_CLASS}(
+        where: {{ path: ["content_hash"], operator: Equal, valueText: "{full_hash}" }}
+        limit: 1
+    ) {{ _additional {{ id }} }} }} }}"""
+    v2_data = weaviate_gql(v2_find_q)
+    v2_objects = v2_data.get("Get", {}).get(V2_CLASS, [])
+    if v2_objects:
+        v2_id = v2_objects[0]["_additional"]["id"]
+
     v2_ok = update_v2_object(full_hash, rosetta, dominant, motif_data, rosetta_vector)
     if not v2_ok:
         log.error(f"  V2 FAILED for {full_hash[:16]}: dual-write failed")
         # V2 failure is non-fatal during shadow deployment — log but don't block
+    else:
+        v2_patched = v2_id is not None
 
-    # --- Neo4j: HMMTile + EXPRESSES edges ---
+    # --- Neo4j: HMMTile + EXPRESSES edges (explicit transaction) ---
     try:
         driver = get_neo4j()
         with driver.session() as session:
-            # Phase 4: Check if tile exists and capture old state for SUPERSEDES
-            old_rosetta = ""
-            old_motifs = []
-            existing = session.run("""
-                MATCH (t:HMMTile {tile_id: $tile_id})
-                WHERE t.rosetta_summary IS NOT NULL
-                RETURN t.rosetta_summary AS rosetta,
-                       t.dominant_motifs AS motifs,
-                       t.enriched_at AS enriched_at
-            """, tile_id=full_hash).single()
+            def _neo4j_write(tx):
+                # Check if tile exists and capture old state for SUPERSEDES
+                existing = tx.run("""
+                    MATCH (t:HMMTile {tile_id: $tile_id})
+                    WHERE t.rosetta_summary IS NOT NULL
+                    RETURN t.rosetta_summary AS rosetta,
+                           t.dominant_motifs AS motifs,
+                           t.enriched_at AS enriched_at
+                """, tile_id=full_hash).single()
 
-            if existing and existing["rosetta"]:
-                old_rosetta = existing["rosetta"]
-                old_motifs = existing["motifs"] or []
+                old_rosetta = ""
+                old_motifs = []
+                if existing and existing["rosetta"]:
+                    old_rosetta = existing["rosetta"]
+                    old_motifs = existing["motifs"] or []
 
-            # Upsert HMMTile
-            session.run("""
-                MERGE (t:HMMTile {tile_id: $tile_id})
-                ON CREATE SET t.created_at = $now
-                SET t.content_hash = $content_hash,
-                    t.rosetta_summary = $rosetta,
-                    t.dominant_motifs = $dominant,
-                    t.enrichment_version = $version,
-                    t.enriched_at = $now,
-                    t.platform = $platform,
-                    t.pkg_id = $pkg_id
-            """, tile_id=full_hash, content_hash=full_hash, rosetta=rosetta,
-                dominant=dominant, version=ENRICHMENT_VERSION, now=now,
-                platform=platform, pkg_id=pkg_id)
+                # Upsert HMMTile
+                tx.run("""
+                    MERGE (t:HMMTile {tile_id: $tile_id})
+                    ON CREATE SET t.created_at = $now
+                    SET t.content_hash = $content_hash,
+                        t.rosetta_summary = $rosetta,
+                        t.dominant_motifs = $dominant,
+                        t.enrichment_version = $version,
+                        t.enriched_at = $now,
+                        t.platform = $platform,
+                        t.pkg_id = $pkg_id
+                """, tile_id=full_hash, content_hash=full_hash, rosetta=rosetta,
+                    dominant=dominant, version=ENRICHMENT_VERSION, now=now,
+                    platform=platform, pkg_id=pkg_id)
 
-            # Phase 4: Create SUPERSEDES snapshot if rosetta changed
+                # Delete-replace: remove old EXPRESSES edges before creating new ones
+                tx.run("""
+                    MATCH (t:HMMTile {tile_id: $tile_id})-[r:EXPRESSES]->()
+                    DELETE r
+                """, tile_id=full_hash)
+
+                # Link to source Document (if exists)
+                tx.run("""
+                    MATCH (d:Document {content_hash: $content_hash})
+                    MATCH (t:HMMTile {tile_id: $tile_id})
+                    MERGE (t)-[r:DERIVED_FROM]->(d)
+                    ON CREATE SET r.created_at = $now
+                """, content_hash=full_hash, tile_id=full_hash, now=now)
+
+                # Link to source ISMAMessage (if exists)
+                tx.run("""
+                    MATCH (m:ISMAMessage {content_hash: $content_hash})
+                    MATCH (t:HMMTile {tile_id: $tile_id})
+                    MERGE (t)-[r:DERIVED_FROM]->(m)
+                    ON CREATE SET r.created_at = $now
+                """, content_hash=full_hash, tile_id=full_hash, now=now)
+
+                # Link tile to ISMASession via ISMAExchange
+                tx.run("""
+                    MATCH (e:ISMAExchange {content_hash: $content_hash})
+                    MATCH (s:ISMASession)-[:CONTAINS]->(e)
+                    MATCH (t:HMMTile {tile_id: $tile_id})
+                    MERGE (t)-[r:IN_SESSION]->(s)
+                    SET r.exchange_index = e.exchange_index
+                """, content_hash=full_hash, tile_id=full_hash)
+
+                # Create new EXPRESSES edges
+                for m in valid_motifs:
+                    tx.run("""
+                        MERGE (t:HMMTile {tile_id: $tile_id})
+                        MERGE (m:HMMMotif {motif_id: $motif_id})
+                        MERGE (t)-[r:EXPRESSES]->(m)
+                        ON CREATE SET r.created_at = $now
+                        SET r.amp = $amp, r.confidence = $confidence,
+                            r.source = 'context_pkg', r.platform = $platform
+                    """, tile_id=full_hash, motif_id=m["motif_id"],
+                        amp=m["amp"], confidence=m["confidence"],
+                        now=now, platform=platform)
+
+                return old_rosetta, old_motifs
+
+            old_rosetta, old_motifs = session.execute_write(_neo4j_write)
+
+            # SUPERSEDES snapshot outside transaction (non-fatal)
             if old_rosetta and old_rosetta != rosetta:
                 try:
                     from isma.src.hmm.neo4j_store import HMMNeo4jStore
@@ -599,50 +697,11 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
                         old_rosetta=old_rosetta,
                         old_motifs=old_motifs,
                     )
-                    store.close()
                     log.info(f"  Neo4j: SUPERSEDES snapshot for {full_hash[:16]}")
                 except Exception as e:
                     log.warning(f"  SUPERSEDES snapshot failed (non-fatal): {e}")
 
-            # Link to source Document (if exists)
-            session.run("""
-                MATCH (d:Document {content_hash: $content_hash})
-                MATCH (t:HMMTile {tile_id: $tile_id})
-                MERGE (t)-[r:DERIVED_FROM]->(d)
-                ON CREATE SET r.created_at = $now
-            """, content_hash=full_hash, tile_id=full_hash, now=now)
-
-            # Link to source ISMASession (if exists, via exchange hash)
-            session.run("""
-                MATCH (m:ISMAMessage {content_hash: $content_hash})
-                MATCH (t:HMMTile {tile_id: $tile_id})
-                MERGE (t)-[r:DERIVED_FROM]->(m)
-                ON CREATE SET r.created_at = $now
-            """, content_hash=full_hash, tile_id=full_hash, now=now)
-
-            # Phase 4: Link tile to ISMASession via ISMAExchange content_hash
-            session.run("""
-                MATCH (e:ISMAExchange {content_hash: $content_hash})
-                MATCH (s:ISMASession)-[:CONTAINS]->(e)
-                MATCH (t:HMMTile {tile_id: $tile_id})
-                MERGE (t)-[r:IN_SESSION]->(s)
-                SET r.exchange_index = e.exchange_index
-            """, content_hash=full_hash, tile_id=full_hash)
-
-            # EXPRESSES edges to HMMMotif
-            for m in valid_motifs:
-                session.run("""
-                    MERGE (t:HMMTile {tile_id: $tile_id})
-                    MERGE (m:HMMMotif {motif_id: $motif_id})
-                    MERGE (t)-[r:EXPRESSES]->(m)
-                    ON CREATE SET r.created_at = $now
-                    SET r.amp = $amp, r.confidence = $confidence,
-                        r.source = 'context_pkg', r.platform = $platform
-                """, tile_id=full_hash, motif_id=m["motif_id"],
-                    amp=m["amp"], confidence=m["confidence"],
-                    now=now, platform=platform)
-
-        log.info(f"  Neo4j: HMMTile + {len(valid_motifs)} EXPRESSES edges")
+        log.info(f"  Neo4j: HMMTile + {len(valid_motifs)} EXPRESSES edges (atomic)")
         neo4j_ok = True
     except Exception as e:
         log.error(f"  NEO4J FAILED for {full_hash[:16]}: {e}")
@@ -651,6 +710,15 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
     try:
         r = get_redis()
         pipe = r.pipeline()
+        # Delete-replace: remove old motif index entries before adding new
+        old_motif_data = r.get(f"hmm:tile:{full_hash}:motifs")
+        if old_motif_data:
+            try:
+                old_motif_list = json.loads(old_motif_data)
+                for om in old_motif_list:
+                    pipe.srem(f"hmm:inv:{om.get('motif_id', '')}", full_hash)
+            except (json.JSONDecodeError, TypeError):
+                pass
         for m in valid_motifs:
             pipe.sadd(f"hmm:inv:{m['motif_id']}", full_hash)
         pipe.set(f"hmm:tile:{full_hash}:motifs",
@@ -663,19 +731,15 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
 
     # 6SIGMA: report ALL failures, never hide partial success
     if not (weaviate_ok and neo4j_ok and redis_ok):
-        log.error(f"  STORE FAILED for {full_hash[:16]}: weaviate={weaviate_ok} neo4j={neo4j_ok} redis={redis_ok}")
-
-        # Compensating rollback: if Weaviate succeeded but Neo4j/Redis failed,
-        # revert Weaviate enrichment flags to prevent data drift
-        if weaviate_ok and not (neo4j_ok and redis_ok):
-            log.warning(f"  Reverting Weaviate enrichment for {full_hash[:16]} (partial write)")
-            revert_props = {
-                "hmm_enriched": False,
-                "hmm_enrichment_version": "",
-            }
-            for tid in tile_ids:
-                weaviate_patch(tid, revert_props)
-
+        log.error(
+            f"  STORE FAILED for {full_hash[:16]}: "
+            f"weaviate={weaviate_ok} neo4j={neo4j_ok} redis={redis_ok}"
+        )
+        _rollback_store(
+            full_hash, patched_tile_ids, rosetta_tile_id,
+            rosetta_tile_created, v2_id, v2_patched,
+            weaviate_ok, neo4j_ok, redis_ok, valid_motifs,
+        )
         return False
 
     # Phase 5: Invalidate semantic cache for this tile
@@ -687,6 +751,81 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
         pass  # Cache invalidation is non-fatal
 
     return True
+
+
+def _rollback_store(
+    full_hash: str,
+    patched_tile_ids: list,
+    rosetta_tile_id: str,
+    rosetta_tile_created: bool,
+    v2_id: str,
+    v2_patched: bool,
+    weaviate_ok: bool,
+    neo4j_ok: bool,
+    redis_ok: bool,
+    valid_motifs: list,
+):
+    """Full compensating rollback for failed triple-write.
+
+    Reverts ALL artifacts created during the failed store_item() call:
+    - Weaviate tile PATCH flags
+    - Rosetta tile (delete if newly created, revert if updated)
+    - V2 object enrichment properties
+    - Redis inverted index entries
+    """
+    log.warning(f"  Rolling back store for {full_hash[:16]}")
+
+    # Revert Weaviate tile enrichment flags
+    if patched_tile_ids:
+        revert_props = {
+            "hmm_enriched": False,
+            "hmm_enrichment_version": "",
+        }
+        for tid in patched_tile_ids:
+            weaviate_patch(tid, revert_props)
+        log.warning(f"  Rollback: reverted {len(patched_tile_ids)} tile patches")
+
+    # Delete newly-created rosetta tile (or revert if it was pre-existing)
+    if rosetta_tile_id and rosetta_tile_created:
+        try:
+            _wv_session.delete(
+                f"{WEAVIATE_URL}/v1/objects/{WEAVIATE_CLASS}/{rosetta_tile_id}",
+                timeout=15,
+            )
+            log.warning(f"  Rollback: deleted rosetta tile {rosetta_tile_id[:12]}")
+        except Exception as e:
+            log.error(f"  Rollback: failed to delete rosetta tile: {e}")
+
+    # Revert V2 enrichment properties
+    if v2_patched and v2_id:
+        revert_v2 = {
+            "hmm_enriched": False,
+            "rosetta_summary": "",
+            "dominant_motifs": [],
+            "motif_annotations": None,
+        }
+        try:
+            _wv_session.patch(
+                f"{WEAVIATE_URL}/v1/objects/{V2_CLASS}/{v2_id}",
+                json={"properties": revert_v2},
+                timeout=15,
+            )
+            log.warning(f"  Rollback: reverted V2 object {v2_id[:12]}")
+        except Exception as e:
+            log.error(f"  Rollback: failed to revert V2: {e}")
+
+    # Clean up Redis inverted index if Redis write succeeded but others failed
+    if redis_ok and not (weaviate_ok and neo4j_ok):
+        try:
+            r = get_redis()
+            pipe = r.pipeline()
+            for m in valid_motifs:
+                pipe.srem(f"hmm:inv:{m['motif_id']}", full_hash)
+            pipe.delete(f"hmm:tile:{full_hash}:motifs")
+            pipe.execute()
+            log.warning(f"  Rollback: cleaned Redis index for {full_hash[:16]}")
+        except Exception as e:
+            log.error(f"  Rollback: failed to clean Redis: {e}")
 
 
 def store_cross_refs(items: list, hash_map: dict, platform: str):
@@ -824,8 +963,12 @@ def process_response(response_path: str, platform: str = "unknown", pkg_id: str 
             stored += 1
             stored_hashes.append(full_hash)
 
-    # Store cross-references
-    store_cross_refs(items, hash_map, platform)
+    # Store cross-references — ONLY for successfully stored items
+    stored_items = [
+        item for item in valid_items
+        if hash_map.get(item.get("hash", ""), "") in stored_hashes
+    ]
+    store_cross_refs(stored_items, hash_map, platform)
 
     # Phase 4: Check contradictions for stored tiles (non-blocking)
     if stored_hashes:

@@ -1,13 +1,17 @@
 """
 HMM Query - motif-based retrieval without vectors.
 
-Query loop:
+Original query loop (deprecated in favor of v2 adaptive_search):
   1. compile_query_to_motifs(text) -> motif vector
   2. candidate selection via motif inverted index + resonance weighting
   3. fetch tile metadata from Neo4j
   4. return tiles + provenance refs
+
+Phase 5: retrieve() now delegates to ISMARetrievalV2.adaptive_search()
+with fallback to the original Redis inverted index path.
 """
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Set, Tuple
@@ -15,6 +19,8 @@ from typing import List, Dict, Optional, Set, Tuple
 from .motifs import assign_motifs, MotifAssignment
 from .neo4j_store import HMMNeo4jStore
 from .redis_store import HMMRedisStore
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -68,9 +74,13 @@ class HMMQuery:
         use_resonance: bool = True,
         require_all_motifs: bool = False,
         min_score: float = 0.0,
+        use_v2: bool = True,
     ) -> QueryResult:
         """
         Full query loop: text -> motifs -> candidates -> scored results.
+
+        Phase 5: Delegates to ISMARetrievalV2.adaptive_search() by default.
+        Falls back to Redis inverted index if v2 is unavailable.
 
         Args:
             query_text: Natural language query
@@ -79,7 +89,37 @@ class HMMQuery:
             require_all_motifs: If True, require ALL query motifs (intersect).
                                 If False, require ANY query motif (union).
             min_score: Minimum score threshold
+            use_v2: Use v2 adaptive search (default True). Set False for legacy.
         """
+        # Phase 5: Try v2 adaptive search first
+        if use_v2:
+            try:
+                from isma.src.retrieval_v2 import get_retrieval_v2
+                r = get_retrieval_v2()
+                if r.is_available():
+                    v2_result = r.adaptive_search(query_text, top_k=top_k)
+                    # Convert v2 result to QueryResult format
+                    query_motifs = self.compile_query_to_motifs(query_text)
+                    candidates = []
+                    for tile in v2_result.get("tiles", []):
+                        if hasattr(tile, "content_hash"):
+                            candidates.append({
+                                "tile_id": tile.content_hash,
+                                "score": round(tile.score, 4),
+                                "motif_overlap": {},
+                                "rosetta_summary": tile.rosetta_summary,
+                                "platform": tile.platform,
+                            })
+                    return QueryResult(
+                        query_motifs=query_motifs,
+                        candidates=candidates,
+                        total_candidates=len(candidates),
+                        resonance_boost_applied=False,
+                    )
+            except Exception as e:
+                log.debug("V2 retrieve failed, falling back to Redis: %s", e)
+
+        # Legacy path: Redis inverted index
         # Step 1: Compile query to motifs
         query_motifs = self.compile_query_to_motifs(query_text)
 
