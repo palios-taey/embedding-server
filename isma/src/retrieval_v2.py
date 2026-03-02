@@ -553,28 +553,46 @@ class ISMARetrievalV2:
     # ── Content Backfill ───────────────────────────────────────
 
     def _fill_content(self, content_hashes: List[str], obj_map: Dict[str, Any]):
-        """Batch-fetch content from v2 for tiles with empty content (graph-expanded)."""
+        """Batch-fetch content from v2 for tiles with empty content (graph-expanded).
+
+        Uses a single OR-filter query instead of N+1 individual queries.
+        Batches of 50 to stay within GraphQL complexity limits.
+        """
         from dataclasses import replace as dc_replace
-        for ch in content_hashes:
-            safe_ch = ch.replace("\\", "\\\\").replace('"', '\\"')
+        batch_size = 50
+        filled = 0
+        for i in range(0, len(content_hashes), batch_size):
+            batch = content_hashes[i:i + batch_size]
+            if len(batch) == 1:
+                safe_ch = batch[0].replace("\\", "\\\\").replace('"', '\\"')
+                where = f'{{ path: ["content_hash"], operator: Equal, valueText: "{safe_ch}" }}'
+            else:
+                operands = ", ".join(
+                    f'{{ path: ["content_hash"], operator: Equal, '
+                    f'valueText: "{ch.replace(chr(92), chr(92)+chr(92)).replace(chr(34), chr(92)+chr(34))}" }}'
+                    for ch in batch
+                )
+                where = f'{{ operator: Or, operands: [{operands}] }}'
             q = (
                 f'{{ Get {{ {V2_CLASS}('
-                f'where: {{ path: ["content_hash"], operator: Equal, valueText: "{safe_ch}" }}'
-                f' limit: 1'
-                f') {{ content rosetta_summary loaded_at }} }} }}'
+                f'where: {where}'
+                f' limit: {len(batch)}'
+                f') {{ content_hash content rosetta_summary loaded_at }} }} }}'
             )
             data = _graphql(q)
             results = data.get("data", {}).get("Get", {}).get(V2_CLASS, [])
-            if results:
-                fetched = results[0]
-                tile = obj_map[ch]
-                obj_map[ch] = dc_replace(
-                    tile,
-                    content=fetched.get("content", "") or tile.content,
-                    rosetta_summary=fetched.get("rosetta_summary", "") or tile.rosetta_summary,
-                    loaded_at=fetched.get("loaded_at", "") or tile.loaded_at,
-                )
-        log.debug("Backfilled content for %d graph-expanded tiles", len(content_hashes))
+            for fetched in results:
+                ch = fetched.get("content_hash", "")
+                if ch in obj_map:
+                    tile = obj_map[ch]
+                    obj_map[ch] = dc_replace(
+                        tile,
+                        content=fetched.get("content", "") or tile.content,
+                        rosetta_summary=fetched.get("rosetta_summary", "") or tile.rosetta_summary,
+                        loaded_at=fetched.get("loaded_at", "") or tile.loaded_at,
+                    )
+                    filled += 1
+        log.debug("Backfilled content for %d/%d graph-expanded tiles", filled, len(content_hashes))
 
     # ── Passage Expansion ───────────────────────────────────────
 

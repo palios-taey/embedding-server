@@ -36,6 +36,7 @@ import os
 import sys
 import tempfile
 import time
+import threading
 
 from isma.src.retrieval import ISMARetrieval, TileResult, SearchResult
 
@@ -63,23 +64,29 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
-# Singleton retrieval instance
+# Singleton retrieval instance (thread-safe)
 _retrieval = None
+_retrieval_lock = threading.Lock()
 
 def get_retrieval() -> ISMARetrieval:
     global _retrieval
     if _retrieval is None:
-        _retrieval = ISMARetrieval()
+        with _retrieval_lock:
+            if _retrieval is None:
+                _retrieval = ISMARetrieval()
     return _retrieval
 
 
-# Singleton cache instance (avoids new Redis connection per request)
+# Singleton cache instance (thread-safe, avoids new Redis connection per request)
 _cache = None
+_cache_lock = threading.Lock()
 
 def _get_cache() -> SemanticCache:
     global _cache
     if _cache is None:
-        _cache = SemanticCache()
+        with _cache_lock:
+            if _cache is None:
+                _cache = SemanticCache()
     return _cache
 
 

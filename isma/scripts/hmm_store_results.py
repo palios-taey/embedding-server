@@ -84,27 +84,49 @@ VALID_XREF_TYPES = {"extends", "contradicts", "references", "builds_on"}
 # Connections
 # ============================================================================
 
+import threading
+
 _wv_session = requests.Session()
 _redis_conn = None
+_redis_lock = threading.Lock()
 _neo4j_driver = None
+_neo4j_lock = threading.Lock()
+
+
+def _escape_gql(s: str) -> str:
+    """Escape a string for safe interpolation into Weaviate GraphQL queries.
+
+    Handles backslashes first (to avoid double-escaping), then quotes,
+    and strips newlines/tabs that could break query structure.
+    """
+    if not s:
+        return s
+    s = s.replace("\\", "\\\\")
+    s = s.replace('"', '\\"')
+    s = s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    return s[:2000]  # Length cap to prevent abuse
 
 
 def get_redis():
     global _redis_conn
     if _redis_conn is None:
-        _redis_conn = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        with _redis_lock:
+            if _redis_conn is None:
+                _redis_conn = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
     return _redis_conn
 
 
 def get_neo4j():
     global _neo4j_driver
     if _neo4j_driver is None:
-        try:
-            from isma.src.hmm.neo4j_store import get_shared_driver
-            _neo4j_driver = get_shared_driver(NEO4J_URI)
-        except ImportError:
-            from neo4j import GraphDatabase
-            _neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=None)
+        with _neo4j_lock:
+            if _neo4j_driver is None:
+                try:
+                    from isma.src.hmm.neo4j_store import get_shared_driver
+                    _neo4j_driver = get_shared_driver(NEO4J_URI)
+                except ImportError:
+                    from neo4j import GraphDatabase
+                    _neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=None)
     return _neo4j_driver
 
 
@@ -166,11 +188,12 @@ def embed_and_store_rosetta(content_hash: str, rosetta: str, dominant: list,
         return False, None
 
     # Step 2: Check if rosetta tile already exists
+    safe_ch = _escape_gql(content_hash)
     q = f"""{{ Get {{ {WEAVIATE_CLASS}(
         where: {{
             operator: And,
             operands: [
-                {{ path: ["content_hash"], operator: Equal, valueText: "{content_hash}" }},
+                {{ path: ["content_hash"], operator: Equal, valueText: "{safe_ch}" }},
                 {{ path: ["scale"], operator: Equal, valueText: "rosetta" }}
             ]
         }}
@@ -238,8 +261,9 @@ def update_v2_object(content_hash: str, rosetta: str, dominant: list,
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     # Find v2 object by content_hash
+    safe_ch = _escape_gql(content_hash)
     q = f"""{{ Get {{ {V2_CLASS}(
-        where: {{ path: ["content_hash"], operator: Equal, valueText: "{content_hash}" }}
+        where: {{ path: ["content_hash"], operator: Equal, valueText: "{safe_ch}" }}
         limit: 1
     ) {{ _additional {{ id }} }} }} }}"""
 
@@ -449,13 +473,14 @@ def validate_item(item: dict) -> list:
 
 def resolve_hash(hash_prefix: str) -> str:
     """Resolve a 12-char hash prefix to full content_hash via Weaviate."""
+    safe_prefix = _escape_gql(hash_prefix)
     q = f"""{{
         Get {{
             {WEAVIATE_CLASS}(
                 where: {{
                     operator: And,
                     operands: [
-                        {{ path: ["content_hash"], operator: Like, valueText: "{hash_prefix}*" }},
+                        {{ path: ["content_hash"], operator: Like, valueText: "{safe_prefix}*" }},
                         {{ path: ["scale"], operator: Equal, valueText: "search_512" }}
                     ]
                 }}
@@ -545,9 +570,10 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
 
     # --- Weaviate: Embed rosetta summary and create searchable rosetta tile ---
     source_file = ""
+    safe_fh = _escape_gql(full_hash)
     if tile_ids:
         src_q = f"""{{ Get {{ {WEAVIATE_CLASS}(
-            where: {{ path: ["content_hash"], operator: Equal, valueText: "{full_hash}" }}
+            where: {{ path: ["content_hash"], operator: Equal, valueText: "{safe_fh}" }}
             limit: 1
         ) {{ source_file }} }} }}"""
         src_data = weaviate_gql(src_q)
@@ -560,7 +586,7 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
         where: {{
             operator: And,
             operands: [
-                {{ path: ["content_hash"], operator: Equal, valueText: "{full_hash}" }},
+                {{ path: ["content_hash"], operator: Equal, valueText: "{safe_fh}" }},
                 {{ path: ["scale"], operator: Equal, valueText: "rosetta" }}
             ]
         }}
@@ -588,7 +614,7 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
     # --- Weaviate V2: Update canonical memory object ---
     # Find v2 ID first for rollback tracking
     v2_find_q = f"""{{ Get {{ {V2_CLASS}(
-        where: {{ path: ["content_hash"], operator: Equal, valueText: "{full_hash}" }}
+        where: {{ path: ["content_hash"], operator: Equal, valueText: "{safe_fh}" }}
         limit: 1
     ) {{ _additional {{ id }} }} }} }}"""
     v2_data = weaviate_gql(v2_find_q)
@@ -867,6 +893,7 @@ def store_cross_refs(items: list, hash_map: dict, platform: str):
 
 def _get_tile_ids(content_hash: str) -> list:
     """Get all Weaviate object IDs for tiles with this content_hash."""
+    safe_ch = _escape_gql(content_hash)
     ids = []
     for scale in ["search_512", "context_2048", "full_4096"]:
         q = f"""{{
@@ -875,7 +902,7 @@ def _get_tile_ids(content_hash: str) -> list:
                     where: {{
                         operator: And,
                         operands: [
-                            {{ path: ["content_hash"], operator: Equal, valueText: "{content_hash}" }},
+                            {{ path: ["content_hash"], operator: Equal, valueText: "{safe_ch}" }},
                             {{ path: ["scale"], operator: Equal, valueText: "{scale}" }}
                         ]
                     }}
