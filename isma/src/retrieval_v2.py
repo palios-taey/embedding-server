@@ -18,6 +18,7 @@ Usage:
 """
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -212,8 +213,8 @@ class ISMARetrievalV2:
         Weaviate BM25 properties weight is applied via the query.
         rosetta_summary and motif_annotations get boosted.
         """
-        # Escape query for GraphQL
-        safe_query = query.replace('"', '\\"').replace("\\", "\\\\")
+        # Escape query for GraphQL (backslash first, then quote)
+        safe_query = query.replace('\\', '\\\\').replace('"', '\\"')
         filter_clause = self._build_filter(**filters)
 
         q = (
@@ -588,13 +589,16 @@ class ISMARetrievalV2:
             return f", where: {{ operator: And, operands: [{ops}] }}"
 
 
-# Module-level singleton
+# Module-level singleton with thread safety
 _instance: Optional[ISMARetrievalV2] = None
+_instance_lock = threading.Lock()
 
 
 def get_retrieval_v2() -> ISMARetrievalV2:
-    """Get singleton ISMARetrievalV2 instance."""
+    """Get singleton ISMARetrievalV2 instance (thread-safe)."""
     global _instance
     if _instance is None:
-        _instance = ISMARetrievalV2()
+        with _instance_lock:
+            if _instance is None:
+                _instance = ISMARetrievalV2()
     return _instance

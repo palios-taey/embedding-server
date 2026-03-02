@@ -12,6 +12,7 @@ Phase 4 additions:
 """
 
 import logging
+import threading
 import time
 from typing import List, Dict, Any, Optional
 from dataclasses import asdict
@@ -26,13 +27,16 @@ NEO4J_URI = "bolt://192.168.100.10:7689"
 
 # Shared driver singleton — avoids creating new connection pools per request
 _shared_driver = None
+_driver_lock = threading.Lock()
 
 
 def get_shared_driver(uri: str = NEO4J_URI):
-    """Get or create the shared Neo4j driver singleton."""
+    """Get or create the shared Neo4j driver singleton (thread-safe)."""
     global _shared_driver
     if _shared_driver is None:
-        _shared_driver = GraphDatabase.driver(uri, auth=None)
+        with _driver_lock:
+            if _shared_driver is None:
+                _shared_driver = GraphDatabase.driver(uri, auth=None)
     return _shared_driver
 
 

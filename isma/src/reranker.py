@@ -17,7 +17,9 @@ Usage:
 
 import logging
 import os
+import threading
 import time
+from dataclasses import replace as dc_replace
 from typing import List, Optional
 
 import requests
@@ -252,20 +254,23 @@ class RerankerClient:
             )
             return tiles  # Fallback: original order
 
-        # Sort by score descending
+        # Sort by score descending, propagating neural scores to tiles
         scored_tiles = sorted(
             zip(tiles, scores), key=lambda x: x[1], reverse=True
         )
-        return [tile for tile, _score in scored_tiles]
+        return [dc_replace(tile, score=score) for tile, score in scored_tiles]
 
 
-# Module-level singleton (lazy init)
+# Module-level singleton (lazy init) with thread safety
 _client: Optional[RerankerClient] = None
+_client_lock = threading.Lock()
 
 
 def get_reranker() -> RerankerClient:
-    """Get the singleton RerankerClient."""
+    """Get the singleton RerankerClient (thread-safe)."""
     global _client
     if _client is None:
-        _client = RerankerClient()
+        with _client_lock:
+            if _client is None:
+                _client = RerankerClient()
     return _client

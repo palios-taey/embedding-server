@@ -361,22 +361,22 @@ def _build_where_filter(
 
     if platform:
         conditions.append(
-            f'{{ path: ["platform"], operator: Equal, valueText: "{platform}" }}')
+            f'{{ path: ["platform"], operator: Equal, valueText: "{_escape_graphql(platform)}" }}')
     if source_type:
         conditions.append(
-            f'{{ path: ["source_type"], operator: Equal, valueText: "{source_type}" }}')
+            f'{{ path: ["source_type"], operator: Equal, valueText: "{_escape_graphql(source_type)}" }}')
     if scale:
         conditions.append(
-            f'{{ path: ["scale"], operator: Equal, valueText: "{scale}" }}')
+            f'{{ path: ["scale"], operator: Equal, valueText: "{_escape_graphql(scale)}" }}')
     if session_id:
         conditions.append(
-            f'{{ path: ["session_id"], operator: Equal, valueText: "{session_id}" }}')
+            f'{{ path: ["session_id"], operator: Equal, valueText: "{_escape_graphql(session_id)}" }}')
     if document_id:
         conditions.append(
-            f'{{ path: ["document_id"], operator: Equal, valueText: "{document_id}" }}')
+            f'{{ path: ["document_id"], operator: Equal, valueText: "{_escape_graphql(document_id)}" }}')
     if content_hash:
         conditions.append(
-            f'{{ path: ["content_hash"], operator: Equal, valueText: "{content_hash}" }}')
+            f'{{ path: ["content_hash"], operator: Equal, valueText: "{_escape_graphql(content_hash)}" }}')
     if has_artifacts is not None:
         val = "true" if has_artifacts else "false"
         conditions.append(
@@ -393,11 +393,11 @@ def _build_where_filter(
             f'{{ path: ["priority"], operator: GreaterThanEqual, valueNumber: {min_priority} }}')
     if model:
         conditions.append(
-            f'{{ path: ["model"], operator: Equal, valueText: "{model}" }}')
+            f'{{ path: ["model"], operator: Equal, valueText: "{_escape_graphql(model)}" }}')
     # HMM filters
     if dominant_motifs:
         # ContainsAny: match tiles with ANY of the specified motifs
-        motif_values = ", ".join(f'"{m}"' for m in dominant_motifs)
+        motif_values = ", ".join(f'"{_escape_graphql(m)}"' for m in dominant_motifs)
         conditions.append(
             f'{{ path: ["dominant_motifs"], operator: ContainsAny, valueText: [{motif_values}] }}')
     if hmm_enriched is not None:

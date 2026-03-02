@@ -58,9 +58,9 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["http://192.168.100.10:8095"],  # NCCL fabric only
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # Singleton retrieval instance
@@ -71,6 +71,16 @@ def get_retrieval() -> ISMARetrieval:
     if _retrieval is None:
         _retrieval = ISMARetrieval()
     return _retrieval
+
+
+# Singleton cache instance (avoids new Redis connection per request)
+_cache = None
+
+def _get_cache() -> SemanticCache:
+    global _cache
+    if _cache is None:
+        _cache = SemanticCache()
+    return _cache
 
 
 # ── Request Models ──────────────────────────────────────────────
@@ -445,8 +455,8 @@ def v2_search_adaptive(req: V2SearchRequest):
 
     # Phase 5: Check semantic cache first (includes filters in key)
     try:
-        cache = SemanticCache()
-        cached = cache.get(req.query, query_type="adaptive", **filters)
+        cache = _get_cache()
+        cached = cache.get(req.query, query_type="adaptive", top_k=req.top_k, **filters)
         if cached:
             cached_result = cached.get("result", cached)
             cached_result["cache_hit"] = True
@@ -466,10 +476,9 @@ def v2_search_adaptive(req: V2SearchRequest):
     result["search_time_ms"] = round(result.get("search_time_ms", 0), 1)
     result["cache_hit"] = False
 
-    # Phase 5: Store in cache (includes filters in key)
+    # Phase 5: Store in cache — use same query_type as read for key consistency
     try:
-        strategy = result.get("strategy", "default")
-        cache.put(req.query, result, query_type=strategy, **filters)
+        cache.put(req.query, result, query_type="adaptive", top_k=req.top_k, **filters)
     except Exception:
         pass  # Cache failure is non-fatal
 
@@ -679,6 +688,11 @@ def hmm_store_response(req: HMMStoreRequest):
 
     # Extract pkg_id from response if not provided
     pkg_id = req.pkg_id or parsed.get("package_id", f"api_{int(time.time())}")
+
+    # Sanitize platform to prevent path traversal
+    ALLOWED_PLATFORMS = {"claude", "claude_chat", "claude_code", "grok", "gemini", "chatgpt", "perplexity", "corpus"}
+    if req.platform not in ALLOWED_PLATFORMS:
+        raise HTTPException(status_code=400, detail=f"Invalid platform: {req.platform}")
 
     # Write to temp file (process_response expects a file path)
     response_dir = "/var/spark/isma/hmm_responses"
