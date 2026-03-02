@@ -1433,11 +1433,22 @@ class ISMARetrieval:
                 query_type=query_type,
                 instruction=instruction,
             )
-            # Trim back to top_k after reranking
+
+        # Step 2.5: Deduplicate by content_hash (keep first = best ranked)
+        # Multi-scale tiles (search_512, context_2048, full_4096) cause the same
+        # content_hash to appear multiple times. Keep best-ranked occurrence only.
+        if search_result.tiles:
+            seen_hashes = set()
+            deduped = []
+            for tile in search_result.tiles:
+                key = tile.content_hash or id(tile)
+                if key not in seen_hashes:
+                    seen_hashes.add(key)
+                    deduped.append(tile)
             search_result = SearchResult(
                 query=search_result.query,
-                tiles=search_result.tiles[:top_k],
-                total_tokens=sum(t.token_count for t in search_result.tiles[:top_k]),
+                tiles=deduped[:top_k],
+                total_tokens=sum(t.token_count for t in deduped[:top_k]),
                 search_time_ms=search_result.search_time_ms,
             )
 
