@@ -94,6 +94,8 @@ class HMMSearchRequest(BaseModel):
     expand_to_document: bool = False
     rosetta_weight: float = 0.3
     motif_weight: float = 0.2
+    query_type: str = "default"
+    instruction: Optional[str] = None
     platform: Optional[str] = None
     source_type: Optional[str] = None
     hmm_enriched: Optional[bool] = None
@@ -192,6 +194,8 @@ def search_hmm(req: HMMSearchRequest):
         expand_to_document=req.expand_to_document,
         rosetta_weight=req.rosetta_weight,
         motif_weight=req.motif_weight,
+        query_type=req.query_type,
+        instruction=req.instruction or "",
         **filters,
     )
 
@@ -328,6 +332,300 @@ def list_documents(
         "limit": limit,
         "documents": [asdict(d) for d in docs],
     }
+
+
+# ── V2 Endpoints (Shadow Deployment) ─────────────────────────
+
+class V2SearchRequest(BaseModel):
+    query: str
+    top_k: int = Field(default=10, ge=1, le=100)
+    rerank: bool = True
+    query_type: str = "default"
+    instruction: Optional[str] = None
+    platform: Optional[str] = None
+    source_type: Optional[str] = None
+    hmm_enriched: Optional[bool] = None
+
+
+@app.get("/v2/stats")
+def v2_stats():
+    from isma.src.retrieval_v2 import get_retrieval_v2
+    r = get_retrieval_v2()
+    return r.stats()
+
+
+@app.post("/v2/search")
+def v2_search(req: V2SearchRequest):
+    from isma.src.retrieval_v2 import get_retrieval_v2
+    r = get_retrieval_v2()
+
+    if not r.is_available():
+        raise HTTPException(status_code=503, detail="V2 class not available")
+
+    filters = {}
+    for field_name in ["platform", "source_type", "hmm_enriched"]:
+        val = getattr(req, field_name)
+        if val is not None:
+            filters[field_name] = val
+
+    result = r.search(req.query, top_k=req.top_k, **filters)
+    return _search_result_to_dict(result)
+
+
+@app.post("/v2/search/hmm")
+def v2_search_hmm(req: V2SearchRequest):
+    from isma.src.retrieval_v2 import get_retrieval_v2
+    r = get_retrieval_v2()
+
+    if not r.is_available():
+        raise HTTPException(status_code=503, detail="V2 class not available")
+
+    filters = {}
+    for field_name in ["platform", "source_type", "hmm_enriched"]:
+        val = getattr(req, field_name)
+        if val is not None:
+            filters[field_name] = val
+
+    result = r.hybrid_search(
+        req.query,
+        top_k=req.top_k,
+        rerank=req.rerank,
+        query_type=req.query_type,
+        instruction=req.instruction or "",
+        **filters,
+    )
+
+    tiles = result.get("tiles", [])
+    result["tiles"] = [_tile_to_dict(t) if isinstance(t, TileResult) else t for t in tiles]
+    result["count"] = len(result["tiles"])
+    result["search_time_ms"] = round(result.get("search_time_ms", 0), 1)
+    return result
+
+
+@app.get("/v2/expand/{content_hash}")
+def v2_expand(content_hash: str, scale: Optional[str] = "search_512"):
+    from isma.src.retrieval_v2 import get_retrieval_v2
+    r = get_retrieval_v2()
+    tiles = r.expand_passages(content_hash, scale=scale or "search_512")
+    return {
+        "content_hash": content_hash,
+        "scale": scale,
+        "count": len(tiles),
+        "tiles": [_tile_to_dict(t) for t in tiles],
+    }
+
+
+@app.post("/v2/search/adaptive")
+def v2_search_adaptive(req: V2SearchRequest):
+    from isma.src.retrieval_v2 import get_retrieval_v2
+    from isma.src.semantic_cache import SemanticCache
+
+    r = get_retrieval_v2()
+    if not r.is_available():
+        raise HTTPException(status_code=503, detail="V2 class not available")
+
+    filters = {}
+    for field_name in ["platform", "source_type", "hmm_enriched"]:
+        val = getattr(req, field_name)
+        if val is not None:
+            filters[field_name] = val
+
+    # Phase 5: Check semantic cache first (includes filters in key)
+    try:
+        cache = SemanticCache()
+        cached = cache.get(req.query, query_type="adaptive", **filters)
+        if cached:
+            cached_result = cached.get("result", cached)
+            cached_result["cache_hit"] = True
+            return cached_result
+    except Exception:
+        pass  # Cache failure is non-fatal
+
+    result = r.adaptive_search(
+        req.query,
+        top_k=req.top_k,
+        **filters,
+    )
+
+    tiles = result.get("tiles", [])
+    result["tiles"] = [_tile_to_dict(t) if isinstance(t, TileResult) else t for t in tiles]
+    result["count"] = len(result["tiles"])
+    result["search_time_ms"] = round(result.get("search_time_ms", 0), 1)
+    result["cache_hit"] = False
+
+    # Phase 5: Store in cache (includes filters in key)
+    try:
+        strategy = result.get("strategy", "default")
+        cache.put(req.query, result, query_type=strategy, **filters)
+    except Exception:
+        pass  # Cache failure is non-fatal
+
+    return result
+
+
+@app.post("/v2/search/retry")
+def v2_search_retry(req: V2SearchRequest):
+    """Adaptive search with agentic retry on low-quality results.
+
+    If the first attempt returns results with top score < 0.3,
+    retries once with expanded strategy and loosened filters.
+    """
+    from isma.src.retrieval_v2 import get_retrieval_v2
+    from isma.src.agentic_retry import retrieval_with_retry
+
+    r = get_retrieval_v2()
+    if not r.is_available():
+        raise HTTPException(status_code=503, detail="V2 class not available")
+
+    filters = {}
+    for field_name in ["platform", "source_type", "hmm_enriched"]:
+        val = getattr(req, field_name)
+        if val is not None:
+            filters[field_name] = val
+
+    result = retrieval_with_retry(
+        req.query,
+        top_k=req.top_k,
+        **filters,
+    )
+
+    tiles = result.get("tiles", [])
+    result["tiles"] = [_tile_to_dict(t) if isinstance(t, TileResult) else t for t in tiles]
+    result["count"] = len(result["tiles"])
+    result["search_time_ms"] = round(result.get("search_time_ms", 0), 1)
+    return result
+
+
+# ── V2 Phase 4: Temporal Truth Endpoints ─────────────────────
+
+@app.get("/v2/timeline/{content_hash}")
+def v2_timeline(content_hash: str):
+    """Get the temporal version chain for a content_hash.
+
+    Shows all enrichment versions from newest to oldest,
+    following SUPERSEDES edges.
+    """
+    from isma.src.hmm.neo4j_store import HMMNeo4jStore
+    store = HMMNeo4jStore()
+    try:
+        chain = store.get_temporal_chain(content_hash)
+        return {
+            "content_hash": content_hash,
+            "versions": len(chain),
+            "chain": chain,
+        }
+    finally:
+        store.close()
+
+
+@app.get("/v2/contradictions")
+def v2_contradictions(
+    min_confidence: float = Query(default=0.5, ge=0.0, le=1.0),
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    """List detected contradictions across the knowledge base."""
+    from isma.src.hmm.neo4j_store import HMMNeo4jStore
+    store = HMMNeo4jStore()
+    try:
+        contradictions = store.get_contradictions(
+            min_confidence=min_confidence, limit=limit,
+        )
+        return {
+            "count": len(contradictions),
+            "min_confidence": min_confidence,
+            "contradictions": contradictions,
+        }
+    finally:
+        store.close()
+
+
+@app.get("/v2/session/{session_id}/reconstruct")
+def v2_reconstruct_session(session_id: str):
+    """Reconstruct a session from its HMM-enriched tiles.
+
+    Returns tiles in exchange order, preferring latest versions
+    (following SUPERSEDES chains). Includes contradiction info.
+    """
+    from isma.src.hmm.neo4j_store import HMMNeo4jStore
+    store = HMMNeo4jStore()
+    try:
+        tiles = store.reconstruct_session(session_id)
+        return {
+            "session_id": session_id,
+            "tile_count": len(tiles),
+            "tiles": tiles,
+        }
+    finally:
+        store.close()
+
+
+@app.get("/v2/tile/{tile_id}/contradictions")
+def v2_tile_contradictions(tile_id: str):
+    """Get all contradictions for a specific tile."""
+    from isma.src.hmm.neo4j_store import HMMNeo4jStore
+    store = HMMNeo4jStore()
+    try:
+        contradictions = store.get_tile_contradictions(tile_id)
+        return {
+            "tile_id": tile_id,
+            "count": len(contradictions),
+            "contradictions": contradictions,
+        }
+    finally:
+        store.close()
+
+
+@app.post("/v2/contradictions/check")
+def v2_check_contradictions(limit: int = Query(default=100, ge=1, le=1000)):
+    """Trigger batch contradiction verification.
+
+    Scans RELATES_TO {type: 'contradicts'} edges that don't yet
+    have a corresponding CONTRADICTS edge and verifies them via
+    the cross-encoder reranker.
+    """
+    from isma.src.contradiction_detector import check_contradictions_batch
+    results = check_contradictions_batch(limit=limit)
+    return {
+        "checked": limit,
+        "confirmed": len(results),
+        "contradictions": results,
+    }
+
+
+@app.get("/v2/cache/stats")
+def v2_cache_stats():
+    """Get semantic cache statistics."""
+    from isma.src.semantic_cache import SemanticCache
+    cache = SemanticCache()
+    return cache.stats()
+
+
+@app.post("/v2/cache/clear")
+def v2_cache_clear():
+    """Clear all semantic cache entries."""
+    from isma.src.semantic_cache import SemanticCache
+    cache = SemanticCache()
+    cache.clear()
+    return {"status": "cleared"}
+
+
+@app.post("/v2/backfill/session-links")
+def v2_backfill_session_links(limit: int = Query(default=5000, ge=1, le=50000)):
+    """Backfill IN_SESSION edges between HMMTiles and ISMASessions.
+
+    Links tiles to their originating sessions via shared content_hash
+    in ISMAExchange nodes.
+    """
+    from isma.src.hmm.neo4j_store import HMMNeo4jStore
+    store = HMMNeo4jStore()
+    try:
+        created = store.backfill_session_links(limit=limit)
+        return {
+            "created": created,
+            "limit": limit,
+        }
+    finally:
+        store.close()
 
 
 # ── HMM Store Endpoint ────────────────────────────────────────

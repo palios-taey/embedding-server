@@ -3,27 +3,49 @@ HMM Neo4j Store - relational meaning layer.
 
 Idempotent upserts for Artifact, Tile, Motif nodes and their relationships.
 All writes are MERGE-based (safe to re-run).
+
+Phase 4 additions:
+  - SUPERSEDES: tracks re-enrichment version chains
+  - CONTRADICTS: first-class contradiction edges with confidence
+  - IN_SESSION: links HMMTile to ISMASession via shared content_hash
+  - Temporal chain queries and session reconstruction
 """
 
+import logging
+import time
 from typing import List, Dict, Any, Optional
 from dataclasses import asdict
 from neo4j import GraphDatabase
 
 from .motifs import MotifAssignment, DICTIONARY_VERSION
 
+log = logging.getLogger(__name__)
+
 # Neo4j connection (same as ISMA - shared instance)
 NEO4J_URI = "bolt://192.168.100.10:7689"
+
+# Shared driver singleton — avoids creating new connection pools per request
+_shared_driver = None
+
+
+def get_shared_driver(uri: str = NEO4J_URI):
+    """Get or create the shared Neo4j driver singleton."""
+    global _shared_driver
+    if _shared_driver is None:
+        _shared_driver = GraphDatabase.driver(uri, auth=None)
+    return _shared_driver
 
 
 class HMMNeo4jStore:
     """Neo4j store for HMM relational data."""
 
     def __init__(self, uri: str = NEO4J_URI):
-        self.driver = GraphDatabase.driver(uri, auth=None)
+        self.driver = get_shared_driver(uri)
         self._ensure_indexes()
 
     def close(self):
-        self.driver.close()
+        # Don't close the shared driver — it's reused across instances
+        pass
 
     def _ensure_indexes(self):
         """Create required indexes if they don't exist."""
@@ -35,6 +57,9 @@ class HMMNeo4jStore:
             "CREATE INDEX hmm_tile_artifact IF NOT EXISTS FOR (t:HMMTile) ON (t.artifact_id)",
             "CREATE INDEX hmm_bridge_hash IF NOT EXISTS FOR (b:WeaviateBridge) ON (b.content_hash)",
             "CREATE INDEX hmm_bridge_status IF NOT EXISTS FOR (b:WeaviateBridge) ON (b.status)",
+            # Phase 4: temporal truth indexes
+            "CREATE INDEX hmm_tile_hash IF NOT EXISTS FOR (t:HMMTile) ON (t.content_hash)",
+            "CREATE INDEX hmm_tile_enriched IF NOT EXISTS FOR (t:HMMTile) ON (t.enriched_at)",
         ]
         with self.driver.session() as session:
             for idx in indexes:
@@ -347,6 +372,271 @@ class HMMNeo4jStore:
             for r in result:
                 stats[r["status"] or "NULL"] = r["count"]
         return stats
+
+    # --- Phase 4: Temporal Truth Methods ---
+
+    def mark_superseded(
+        self,
+        old_tile_id: str,
+        new_tile_id: str,
+        evidence: str = "",
+        old_rosetta: str = "",
+        old_motifs: Optional[List[str]] = None,
+    ):
+        """Create SUPERSEDES edge when a tile is re-enriched.
+
+        The new tile supersedes the old one. If old_tile_id == new_tile_id
+        (same content re-enriched), we create a snapshot node first.
+        """
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+        if old_tile_id == new_tile_id:
+            # Same tile re-enriched — create a version snapshot
+            snapshot_id = f"{old_tile_id}_v{int(time.time())}"
+            query = """
+            MATCH (t:HMMTile {tile_id: $old_tile_id})
+            CREATE (snap:HMMTile {
+                tile_id: $snapshot_id,
+                content_hash: t.content_hash,
+                rosetta_summary: $old_rosetta,
+                dominant_motifs: $old_motifs,
+                enrichment_version: t.enrichment_version,
+                enriched_at: t.enriched_at,
+                platform: t.platform,
+                created_at: t.created_at,
+                updated_at: $now,
+                is_snapshot: true
+            })
+            CREATE (t)-[r:SUPERSEDES {
+                valid_from: t.enriched_at,
+                superseded_at: $now,
+                evidence: $evidence
+            }]->(snap)
+            RETURN snap.tile_id AS snapshot_id
+            """
+            with self.driver.session() as session:
+                result = session.run(
+                    query,
+                    old_tile_id=old_tile_id,
+                    snapshot_id=snapshot_id,
+                    old_rosetta=old_rosetta or "",
+                    old_motifs=old_motifs or [],
+                    now=now,
+                    evidence=evidence,
+                )
+                rec = result.single()
+                if rec:
+                    log.info("Created snapshot %s for re-enrichment of %s",
+                             snapshot_id, old_tile_id)
+        else:
+            # Different tiles — direct SUPERSEDES
+            query = """
+            MATCH (new:HMMTile {tile_id: $new_tile_id})
+            MATCH (old:HMMTile {tile_id: $old_tile_id})
+            MERGE (new)-[r:SUPERSEDES]->(old)
+            SET r.valid_from = new.enriched_at,
+                r.superseded_at = $now,
+                r.evidence = $evidence
+            """
+            with self.driver.session() as session:
+                session.run(
+                    query,
+                    new_tile_id=new_tile_id,
+                    old_tile_id=old_tile_id,
+                    now=now,
+                    evidence=evidence,
+                )
+
+    def mark_contradiction(
+        self,
+        tile_a_id: str,
+        tile_b_id: str,
+        confidence: float,
+        resolution: str = "",
+        detected_by: str = "reranker",
+    ):
+        """Create first-class CONTRADICTS edge between two tiles.
+
+        Unlike RELATES_TO {type: "contradicts"} which comes from HMM enrichment,
+        CONTRADICTS edges are programmatically verified with confidence scores.
+        """
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        query = """
+        MATCH (a:HMMTile {tile_id: $tile_a})
+        MATCH (b:HMMTile {tile_id: $tile_b})
+        MERGE (a)-[r:CONTRADICTS]->(b)
+        SET r.detected_at = $now,
+            r.confidence = $confidence,
+            r.resolution = $resolution,
+            r.detected_by = $detected_by
+        """
+        with self.driver.session() as session:
+            session.run(
+                query,
+                tile_a=tile_a_id,
+                tile_b=tile_b_id,
+                now=now,
+                confidence=confidence,
+                resolution=resolution,
+                detected_by=detected_by,
+            )
+
+    def link_tile_to_session(self, tile_id: str, session_id: str, exchange_index: int = -1):
+        """Create IN_SESSION edge from HMMTile to ISMASession.
+
+        Links tiles to their originating session via the shared content_hash.
+        """
+        query = """
+        MATCH (t:HMMTile {tile_id: $tile_id})
+        MATCH (s:ISMASession {session_id: $session_id})
+        MERGE (t)-[r:IN_SESSION]->(s)
+        SET r.exchange_index = $exchange_index
+        """
+        with self.driver.session() as session:
+            session.run(
+                query,
+                tile_id=tile_id,
+                session_id=session_id,
+                exchange_index=exchange_index,
+            )
+
+    def backfill_session_links(self, limit: int = 5000) -> int:
+        """Bulk link HMMTiles to ISMASessions via shared content_hash.
+
+        Returns count of new IN_SESSION edges created.
+        """
+        query = """
+        MATCH (t:HMMTile)
+        WHERE NOT EXISTS { MATCH (t)-[:IN_SESSION]->() }
+        WITH t LIMIT $limit
+        MATCH (e:ISMAExchange {content_hash: t.content_hash})
+        MATCH (s:ISMASession)-[:CONTAINS]->(e)
+        MERGE (t)-[r:IN_SESSION]->(s)
+        SET r.exchange_index = e.exchange_index
+        RETURN count(r) AS created
+        """
+        with self.driver.session() as session:
+            result = session.run(query, limit=limit)
+            rec = result.single()
+            return rec["created"] if rec else 0
+
+    def get_temporal_chain(self, content_hash: str) -> List[Dict]:
+        """Follow SUPERSEDES chain for a content_hash.
+
+        Returns all versions from newest to oldest.
+        """
+        query = """
+        MATCH (t:HMMTile {content_hash: $content_hash})
+        WHERE NOT EXISTS { MATCH ()-[:SUPERSEDES]->(t) WHERE coalesce(t.is_snapshot, false) = false }
+        OPTIONAL MATCH chain = (t)-[:SUPERSEDES*0..10]->(old)
+        WITH nodes(chain) AS versions
+        UNWIND versions AS v
+        RETURN DISTINCT v.tile_id AS tile_id,
+               v.rosetta_summary AS rosetta_summary,
+               v.dominant_motifs AS dominant_motifs,
+               v.enrichment_version AS enrichment_version,
+               v.enriched_at AS enriched_at,
+               v.platform AS platform,
+               v.is_snapshot AS is_snapshot
+        ORDER BY v.enriched_at DESC
+        """
+        with self.driver.session() as session:
+            result = session.run(query, content_hash=content_hash)
+            return [dict(r) for r in result]
+
+    def get_contradictions(
+        self,
+        min_confidence: float = 0.5,
+        limit: int = 50,
+    ) -> List[Dict]:
+        """Get all detected contradictions above confidence threshold."""
+        query = """
+        MATCH (a:HMMTile)-[r:CONTRADICTS]->(b:HMMTile)
+        WHERE r.confidence >= $min_confidence
+        RETURN a.tile_id AS tile_a, a.rosetta_summary AS rosetta_a,
+               b.tile_id AS tile_b, b.rosetta_summary AS rosetta_b,
+               r.confidence AS confidence, r.detected_at AS detected_at,
+               r.resolution AS resolution, r.detected_by AS detected_by
+        ORDER BY r.confidence DESC
+        LIMIT $limit
+        """
+        with self.driver.session() as session:
+            result = session.run(query, min_confidence=min_confidence, limit=limit)
+            return [dict(r) for r in result]
+
+    def reconstruct_session(self, session_id: str) -> List[Dict]:
+        """Reconstruct a session's tiles in exchange order.
+
+        Returns HMMTiles linked to a session, preferring the latest
+        version (following SUPERSEDES chains).
+        """
+        query = """
+        MATCH (s:ISMASession {session_id: $session_id})<-[r:IN_SESSION]-(t:HMMTile)
+        WHERE coalesce(t.is_snapshot, false) = false
+        OPTIONAL MATCH (t)-[:SUPERSEDES]->(old:HMMTile)
+        RETURN t.tile_id AS tile_id,
+               t.content_hash AS content_hash,
+               t.rosetta_summary AS rosetta_summary,
+               t.dominant_motifs AS dominant_motifs,
+               t.enrichment_version AS enrichment_version,
+               t.enriched_at AS enriched_at,
+               r.exchange_index AS exchange_index,
+               count(old) AS superseded_count
+        ORDER BY r.exchange_index
+        """
+        with self.driver.session() as session:
+            result = session.run(query, session_id=session_id)
+            return [dict(r) for r in result]
+
+    def get_tile_contradictions(self, tile_id: str) -> List[Dict]:
+        """Get all contradictions for a specific tile."""
+        query = """
+        MATCH (t:HMMTile {tile_id: $tile_id})-[r:CONTRADICTS]-(other:HMMTile)
+        RETURN other.tile_id AS other_tile_id,
+               other.rosetta_summary AS other_rosetta,
+               r.confidence AS confidence,
+               r.detected_at AS detected_at,
+               r.resolution AS resolution,
+               CASE WHEN startNode(r) = t THEN 'outgoing' ELSE 'incoming' END AS direction
+        ORDER BY r.confidence DESC
+        """
+        with self.driver.session() as session:
+            result = session.run(query, tile_id=tile_id)
+            return [dict(r) for r in result]
+
+    def graph_expand(
+        self,
+        tile_ids: List[str],
+        depth: int = 2,
+        follow_supersedes: bool = True,
+    ) -> List[Dict]:
+        """Expand from seed tiles through RELATES_TO, SUPERSEDES, and CONTRADICTS.
+
+        For SUPERSEDES chains, prefers the latest version (no incoming SUPERSEDES).
+        Returns expanded tile info with relationship context.
+        """
+        rel_types = "RELATES_TO"
+        if follow_supersedes:
+            rel_types = "RELATES_TO|SUPERSEDES|CONTRADICTS"
+
+        query = f"""
+        UNWIND $tile_ids AS seed_id
+        MATCH (seed:HMMTile {{tile_id: seed_id}})
+        OPTIONAL MATCH path = (seed)-[:{rel_types}*1..{depth}]-(neighbor:HMMTile)
+        WHERE coalesce(neighbor.is_snapshot, false) = false
+        WITH DISTINCT neighbor, seed
+        WHERE neighbor IS NOT NULL AND neighbor.tile_id <> seed.tile_id
+        RETURN neighbor.tile_id AS tile_id,
+               neighbor.content_hash AS content_hash,
+               neighbor.rosetta_summary AS rosetta_summary,
+               neighbor.dominant_motifs AS dominant_motifs,
+               neighbor.platform AS platform,
+               neighbor.enriched_at AS enriched_at
+        LIMIT 100
+        """
+        with self.driver.session() as session:
+            result = session.run(query, tile_ids=tile_ids)
+            return [dict(r) for r in result]
 
     def wipe(self):
         """Delete all HMM nodes and relationships (for rebuild)."""
