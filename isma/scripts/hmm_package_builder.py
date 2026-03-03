@@ -97,6 +97,11 @@ def weaviate_gql(query: str, timeout: int = 120) -> dict:
     return {}
 
 
+# Instance ID for multi-worker package isolation
+# Each worker gets its own "current package" tracking via hostname
+import socket
+_INSTANCE_ID = os.environ.get("TAEY_NODE_ID", socket.gethostname().split("-")[0])
+
 # ============================================================================
 # Theme Index & State Management
 # ============================================================================
@@ -172,14 +177,14 @@ def mark_completed(content_hashes: list, pkg_id: str = ""):
 
 
 def get_current_package(platform: str = None) -> dict:
-    """Get the current package being worked on."""
+    """Get the current package being worked on by THIS instance."""
     r = get_redis()
     if platform:
-        data = r.get(f"{PFX}current:{platform}")
+        data = r.get(f"{PFX}current:{_INSTANCE_ID}:{platform}")
     else:
-        # Find any current package
+        # Find any current package for this instance
         for p in PLATFORM_BUDGETS:
-            data = r.get(f"{PFX}current:{p}")
+            data = r.get(f"{PFX}current:{_INSTANCE_ID}:{p}")
             if data:
                 return json.loads(data)
         return {}
@@ -187,15 +192,15 @@ def get_current_package(platform: str = None) -> dict:
 
 
 def set_current_package(platform: str, pkg_info: dict):
-    """Set the current package for a platform."""
+    """Set the current package for a platform on THIS instance."""
     r = get_redis()
-    r.set(f"{PFX}current:{platform}", json.dumps(pkg_info), ex=7200)
+    r.set(f"{PFX}current:{_INSTANCE_ID}:{platform}", json.dumps(pkg_info), ex=7200)
 
 
 def clear_current_package(platform: str):
-    """Clear the current package for a platform."""
+    """Clear the current package for a platform on THIS instance."""
     r = get_redis()
-    r.delete(f"{PFX}current:{platform}")
+    r.delete(f"{PFX}current:{_INSTANCE_ID}:{platform}")
 
 
 # ============================================================================
