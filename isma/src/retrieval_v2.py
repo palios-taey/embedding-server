@@ -503,14 +503,34 @@ class ISMARetrievalV2:
         graph_expanded = 0
         if expand_graph:
             try:
+                import threading
                 from isma.src.hmm.neo4j_store import HMMNeo4jStore
                 store = HMMNeo4jStore()  # Uses shared driver singleton
                 # Use top-ranked seed tiles for graph expansion (sorted by RRF score)
                 seed_ids = sorted(rrf_scores.keys(), key=lambda ch: rrf_scores[ch], reverse=True)[:top_k]
                 if seed_ids:
-                    neighbors = store.graph_expand(
-                        seed_ids, depth=graph_depth, follow_supersedes=True,
-                    )
+                    # Latency guard: depth-3 expansion can be slow on dense graph (4.36 edges/node).
+                    # If depth-3 exceeds 500ms, fall back to depth-2.
+                    _graph_result = [None]
+                    _depth = graph_depth
+                    def _run_expand(depth):
+                        _graph_result[0] = store.graph_expand(
+                            seed_ids, depth=depth, follow_supersedes=True,
+                        )
+                    t = threading.Thread(target=_run_expand, args=(_depth,), daemon=True)
+                    t.start()
+                    t.join(timeout=0.5)  # 500ms wall-clock limit
+                    if not t.is_alive():
+                        neighbors = _graph_result[0] or []
+                    elif _depth >= 3:
+                        # depth-3 timed out — fall back to depth-2
+                        log.debug("Graph expand depth-%d timed out, falling back to depth-2", _depth)
+                        t2 = threading.Thread(target=_run_expand, args=(2,), daemon=True)
+                        t2.start()
+                        t2.join(timeout=1.5)  # 1.5s for depth-2
+                        neighbors = _graph_result[0] or []
+                    else:
+                        neighbors = _graph_result[0] or []
                     for rank, nb in enumerate(neighbors):
                         ch = nb.get("content_hash", "")
                         if ch:
