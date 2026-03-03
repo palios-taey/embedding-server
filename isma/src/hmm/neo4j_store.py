@@ -636,6 +636,7 @@ class HMMNeo4jStore:
                neighbor.dominant_motifs AS dominant_motifs,
                neighbor.platform AS platform,
                neighbor.enriched_at AS enriched_at
+        ORDER BY neighbor.enriched_at DESC
         LIMIT 100
         """
         with self.driver.session() as session:

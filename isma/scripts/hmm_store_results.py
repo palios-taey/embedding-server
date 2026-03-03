@@ -851,8 +851,15 @@ def _rollback_store(
                                 if v is not None}
                 weaviate_patch(tid, revert_props)
             else:
-                # No snapshot — best-effort: mark as not enriched
-                weaviate_patch(tid, {"hmm_enriched": False, "hmm_enrichment_version": ""})
+                # No snapshot — clear enrichment fields to avoid polluting BM25
+                # (V2 uses rosetta_summary^3 — leaving new values silently corrupts search)
+                weaviate_patch(tid, {
+                    "hmm_enriched": False,
+                    "hmm_enrichment_version": "",
+                    "rosetta_summary": "",
+                    "dominant_motifs": [],
+                    "motif_data_json": "",
+                })
         log.warning(f"  Rollback: reverted {len(patched_tile_ids)} tile patches")
 
     # Delete newly-created rosetta tile (or revert if it was pre-existing)

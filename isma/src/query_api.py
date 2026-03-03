@@ -38,7 +38,7 @@ import tempfile
 import time
 import threading
 
-from isma.src.retrieval import ISMARetrieval, TileResult, SearchResult
+from isma.src.retrieval import ISMARetrieval, TileResult, SearchResult, _get_embedding
 from isma.src.semantic_cache import SemanticCache
 
 
@@ -461,10 +461,18 @@ def v2_search_adaptive(req: V2SearchRequest):
         if val is not None:
             filters[field_name] = val
 
+    # Fetch embedding once — used for both semantic cache lookup and cache store.
+    # Without this, cache.get/put bypass _find_similar() and only do exact string match.
+    query_embedding = None
+    try:
+        query_embedding = _get_embedding(req.query)
+    except Exception:
+        pass  # Embedding failure is non-fatal; cache falls back to exact-match only
+
     # Phase 5: Check semantic cache first (includes filters in key)
     try:
         cache = _get_cache()
-        cached = cache.get(req.query, query_type="adaptive", top_k=req.top_k, **filters)
+        cached = cache.get(req.query, query_type="adaptive", embedding=query_embedding, top_k=req.top_k, **filters)
         if cached:
             cached_result = cached.get("result", cached)
             cached_result["cache_hit"] = True
@@ -486,7 +494,7 @@ def v2_search_adaptive(req: V2SearchRequest):
 
     # Phase 5: Store in cache — use same query_type as read for key consistency
     try:
-        cache.put(req.query, result, query_type="adaptive", top_k=req.top_k, **filters)
+        cache.put(req.query, result, query_type="adaptive", embedding=query_embedding, top_k=req.top_k, **filters)
     except Exception:
         pass  # Cache failure is non-fatal
 
