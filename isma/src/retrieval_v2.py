@@ -422,10 +422,14 @@ class ISMARetrievalV2:
         else:
             # Conceptual queries get theme-enriched reranker instructions
             instruction = plan.reranker_instruction
-            if strategy == "conceptual":
-                theme_ctx = self._get_theme_context(query)
-                if theme_ctx:
-                    instruction = f"{instruction} {theme_ctx}".strip()
+            # DISABLED 2026-03-03: _get_theme_context() causes 3.8x latency spike
+            # (embedding roundtrip + nearVector on 1M tiles to find 24 theme tiles)
+            # and -3.3pt conceptual R@10 regression (reranker biased toward theme abstractions).
+            # Re-enable after moving theme tiles to dedicated ISMA_Themes collection.
+            # if strategy == "conceptual":
+            #     theme_ctx = self._get_theme_context(query)
+            #     if theme_ctx:
+            #         instruction = f"{instruction} {theme_ctx}".strip()
 
             result = self.hybrid_search(
                 query,
