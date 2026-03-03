@@ -420,13 +420,19 @@ class ISMARetrievalV2:
                 **merged_filters,
             )
         else:
-            # All other strategies use hybrid_search with appropriate instruction
+            # Conceptual queries get theme-enriched reranker instructions
+            instruction = plan.reranker_instruction
+            if strategy == "conceptual":
+                theme_ctx = self._get_theme_context(query)
+                if theme_ctx:
+                    instruction = f"{instruction} {theme_ctx}".strip()
+
             result = self.hybrid_search(
                 query,
                 top_k=top_k,
                 rerank=True,
                 query_type=strategy,
-                instruction=plan.reranker_instruction,
+                instruction=instruction,
                 **merged_filters,
             )
 
@@ -624,6 +630,45 @@ class ISMARetrievalV2:
 
         r = ISMARetrieval()
         return r.get_tiles_for_content(content_hash, scale=scale)
+
+    def _get_theme_context(self, query: str) -> str:
+        """Look up the best-matching theme tile for a conceptual query.
+
+        Returns a short context string enriching the reranker instruction,
+        e.g. "Relevant themes: Sacred Covenant, Guardian Protocol."
+        Queries ISMA_Quantum (v1) via nearVector. Returns "" on failure.
+        """
+        try:
+            vector = _get_embedding(query)
+            if not vector:
+                return ""
+            vector_str = str(vector)
+            gql = (
+                f"{{ Get {{ ISMA_Quantum("
+                f"nearVector: {{ vector: {vector_str} }}"
+                f' where: {{ path: ["scale"], operator: Equal, valueText: "theme" }}'
+                f" limit: 3"
+                f") {{ rosetta_summary dominant_motifs _additional {{ distance }} }} }} }}"
+            )
+            data = requests.post(
+                f"{WEAVIATE_URL}/v1/graphql", json={"query": gql}, timeout=5
+            ).json()
+            themes = (data.get("data") or {}).get("Get", {}).get("ISMA_Quantum", [])
+            if not themes:
+                return ""
+            # Extract theme names from rosetta_summary ("Theme 007 — Family Collective: ...")
+            import re
+            names = []
+            for t in themes:
+                rs = t.get("rosetta_summary") or ""
+                m = re.search(r"Theme \d+ — ([^:]+)", rs)
+                if m:
+                    names.append(m.group(1).strip())
+            if names:
+                return f"Relevant themes: {', '.join(names)}."
+        except Exception as e:
+            log.debug("Theme lookup failed: %s", e)
+        return ""
 
     # ── Filters ─────────────────────────────────────────────────
 
