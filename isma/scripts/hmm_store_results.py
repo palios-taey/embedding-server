@@ -990,7 +990,8 @@ def process_response(response_path: str, platform: str = "unknown", pkg_id: str 
         issues = validate_item(item)
         if issues:
             log.warning(f"  Item {prefix}: {', '.join(issues)}")
-            if "missing hash" in issues:
+            # Skip items missing required fields — store_item() requires both
+            if any(k in issues for k in ("missing hash", "missing rosetta_summary", "rosetta_summary too short")):
                 continue
 
         # Resolve hash prefix to full content_hash
