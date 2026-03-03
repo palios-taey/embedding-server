@@ -462,23 +462,25 @@ class ISMARetrievalV2:
         rrf_scores: Dict[str, float] = {}
         obj_map: Dict[str, Any] = {}
 
-        # Run sub-queries (sequential for now, could be parallel)
-        for sq in sub_queries:
-            sub_result = self.search(sq, top_k=top_k * 2, **filters)
-            for rank, tile in enumerate(sub_result.tiles):
-                ch = tile.content_hash
-                if ch:
-                    rrf_scores[ch] = rrf_scores.get(ch, 0) + 1.0 / (k + rank + 1)
-                    obj_map[ch] = tile
-
-        # Also search with full query
-        full_result = self.search(query, top_k=top_k * 2, **filters)
-        for rank, tile in enumerate(full_result.tiles):
-            ch = tile.content_hash
-            if ch:
-                # Full query gets 2x weight
-                rrf_scores[ch] = rrf_scores.get(ch, 0) + 2.0 / (k + rank + 1)
-                obj_map[ch] = tile
+        # Run sub-queries + full query in parallel (full query gets 2x weight)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        all_queries = [(sq, 1.0) for sq in sub_queries] + [(query, 2.0)]
+        with ThreadPoolExecutor(max_workers=min(len(all_queries), 8)) as executor:
+            futures = {
+                executor.submit(self.search, q, top_k=top_k * 2, **filters): weight
+                for q, weight in all_queries
+            }
+            for future in as_completed(futures):
+                weight = futures[future]
+                try:
+                    result = future.result()
+                    for rank, tile in enumerate(result.tiles):
+                        ch = tile.content_hash
+                        if ch:
+                            rrf_scores[ch] = rrf_scores.get(ch, 0) + weight / (k + rank + 1)
+                            obj_map[ch] = tile
+                except Exception as e:
+                    log.warning("Relational sub-query failed: %s", e)
 
         # Phase 4: Neo4j graph expansion from seed results
         graph_expanded = 0
