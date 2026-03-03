@@ -56,8 +56,16 @@ def embed_text(text: str):
     return None
 
 
-def theme_content_hash(theme_id: str) -> str:
-    """Deterministic content_hash for a theme tile."""
+def theme_content_hash(theme_id: str, content: str = "") -> str:
+    """Deterministic content_hash for a theme tile.
+
+    If content is provided, hashes the content (provenance-correct: hash changes
+    when theme definition changes). Falls back to ID-only hash for backward
+    compatibility with tiles that haven't been rebuilt yet.
+    """
+    if content:
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+    # Legacy: ID-only hash (used for lookup of tiles built before this fix)
     return hashlib.sha256(f"theme_tile_{theme_id}".encode()).hexdigest()[:16]
 
 
