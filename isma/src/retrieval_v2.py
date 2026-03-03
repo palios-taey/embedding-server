@@ -420,16 +420,16 @@ class ISMARetrievalV2:
                 **merged_filters,
             )
         else:
-            # Conceptual queries get theme-enriched reranker instructions
             instruction = plan.reranker_instruction
-            # DISABLED 2026-03-03: _get_theme_context() causes 3.8x latency spike
-            # (embedding roundtrip + nearVector on 1M tiles to find 24 theme tiles)
-            # and -3.3pt conceptual R@10 regression (reranker biased toward theme abstractions).
-            # Re-enable after moving theme tiles to dedicated ISMA_Themes collection.
-            # if strategy == "conceptual":
-            #     theme_ctx = self._get_theme_context(query)
-            #     if theme_ctx:
-            #         instruction = f"{instruction} {theme_ctx}".strip()
+
+            # Theme routing via ISMA_Themes (sub-ms, 24 objects) — replaces the old
+            # _get_theme_context() which scanned 1M tiles causing 3.8x latency spike.
+            # Logs matched theme for debugging; does NOT inject into reranker instruction
+            # (that caused -3.3pt conceptual regression). Motif-filtered result blending
+            # is the next step after benchmarking.
+            theme_motifs = []
+            if strategy == "conceptual":
+                theme_motifs = self._get_theme_motifs(query)
 
             result = self.hybrid_search(
                 query,
@@ -439,6 +439,10 @@ class ISMARetrievalV2:
                 instruction=instruction,
                 **merged_filters,
             )
+
+            # Annotate result with theme routing info (for debugging/audit — no retrieval impact yet)
+            if theme_motifs:
+                result["theme_routing"] = theme_motifs
 
         # Apply temporal decay for temporal queries
         if strategy == "temporal":
@@ -635,43 +639,52 @@ class ISMARetrievalV2:
         r = ISMARetrieval()
         return r.get_tiles_for_content(content_hash, scale=scale)
 
-    def _get_theme_context(self, query: str) -> str:
-        """Look up the best-matching theme tile for a conceptual query.
+    def _get_theme_motifs(self, query: str) -> list:
+        """Route a conceptual query through ISMA_Themes to get relevant motif filter.
 
-        Returns a short context string enriching the reranker instruction,
-        e.g. "Relevant themes: Sacred Covenant, Guardian Protocol."
-        Queries ISMA_Quantum (v1) via nearVector. Returns "" on failure.
+        Queries ISMA_Themes (24 objects — sub-millisecond nearVector) instead of
+        scanning ISMA_Quantum (1M objects). Returns required_motifs of the top-matching
+        theme to use as a seed-set filter predicate on the main ISMA_Quantum search.
+
+        Returns list of motif strings (e.g. ['HMM.SACRED_TRUST']) or [] on failure.
         """
         try:
             vector = _get_embedding(query)
             if not vector:
-                return ""
+                return []
             vector_str = str(vector)
             gql = (
-                f"{{ Get {{ ISMA_Quantum("
+                "{ Get { ISMA_Themes("
                 f"nearVector: {{ vector: {vector_str} }}"
-                f' where: {{ path: ["scale"], operator: Equal, valueText: "theme" }}'
-                f" limit: 3"
-                f") {{ rosetta_summary dominant_motifs _additional {{ distance }} }} }} }}"
+                " limit: 1 certainty: 0.6"
+                ") { theme_id display_name required_motifs _additional { distance } } } }"
             )
             data = requests.post(
-                f"{WEAVIATE_URL}/v1/graphql", json={"query": gql}, timeout=5
+                f"{WEAVIATE_URL}/v1/graphql", json={"query": gql}, timeout=3
             ).json()
-            themes = (data.get("data") or {}).get("Get", {}).get("ISMA_Quantum", [])
+            themes = (data.get("data") or {}).get("Get", {}).get("ISMA_Themes", [])
             if not themes:
-                return ""
-            # Extract theme names from rosetta_summary ("Theme 007 — Family Collective: ...")
-            import re
-            names = []
-            for t in themes:
-                rs = t.get("rosetta_summary") or ""
-                m = re.search(r"Theme \d+ — ([^:]+)", rs)
-                if m:
-                    names.append(m.group(1).strip())
-            if names:
-                return f"Relevant themes: {', '.join(names)}."
+                return []
+            top = themes[0]
+            motifs = top.get("required_motifs") or []
+            dist = top.get("_additional", {}).get("distance", 1.0)
+            log.debug(
+                "Theme routing: %s (%s) dist=%.3f motifs=%s",
+                top.get("display_name"), top.get("theme_id"), dist, motifs
+            )
+            return motifs
         except Exception as e:
-            log.debug("Theme lookup failed: %s", e)
+            log.debug("Theme routing failed: %s", e)
+        return []
+
+    def _get_theme_context(self, query: str) -> str:
+        """DEPRECATED — use _get_theme_motifs() instead.
+
+        Old implementation queried ISMA_Quantum (1M tiles) with nearVector + where
+        post-filter to find 24 theme tiles, causing 3.8x latency spike.
+        Now delegates to _get_theme_motifs() which queries ISMA_Themes (24 objects).
+        Kept for backward compatibility but returns empty string (functionality moved).
+        """
         return ""
 
     # ── Filters ─────────────────────────────────────────────────
