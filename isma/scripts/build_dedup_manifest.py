@@ -58,6 +58,7 @@ CORPUS_STAGES = [
     ("mira_md",       DATA_BASE / "mira_md_files",               0.3),
     ("mac_all_md",    CORPUS_BASE / "mac_all_md",                0.2),
     ("spark_loose",   CORPUS_BASE / "spark_loose",               0.2),
+    ("ccm_new_mds",   DATA_BASE / "CCM_NEW_MDS",                 0.5),
 ]
 
 # File extensions to process for corpus

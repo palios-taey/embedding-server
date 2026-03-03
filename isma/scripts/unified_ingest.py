@@ -86,6 +86,7 @@ STAGES = [
     ("mira_md",       DATA_BASE / "mira_md_files",               0.3,  None),
     ("mac_all_md",    CORPUS_BASE / "mac_all_md",                0.2,  None),
     ("spark_loose",   CORPUS_BASE / "spark_loose",               0.2,  None),
+    ("ccm_new_mds",   DATA_BASE / "CCM_NEW_MDS",                 0.5,  None),
     # Transcripts last
     ("transcripts",   TRANSCRIPT_BASE,                           0.0,  None),
 ]
@@ -96,6 +97,7 @@ LAYER_INT = {
     "layer_1": 1, "layer_2": 2,
     "github-repos": 2, "expansion_md": 2, "mira_md": 2,
     "mac_all_md": 2, "spark_loose": 2,
+    "ccm_new_mds": 1,
 }
 
 # Pipeline sizing
