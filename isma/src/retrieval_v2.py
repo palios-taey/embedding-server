@@ -56,6 +56,11 @@ V2_PROPERTIES = [
 V2_PROPS_STR = " ".join(V2_PROPERTIES)
 
 
+def _escape_gql(s: str) -> str:
+    """Escape a string for embedding in a GraphQL value literal."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _graphql(query: str) -> dict:
     """Execute a GraphQL query using connection-pooled session.
 
@@ -481,8 +486,8 @@ class ISMARetrievalV2:
             try:
                 from isma.src.hmm.neo4j_store import HMMNeo4jStore
                 store = HMMNeo4jStore()  # Uses shared driver singleton
-                # Use top seed tiles for graph expansion
-                seed_ids = list(rrf_scores.keys())[:top_k]
+                # Use top-ranked seed tiles for graph expansion (sorted by RRF score)
+                seed_ids = sorted(rrf_scores.keys(), key=lambda ch: rrf_scores[ch], reverse=True)[:top_k]
                 if seed_ids:
                     neighbors = store.graph_expand(
                         seed_ids, depth=graph_depth, follow_supersedes=True,
@@ -564,12 +569,11 @@ class ISMARetrievalV2:
         for i in range(0, len(content_hashes), batch_size):
             batch = content_hashes[i:i + batch_size]
             if len(batch) == 1:
-                safe_ch = batch[0].replace("\\", "\\\\").replace('"', '\\"')
+                safe_ch = _escape_gql(batch[0])
                 where = f'{{ path: ["content_hash"], operator: Equal, valueText: "{safe_ch}" }}'
             else:
                 operands = ", ".join(
-                    f'{{ path: ["content_hash"], operator: Equal, '
-                    f'valueText: "{ch.replace(chr(92), chr(92)+chr(92)).replace(chr(34), chr(92)+chr(34))}" }}'
+                    f'{{ path: ["content_hash"], operator: Equal, valueText: "{_escape_gql(ch)}" }}'
                     for ch in batch
                 )
                 where = f'{{ operator: Or, operands: [{operands}] }}'
