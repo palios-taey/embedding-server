@@ -168,6 +168,18 @@ class SemanticCache:
             log.warning("Cache put failed: %s", e)
             return
 
+        # Build reverse index: tile → [qhash, ...] for O(1) invalidation.
+        # Replaces the O(N) scan_iter in invalidate_for_tile().
+        try:
+            tiles = result.get("tiles", []) if isinstance(result, dict) else []
+            for tile in tiles:
+                ch = tile.get("content_hash") if isinstance(tile, dict) else getattr(tile, "content_hash", None)
+                if ch:
+                    self.r.sadd(f"{PREFIX}tile:{ch}", qhash)
+                    self.r.expire(f"{PREFIX}tile:{ch}", ttl)
+        except Exception as e:
+            log.debug("Reverse tile index put failed: %s", e)
+
         # Store embedding for semantic matching
         if embedding:
             try:
@@ -187,20 +199,24 @@ class SemanticCache:
         """Invalidate cached results that contain a specific tile.
 
         Called after HMM enrichment updates a tile.
+
+        Uses reverse index (isma:cache:tile:{hash}) for O(1) lookup instead
+        of O(N) scan_iter over all cached queries.
         """
         count = 0
-        for key in self.r.scan_iter(f"{PREFIX}query:*", count=100):
-            try:
-                raw = self.r.get(key)
-                if raw and content_hash in raw:
-                    self.r.delete(key)
-                    # Also delete the vector if it exists
-                    qhash = key.split(":")[-1]
-                    self.r.delete(f"{PREFIX}vec:{qhash}")
-                    self.r.srem(f"{PREFIX}vec_index", qhash)
-                    count += 1
-            except Exception:
-                pass
+        try:
+            qhashes = self.r.smembers(f"{PREFIX}tile:{content_hash}")
+            if qhashes:
+                pipe = self.r.pipeline()
+                for qhash in qhashes:
+                    pipe.delete(f"{PREFIX}query:{qhash}")
+                    pipe.delete(f"{PREFIX}vec:{qhash}")
+                    pipe.srem(f"{PREFIX}vec_index", qhash)
+                pipe.delete(f"{PREFIX}tile:{content_hash}")
+                pipe.execute()
+                count = len(qhashes)
+        except Exception as e:
+            log.warning("Cache invalidation failed for tile %s: %s", content_hash[:16], e)
 
         if count:
             log.info("Cache invalidated %d entries for tile %s", count, content_hash[:16])

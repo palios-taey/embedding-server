@@ -73,7 +73,14 @@ def _graphql(query: str) -> dict:
             json={"query": query},
             timeout=30,
         )
-        return r.json()
+        result = r.json()
+        # Weaviate returns HTTP 200 with {"data": null, "errors": [...]} on invalid GQL syntax.
+        # data.get("data", {}) returns None (key exists, value is null) → AttributeError on .get().
+        if result.get("data") is None:
+            if result.get("errors"):
+                log.warning("GraphQL errors: %s", result["errors"])
+            return {}
+        return result
     except (requests.ConnectionError, requests.Timeout) as e:
         log.error("Weaviate connection failure: %s", e)
         raise
@@ -229,8 +236,8 @@ class ISMARetrievalV2:
         Weaviate BM25 properties weight is applied via the query.
         rosetta_summary and motif_annotations get boosted.
         """
-        # Escape query for GraphQL (backslash first, then quote)
-        safe_query = query.replace('\\', '\\\\').replace('"', '\\"')
+        # Escape query for GraphQL (backslash first, then quote, then newlines)
+        safe_query = query.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
         filter_clause = self._build_filter(**filters)
 
         q = (
@@ -496,22 +503,24 @@ class ISMARetrievalV2:
                     )
                     for rank, nb in enumerate(neighbors):
                         ch = nb.get("content_hash", "")
-                        if ch and ch not in obj_map:
-                            # Graph neighbors get lower weight than direct search
+                        if ch:
+                            # Accumulate RRF unconditionally — previously skipped nodes already
+                            # found by direct search, penalizing the highest-relevance items.
                             rrf_scores[ch] = rrf_scores.get(ch, 0) + 0.5 / (k + rank + 1)
-                            # Create TileResult from graph data
-                            obj_map[ch] = TileResult(
-                                content="",  # Content fetched later if needed
-                                content_hash=ch,
-                                platform=nb.get("platform", ""),
-                                source_type="", source_file="",
-                                session_id="", document_id="",
-                                scale="canonical", tile_id=ch,
-                                token_count=0, score=rrf_scores[ch],
-                                rosetta_summary=nb.get("rosetta_summary", ""),
-                                dominant_motifs=nb.get("dominant_motifs") or [],
-                            )
-                            graph_expanded += 1
+                            if ch not in obj_map:
+                                # Create TileResult from graph data (only if not already present)
+                                obj_map[ch] = TileResult(
+                                    content="",  # Content fetched later if needed
+                                    content_hash=ch,
+                                    platform=nb.get("platform", ""),
+                                    source_type="", source_file="",
+                                    session_id="", document_id="",
+                                    scale="canonical", tile_id=ch,
+                                    token_count=0, score=rrf_scores[ch],
+                                    rosetta_summary=nb.get("rosetta_summary", ""),
+                                    dominant_motifs=nb.get("dominant_motifs") or [],
+                                )
+                                graph_expanded += 1
                 # No store.close() needed — uses shared driver singleton
             except Exception as e:
                 log.debug("Graph expansion failed: %s", e)

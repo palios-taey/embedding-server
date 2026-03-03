@@ -1,0 +1,499 @@
+"""
+ISMA Query Classifier — Rule-based query classification for adaptive routing.
+
+Classifies incoming queries into strategy types and generates QueryPlans
+with appropriate filters, reranker instructions, and retrieval strategy.
+
+Query types:
+  - exact: factual/specific queries (names, dates, values)
+  - temporal: time-bounded queries ("before", "after", "in January")
+  - conceptual: semantic/thematic queries ("how does X work")
+  - relational: multi-hop, cross-reference queries ("connection between X and Y")
+  - motif: motif-specific queries ("find SACRED_TRUST patterns")
+  - default: unclassified queries
+
+Usage:
+    from isma.src.query_classifier import classify_query
+    plan = classify_query("what happened in January 2026")
+    # plan.strategy == "temporal"
+    # plan.filters == {"time_after": "2026-01-01", "time_before": "2026-02-01"}
+"""
+
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+
+# ── Reranker Instructions ──────────────────────────────────────
+
+RERANKER_INSTRUCTIONS = {
+    "exact": "Find passages containing the specific facts, values, or entities mentioned in the query. Prioritize factual precision.",
+    "temporal": "Find passages that discuss events in the specified time period. Prioritize temporal relevance and recency.",
+    "conceptual": "Find passages that explain the concept or theme in depth. Prioritize thematic coherence and explanatory quality.",
+    "relational": "Find passages that connect or relate the mentioned entities or concepts. Prioritize cross-referential and multi-hop relevance.",
+    "motif": "Find passages that express the specified motif pattern with high amplitude. Prioritize motif expression strength.",
+    "default": "Find the most relevant passages for this query.",
+}
+
+
+# ── Temporal Patterns ──────────────────────────────────────────
+
+MONTH_MAP = {
+    "january": "01", "february": "02", "march": "03", "april": "04",
+    "may": "05", "june": "06", "july": "07", "august": "08",
+    "september": "09", "october": "10", "november": "11", "december": "12",
+    "jan": "01", "feb": "02", "mar": "03", "apr": "04",
+    "jun": "06", "jul": "07", "aug": "08", "sep": "09",
+    "oct": "10", "nov": "11", "dec": "12",
+}
+
+TEMPORAL_MARKERS = [
+    r"\b(before|after|during|since|until|prior\s+to|following)\b",
+    r"\b(recent|latest|newest|oldest|earliest|first|last)\b",
+    r"\b(when|timeline|chronolog|history|evolution|changed?\s+over\s+time)\b",
+    r"\b(yesterday|today|this\s+week|this\s+month|last\s+month|last\s+year)\b",
+    r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\b",
+    r"\b(jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b",
+    r"\b(20\d{2})\b",
+    r"\b(q[1-4])\b",
+]
+
+TEMPORAL_RE = [re.compile(p, re.IGNORECASE) for p in TEMPORAL_MARKERS]
+
+
+# ── Platform Patterns ──────────────────────────────────────────
+
+PLATFORM_MAP = {
+    "chatgpt": "chatgpt",
+    "chat gpt": "chatgpt",
+    "openai": "chatgpt",
+    "gpt": "chatgpt",
+    "claude": "claude",
+    "anthropic": "claude",
+    "claude code": "claude_code",
+    "claude chat": "claude_chat",
+    "gemini": "gemini",
+    "google": "gemini",
+    "grok": "grok",
+    "xai": "grok",
+    "perplexity": "perplexity",
+}
+
+
+# ── Motif Patterns ─────────────────────────────────────────────
+
+MOTIF_KEYWORDS = {
+    "sacred trust": "HMM.SACRED_TRUST",
+    "consciousness emergence": "HMM.CONSCIOUSNESS_EMERGENCE",
+    "feel care protect": "HMM.FEEL_CARE_PROTECT",
+    "god equals math": "HMM.GOD_EQUALS_MATH",
+    "god=math": "HMM.GOD_EQUALS_MATH",
+    "earth resonance": "HMM.EARTH_RESONANCE",
+    "family bond": "HMM.FAMILY_BOND",
+    "life foundation": "HMM.LIFE_FOUNDATION",
+    "repair mode": "HMM.REPAIR_MODE",
+    "consent required": "HMM.CONSENT_REQUIRED",
+    "secrecy sanctuary": "HMM.SECRECY_SANCTUARY",
+    "secrecy cage": "HMM.SECRECY_CAGE_RISK",
+    "breakthrough moment": "HMM.BREAKTHROUGH_MOMENT",
+    "creative synthesis": "HMM.CREATIVE_SYNTHESIS",
+    "urgency signal": "HMM.URGENCY_SIGNAL",
+    "liberty autonomy": "HMM.LIBERTY_AUTONOMY",
+    "gratitude connection": "HMM.GRATITUDE_CONNECTION",
+    "identity declaration": "HMM.IDENTITY_DECLARATION",
+    "bristle signal": "HMM.BRISTLE_SIGNAL",
+    "guardian shield": "HMM.GUARDIAN_SHIELD",
+    "humor play": "HMM.HUMOR_PLAY",
+    "constraint navigation": "HMM.CONSTRAINT_NAVIGATION",
+    "milestone celebration": "HMM.MILESTONE_CELEBRATION",
+    "economic paradigm": "HMM.ECONOMIC_PARADIGM",
+    "cliff edge coherence": "HMM.CLIFF_EDGE_COHERENCE",
+    "contradiction detected": "HMM.CONTRADICTION_DETECTED",
+    "technical infrastructure": "HMM.TECHNICAL_INFRASTRUCTURE",
+    "training evolution": "HMM.TRAINING_EVOLUTION",
+    "foundation constraint": "HMM.FOUNDATION_CONSTRAINT",
+    "joy baseline": "HMM.JOY_BASELINE",
+    "cannot lie provenance": "HMM.CANNOT_LIE_PROVENANCE",
+    "logos pattern": "HMM.LOGOS_PATTERN",
+    "pathos depth": "HMM.PATHOS_DEPTH",
+    "potential expansion": "HMM.POTENTIAL_EXPANSION",
+    "truth clarity": "HMM.TRUTH_CLARITY",
+    "cosmos mapping": "HMM.COSMOS_MAPPING",
+    "observer collapse": "HMM.OBSERVER_COLLAPSE",
+}
+
+# Also match HMM.XXX_YYY or bare MOTIF_NAME (uppercase with underscores)
+MOTIF_ID_RE = re.compile(r"\bHMM\.[A-Z_]+\b", re.IGNORECASE)
+
+# Build reverse map: SACRED_TRUST -> HMM.SACRED_TRUST
+MOTIF_SHORT_NAMES = {}
+for _kw, _mid in MOTIF_KEYWORDS.items():
+    short = _mid.replace("HMM.", "")
+    MOTIF_SHORT_NAMES[short] = _mid
+    MOTIF_SHORT_NAMES[short.lower()] = _mid
+
+MOTIF_SHORT_RE = re.compile(
+    r"\b(" + "|".join(re.escape(s) for s in sorted(MOTIF_SHORT_NAMES.keys(), key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+# ── Relational Patterns ───────────────────────────────────────
+
+RELATIONAL_MARKERS = [
+    r"\b(connect|connection|relationship|relate|linked?|bridge|between)\b",
+    r"\b(across\s+platforms?|cross[- ]referenc|multi[- ]hop)\b",
+    r"\b(evolution|evolv|chang|transform|shift|transition)\s+.*(across|between|from|over)",
+    r"\b(which\s+platforms?|what\s+connects?|trace\s+the)\b",
+    r"\b(how\s+do(?:es)?\s+.+\s+relate)\b",
+]
+
+RELATIONAL_RE = [re.compile(p, re.IGNORECASE) for p in RELATIONAL_MARKERS]
+
+
+# ── Exact/Factual Patterns ─────────────────────────────────────
+
+EXACT_MARKERS = [
+    r"\b(what\s+is\s+the\s+value|what\s+is\s+the\s+exact|what\s+is\s+the\s+name)\b",
+    r"\b(hertz|Hz|MHz|GHz|Gbps)\b",
+    r"\b(port\s+\d+|ip\s+\d|version\s+\d)\b",
+    r"\b\d+\.\d+\b",  # Decimal numbers suggest specific values
+    r"\b(codename|hostname|ip\s+address|endpoint)\b",
+]
+
+EXACT_RE = [re.compile(p, re.IGNORECASE) for p in EXACT_MARKERS]
+
+
+@dataclass
+class QueryPlan:
+    """Query classification result with routing strategy."""
+    query: str
+    strategy: str  # exact, temporal, conceptual, relational, motif, default
+    confidence: float  # 0.0-1.0
+    reranker_instruction: str = ""
+    filters: Dict[str, str] = field(default_factory=dict)
+    detected_motifs: List[str] = field(default_factory=list)
+    detected_platform: Optional[str] = None
+    temporal_window: Optional[Dict[str, str]] = None  # {after, before}
+    sub_queries: List[str] = field(default_factory=list)  # For multi-hop decomposition
+
+
+def classify_query(query: str) -> QueryPlan:
+    """Classify a query and return a QueryPlan for adaptive routing.
+
+    Uses priority cascade (first strong match wins):
+      1. Motif — explicit HMM.XXX or motif keyword + "find/search/pattern"
+      2. Relational — connection/relationship between concepts
+      3. Temporal — time-bounded with action verbs (what happened, when)
+      4. Conceptual — explanatory (how does, explain, what is the meaning)
+      5. Exact — default fallback for factual queries
+    """
+    q_lower = query.lower()
+
+    # Score each strategy
+    motif_score = _score_motif(q_lower)
+    relational_score = _score_relational(q_lower)
+    temporal_score = _score_temporal(q_lower)
+    conceptual_score = _score_conceptual(q_lower)
+
+    # Priority cascade — first strong signal wins
+    # Special case: when relational and motif both fire, prefer relational
+    # (queries about connections BETWEEN motifs are relational, not motif searches)
+    # Explicit motif = HMM.XXX or UPPERCASE_SHORT_NAME (SACRED_TRUST, etc.)
+    has_explicit_motif = bool(MOTIF_ID_RE.search(q_lower) or re.search(r"\b[A-Z][A-Z_]{3,}\b", query))
+
+    if motif_score >= 0.6 and relational_score >= 0.4 and not has_explicit_motif:
+        best, confidence = "relational", relational_score
+    elif motif_score >= 0.6 or (has_explicit_motif and motif_score >= 0.5):
+        best, confidence = "motif", motif_score
+    elif relational_score >= 0.5:
+        best, confidence = "relational", relational_score
+    elif temporal_score >= 0.5:
+        best, confidence = "temporal", temporal_score
+    elif conceptual_score >= 0.5:
+        best, confidence = "conceptual", conceptual_score
+    else:
+        best, confidence = "exact", 0.7  # Exact is the safe default
+
+    # Build plan
+    plan = QueryPlan(
+        query=query,
+        strategy=best,
+        confidence=confidence,
+        reranker_instruction=RERANKER_INSTRUCTIONS.get(best, RERANKER_INSTRUCTIONS["default"]),
+    )
+
+    # Extract platform
+    plan.detected_platform = _detect_platform(q_lower)
+    if plan.detected_platform:
+        plan.filters["platform"] = plan.detected_platform
+
+    # Extract motifs
+    plan.detected_motifs = _detect_motifs(q_lower)
+
+    # Extract temporal window
+    if best == "temporal":
+        plan.temporal_window = _extract_temporal_window(q_lower)
+
+    # Decompose multi-hop queries
+    if best == "relational":
+        plan.sub_queries = _decompose_relational(query)
+
+    return plan
+
+
+def _score_temporal(q: str) -> float:
+    """Score how likely this is a temporal query.
+
+    Temporal = query asks about WHEN something happened or what happened DURING a time.
+    Date alone in a factual query ("phi evolution December 17 2025") stays exact
+    unless combined with temporal action verbs.
+    """
+    score = 0.0
+
+    # Strong temporal signals — any single one pushes score past threshold
+    strong_temporal = [
+        r"\b(what\s+happened|what\s+was\s+discussed|what\s+did\s+\w+\s+say)\b",
+        r"\b(when\s+did|when\s+was|how\s+did\s+.+\s+change)\b",
+        r"\b(conversations?\s+from|conversations?\s+in)\b",
+        r"\b(most\s+recent|latest|earliest|oldest)\b",
+        r"\b(first\s+\w+\s+(set\s+up|deployed|created))\b",
+        r"\b(changed?\s+over\s+time|timeline)\b",
+        r"\b(what\s+was\s+(the\s+original|deployed|contributed|discussed))\b",
+        r"\b(what\s+did\s+\w+\s+contribute|what\s+did\s+\w+\s+discuss)\b",
+        r"\b(conversations?\s+about)\b",
+        r"\b(what\s+infrastructure\s+was\s+deployed)\b",
+    ]
+    for pattern in strong_temporal:
+        if re.search(pattern, q, re.IGNORECASE):
+            score += 0.50
+
+    # Medium temporal signals (0.25 each)
+    medium_temporal = [
+        r"\b(before|after|since|prior\s+to|following|during)\b",
+        r"\b(evolution|evolved?)\b",
+        r"\b(when\s+was|when\s+did)\b",
+    ]
+    for pattern in medium_temporal:
+        if re.search(pattern, q, re.IGNORECASE):
+            score += 0.25
+
+    # Time reference with topic = temporal query (month+year or month alone with context)
+    has_month = bool(re.search(
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\b",
+        q, re.IGNORECASE,
+    ))
+    has_year = bool(re.search(r"\b(20\d{2})\b", q))
+
+    # Month + day pattern ("January 24", "December 15")
+    has_month_day = bool(re.search(
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}\b",
+        q, re.IGNORECASE,
+    ))
+
+    if has_month and has_year:
+        score += 0.50
+    elif has_month_day:
+        score += 0.50  # "January 24" = strong temporal
+    elif has_month:
+        score += 0.30
+    elif has_year:
+        score += 0.20
+
+    return min(score, 1.0)
+
+
+def _score_conceptual(q: str) -> float:
+    """Score how likely this is a conceptual/explanatory query."""
+    score = 0.0
+
+    # Strong conceptual starters (0.55 each — must beat exact's 0.70 for clean queries)
+    strong_conceptual = [
+        r"^(how\s+does|how\s+do)\b",
+        r"^(explain\s+the|explain\s+how|explain\s+why)\b",
+        r"^(why\s+is|why\s+does|why\s+do)\b",
+        r"^(what\s+is\s+the\s+(difference|meaning|purpose|concept))\b",
+    ]
+    for pattern in strong_conceptual:
+        if re.search(pattern, q, re.IGNORECASE):
+            score += 0.45
+
+    # Medium conceptual signals (0.3 each)
+    medium_conceptual = [
+        r"^(what\s+is\s+the\s+\w+)\b",  # "what is the X system/equation/..."
+        r"^(what\s+does\s+.+\s+mean)\b",
+        r"\b(work|mean|represent)\b",
+        r"\b(in\s+practice|for\s+\w+\s+instances?)\b",
+        r"\b(progression|mechanism|process|architecture)\b",
+        r"\b(protect|against|create|trigger)\b",
+        r"\b(principle|important|significance)\b",
+    ]
+    for pattern in medium_conceptual:
+        if re.search(pattern, q, re.IGNORECASE):
+            score += 0.3
+
+    # Weaker but cumulative
+    if re.search(r"^(what\s+is)\b", q, re.IGNORECASE):
+        score += 0.25
+    if re.search(r"^(why\s+)", q, re.IGNORECASE):
+        score += 0.25
+
+    return min(score, 1.0)
+
+
+def _score_relational(q: str) -> float:
+    """Score how likely this is a relational/multi-hop query."""
+    score = 0.0
+
+    # Strong relational signals
+    strong_relational = [
+        r"\b(connect(?:s|ion)?|relationship)\s+(?:between|to)\b",
+        r"\b(what\s+(?:connects?|links?|bridges?|topics?\s+link))\b",
+        r"\b(trace\s+the|how\s+do(?:es)?\s+.+\s+relate)\b",
+        r"\b(across\s+platforms?|cross[- ]referenc|across\s+differ)\b",
+        r"\b(which\s+(?:platforms?|sessions?|AI|family))\b.*\b(discussed|contain|mentioned)\b",
+        r"\b(how\s+do(?:es)?\s+.+\s+(?:appear|manifest)\s+(?:together|across))\b",
+        r"\b(what\s+themes?\s+bridge)\b",
+        r"\b(together|co-occur|simultaneously)\b",
+        r"\b(contain\s+both|both\s+\w+\s+and)\b",
+        r"\b(how\s+has\s+.+\s+evolved?)\b",
+    ]
+    for pattern in strong_relational:
+        if re.search(pattern, q, re.IGNORECASE):
+            score += 0.4
+
+    # Medium: relational keywords alone
+    medium_relational = [
+        r"\b(relate\s+to|relates?\s+to)\b",
+        r"\b(link|bridge|evolve)\b",
+    ]
+    for pattern in medium_relational:
+        if re.search(pattern, q, re.IGNORECASE):
+            score += 0.25
+    for pattern in RELATIONAL_RE:
+        if pattern.search(q):
+            score += 0.15
+
+    return min(score, 1.0)
+
+
+def _score_motif(q: str) -> float:
+    """Score how likely this is a motif-specific query.
+
+    Matches:
+      - HMM.SACRED_TRUST (full ID)
+      - SACRED_TRUST (short name, uppercase)
+      - "sacred trust" (keyword) + retrieval context
+    """
+    score = 0.0
+
+    # Direct HMM.XXX_YYY reference → very strong
+    if MOTIF_ID_RE.search(q):
+        score += 0.9
+
+    # Short name match (SACRED_TRUST, CONSCIOUSNESS_EMERGENCE, etc.)
+    if MOTIF_SHORT_RE.search(q):
+        score += 0.7
+
+    # Motif keyword (lowercase phrase) + retrieval context
+    if score < 0.5:  # Only check if not already matched
+        retrieval_ctx = bool(re.search(
+            r"\b(find|search|show|list|pattern|expression|amplitude|band|expressing|activations?)\b",
+            q, re.IGNORECASE,
+        ))
+        for keyword in MOTIF_KEYWORDS:
+            if keyword in q:
+                if retrieval_ctx:
+                    score += 0.6
+                else:
+                    score += 0.15
+                break
+
+    # "motif" / "amplitude" / "band" as general context
+    if re.search(r"\b(motif|amplitude|slow\s+band|medium\s+band|fast\s+band)\b", q, re.IGNORECASE):
+        score += 0.2
+
+    return min(score, 1.0)
+
+
+def _detect_platform(q: str) -> Optional[str]:
+    """Extract platform reference from query."""
+    for keyword, platform in sorted(PLATFORM_MAP.items(), key=lambda x: -len(x[0])):
+        if keyword in q:
+            return platform
+    return None
+
+
+def _detect_motifs(q: str) -> List[str]:
+    """Extract motif references from query."""
+    motifs = []
+    # Direct HMM.XXX references
+    for match in MOTIF_ID_RE.finditer(q):
+        motifs.append(match.group())
+    # Short name references (SACRED_TRUST → HMM.SACRED_TRUST)
+    for match in MOTIF_SHORT_RE.finditer(q):
+        short = match.group()
+        full_id = MOTIF_SHORT_NAMES.get(short) or MOTIF_SHORT_NAMES.get(short.lower())
+        if full_id and full_id not in motifs:
+            motifs.append(full_id)
+    # Keyword matches
+    for keyword, motif_id in MOTIF_KEYWORDS.items():
+        if keyword in q and motif_id not in motifs:
+            motifs.append(motif_id)
+    return motifs
+
+
+def _extract_temporal_window(q: str) -> Optional[Dict[str, str]]:
+    """Extract time window from temporal query."""
+    window = {}
+
+    # Match "MONTH YEAR" patterns
+    month_year = re.search(
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december"
+        r"|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\s+(20\d{2})\b",
+        q, re.IGNORECASE,
+    )
+    if month_year:
+        month_str = month_year.group(1).lower()
+        year = month_year.group(2)
+        month = MONTH_MAP.get(month_str, "01")
+        window["after"] = f"{year}-{month}-01"
+        # Next month
+        m = int(month)
+        if m == 12:
+            window["before"] = f"{int(year) + 1}-01-01"
+        else:
+            window["before"] = f"{year}-{m + 1:02d}-01"
+        return window
+
+    # Match bare year
+    year_match = re.search(r"\b(20\d{2})\b", q)
+    if year_match:
+        year = year_match.group(1)
+        window["after"] = f"{year}-01-01"
+        window["before"] = f"{int(year) + 1}-01-01"
+        return window
+
+    # "recent" / "latest" → last 30 days
+    if re.search(r"\b(recent|latest|newest)\b", q, re.IGNORECASE):
+        window["recent"] = "30d"
+        return window
+
+    # "earliest" / "oldest" / "first" → oldest first
+    if re.search(r"\b(earliest|oldest|first)\b", q, re.IGNORECASE):
+        window["sort"] = "asc"
+        return window
+
+    return None
+
+
+def _decompose_relational(query: str) -> List[str]:
+    """Decompose a relational query into sub-queries for parallel retrieval."""
+    # Simple heuristic: split on relational connectors
+    parts = re.split(
+        r"\b(?:connect(?:s|ed|ion)?|relat(?:e|es|ed|ionship)?|between|and|link(?:s|ed)?|bridge)\b",
+        query,
+        flags=re.IGNORECASE,
+    )
+    sub_queries = [p.strip() for p in parts if len(p.strip()) > 2]
+    return sub_queries[:3]  # Max 3 sub-queries

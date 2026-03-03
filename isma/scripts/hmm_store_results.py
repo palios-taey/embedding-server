@@ -659,6 +659,10 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
     else:
         v2_patched = v2_id is not None
 
+    # Initialize Neo4j pre-write state so rollback has them in scope even if Neo4j fails
+    old_rosetta = ""
+    old_motifs: list = []
+
     # --- Neo4j: HMMTile + EXPRESSES edges (explicit transaction) ---
     try:
         driver = get_neo4j()
@@ -796,6 +800,8 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
             rosetta_tile_created, v2_id, v2_patched,
             weaviate_ok, neo4j_ok, redis_ok, valid_motifs,
             tile_snapshots=tile_snapshots,
+            old_rosetta=old_rosetta,
+            old_motifs=old_motifs,
         )
         return False
 
@@ -822,6 +828,8 @@ def _rollback_store(
     redis_ok: bool,
     valid_motifs: list,
     tile_snapshots: dict = None,
+    old_rosetta: str = "",
+    old_motifs: list = None,
 ):
     """Full compensating rollback for failed triple-write.
 
@@ -829,6 +837,7 @@ def _rollback_store(
     - Weaviate tile PATCH flags (restored to pre-mutation snapshot when available)
     - Rosetta tile (delete if newly created, revert if updated)
     - V2 object enrichment properties
+    - Neo4j HMMTile properties + EXPRESSES edges (compensating Cypher)
     - Redis inverted index entries
     """
     log.warning(f"  Rolling back store for {full_hash[:16]}")
@@ -874,6 +883,38 @@ def _rollback_store(
             log.warning(f"  Rollback: reverted V2 object {v2_id[:12]}")
         except Exception as e:
             log.error(f"  Rollback: failed to revert V2: {e}")
+
+    # Compensating Neo4j rollback — revert HMMTile + delete new EXPRESSES edges
+    if neo4j_ok:
+        try:
+            driver = get_neo4j()
+            with driver.session() as session:
+                def _neo4j_rollback(tx):
+                    # Always delete the new EXPRESSES edges (they reference wrong motifs)
+                    tx.run("""
+                        MATCH (t:HMMTile {tile_id: $tile_id})-[r:EXPRESSES]->()
+                        DELETE r
+                    """, tile_id=full_hash)
+
+                    if old_rosetta:
+                        # Tile pre-existed — restore old rosetta/motifs
+                        tx.run("""
+                            MATCH (t:HMMTile {tile_id: $tile_id})
+                            SET t.rosetta_summary = $old_rosetta,
+                                t.dominant_motifs = $old_motifs
+                        """, tile_id=full_hash, old_rosetta=old_rosetta,
+                            old_motifs=old_motifs or [])
+                    else:
+                        # Tile was newly created — delete it entirely
+                        tx.run("""
+                            MATCH (t:HMMTile {tile_id: $tile_id})
+                            DETACH DELETE t
+                        """, tile_id=full_hash)
+
+                session.execute_write(_neo4j_rollback)
+                log.warning(f"  Rollback: reverted Neo4j HMMTile for {full_hash[:16]}")
+        except Exception as e:
+            log.error(f"  Rollback: Neo4j compensating write failed: {e}")
 
     # Clean up Redis inverted index if Redis write succeeded but others failed
     if redis_ok and not (weaviate_ok and neo4j_ok):
