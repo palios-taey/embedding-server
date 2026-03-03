@@ -161,6 +161,28 @@ def weaviate_patch(object_id: str, properties: dict):
     return False
 
 
+_SNAPSHOT_PROPS = [
+    "hmm_enriched", "hmm_enrichment_version", "rosetta_summary",
+    "dominant_motifs", "motif_data_json", "hmm_enriched_at",
+    "hmm_platforms", "hmm_gate_flags",
+]
+
+
+def weaviate_get_object_props(object_id: str) -> dict:
+    """GET a V1 tile's current enrichment properties for pre-mutation snapshot."""
+    try:
+        r = _wv_session.get(
+            f"{WEAVIATE_URL}/v1/objects/{WEAVIATE_CLASS}/{object_id}",
+            timeout=15,
+        )
+        if r.status_code == 200:
+            obj_props = r.json().get("properties", {})
+            return {p: obj_props.get(p) for p in _SNAPSHOT_PROPS}
+    except Exception as e:
+        log.warning(f"Weaviate GET {object_id[:12]}: {e}")
+    return {}
+
+
 def embed_and_store_rosetta(content_hash: str, rosetta: str, dominant: list,
                             motif_data: str, platform: str, source_file: str = ""):
     """Embed rosetta summary and create/update a 'rosetta' scale tile in Weaviate.
@@ -538,6 +560,7 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
 
     # Track ALL artifacts for rollback
     patched_tile_ids = []
+    tile_snapshots = {}  # Pre-mutation snapshots for true compensating rollback
     rosetta_tile_created = False
     rosetta_tile_id = None
     v2_patched = False
@@ -549,6 +572,12 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
         log.warning(f"  No tiles found for {full_hash[:12]} — skipping Weaviate PATCH")
         weaviate_ok = True  # Not a failure if tiles don't exist yet
     else:
+        # Snapshot current state before mutation — enables true compensating rollback
+        for tid in tile_ids:
+            snap = weaviate_get_object_props(tid)
+            if snap:
+                tile_snapshots[tid] = snap
+
         props = {
             "rosetta_summary": rosetta,
             "dominant_motifs": dominant,
@@ -566,7 +595,8 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
                 patched += 1
                 patched_tile_ids.append(tid)
         log.info(f"  Weaviate: patched {patched}/{len(tile_ids)} tiles")
-        weaviate_ok = patched > 0
+        # Require ALL tiles patched — partial success leaves stores inconsistent
+        weaviate_ok = patched == len(tile_ids)
 
     # --- Weaviate: Embed rosetta summary and create searchable rosetta tile ---
     source_file = ""
@@ -765,6 +795,7 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
             full_hash, patched_tile_ids, rosetta_tile_id,
             rosetta_tile_created, v2_id, v2_patched,
             weaviate_ok, neo4j_ok, redis_ok, valid_motifs,
+            tile_snapshots=tile_snapshots,
         )
         return False
 
@@ -790,25 +821,29 @@ def _rollback_store(
     neo4j_ok: bool,
     redis_ok: bool,
     valid_motifs: list,
+    tile_snapshots: dict = None,
 ):
     """Full compensating rollback for failed triple-write.
 
     Reverts ALL artifacts created during the failed store_item() call:
-    - Weaviate tile PATCH flags
+    - Weaviate tile PATCH flags (restored to pre-mutation snapshot when available)
     - Rosetta tile (delete if newly created, revert if updated)
     - V2 object enrichment properties
     - Redis inverted index entries
     """
     log.warning(f"  Rolling back store for {full_hash[:16]}")
 
-    # Revert Weaviate tile enrichment flags
+    # Revert Weaviate tile enrichment flags — restore from snapshot if available
     if patched_tile_ids:
-        revert_props = {
-            "hmm_enriched": False,
-            "hmm_enrichment_version": "",
-        }
         for tid in patched_tile_ids:
-            weaviate_patch(tid, revert_props)
+            if tile_snapshots and tid in tile_snapshots:
+                # True compensating rollback: restore to pre-mutation state
+                revert_props = {k: v for k, v in tile_snapshots[tid].items()
+                                if v is not None}
+                weaviate_patch(tid, revert_props)
+            else:
+                # No snapshot — best-effort: mark as not enriched
+                weaviate_patch(tid, {"hmm_enriched": False, "hmm_enrichment_version": ""})
         log.warning(f"  Rollback: reverted {len(patched_tile_ids)} tile patches")
 
     # Delete newly-created rosetta tile (or revert if it was pre-existing)

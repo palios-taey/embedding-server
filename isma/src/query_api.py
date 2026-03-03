@@ -39,6 +39,7 @@ import time
 import threading
 
 from isma.src.retrieval import ISMARetrieval, TileResult, SearchResult
+from isma.src.semantic_cache import SemanticCache
 
 
 @asynccontextmanager
