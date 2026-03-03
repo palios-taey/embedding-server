@@ -654,8 +654,7 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
 
     v2_ok = update_v2_object(full_hash, rosetta, dominant, motif_data, rosetta_vector)
     if not v2_ok:
-        log.error(f"  V2 FAILED for {full_hash[:16]}: dual-write failed")
-        # V2 failure is non-fatal during shadow deployment — log but don't block
+        log.error(f"  V2 FAILED for {full_hash[:16]}: dual-write failed — will trigger rollback")
     else:
         v2_patched = v2_id is not None
 
@@ -759,7 +758,7 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
                     )
                     log.info(f"  Neo4j: SUPERSEDES snapshot for {full_hash[:16]}")
                 except Exception as e:
-                    log.warning(f"  SUPERSEDES snapshot failed (non-fatal): {e}")
+                    log.error(f"  SUPERSEDES snapshot failed: {e}")
 
         log.info(f"  Neo4j: HMMTile + {len(valid_motifs)} EXPRESSES edges (atomic)")
         neo4j_ok = True
@@ -790,10 +789,10 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
         log.error(f"  REDIS FAILED for {full_hash[:16]}: {e}")
 
     # 6SIGMA: report ALL failures, never hide partial success
-    if not (weaviate_ok and neo4j_ok and redis_ok):
+    if not (weaviate_ok and neo4j_ok and redis_ok and v2_ok):
         log.error(
             f"  STORE FAILED for {full_hash[:16]}: "
-            f"weaviate={weaviate_ok} neo4j={neo4j_ok} redis={redis_ok}"
+            f"weaviate={weaviate_ok} neo4j={neo4j_ok} redis={redis_ok} v2={v2_ok}"
         )
         _rollback_store(
             full_hash, patched_tile_ids, rosetta_tile_id,
@@ -810,8 +809,8 @@ def store_item(item: dict, full_hash: str, platform: str, pkg_id: str) -> bool:
         from isma.src.semantic_cache import SemanticCache
         cache = SemanticCache()
         cache.invalidate_for_tile(full_hash)
-    except Exception:
-        pass  # Cache invalidation is non-fatal
+    except Exception as e:
+        log.error(f"  Cache invalidation failed for {full_hash[:16]}: {e}")
 
     return True
 
