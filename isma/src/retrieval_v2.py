@@ -416,7 +416,7 @@ class ISMARetrievalV2:
                 query, plan.sub_queries, top_k,
                 instruction=plan.reranker_instruction,
                 expand_graph=expand_graph,
-                graph_depth=graph_depth,
+                graph_depth=max(graph_depth, 3),  # relational queries need deeper graph traversal
                 **merged_filters,
             )
         else:

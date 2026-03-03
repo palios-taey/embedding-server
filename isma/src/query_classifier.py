@@ -488,12 +488,69 @@ def _extract_temporal_window(q: str) -> Optional[Dict[str, str]]:
 
 
 def _decompose_relational(query: str) -> List[str]:
-    """Decompose a relational query into sub-queries for parallel retrieval."""
-    # Simple heuristic: split on relational connectors
+    """Decompose a relational query into concept sub-queries for parallel retrieval.
+
+    Extracts the concept phrases flanking relational keywords rather than splitting
+    on them. Examples:
+      "how do bristle signals relate to identity declarations"
+        → ['bristle signals', 'identity declarations', full_query]
+      "relationship between coercion entropy and ethics fidelity"
+        → ['coercion entropy', 'ethics fidelity', full_query]
+
+    Falls back to the original regex split if fewer than 2 usable concepts extracted.
+    """
+    # Verb-style connectors (X <connector> Y): "X relates to Y", "X links to Y"
+    VERB_CONNECTOR = (
+        r"connect(?:s|ed|ion)?|relat(?:e|es|ed|ionship)?|"
+        r"link(?:s|ed)?|bridge"
+    )
+    # Meta-words that precede "between X and Y" — not concept nouns
+    META_WORDS = re.compile(
+        r"^(?:relationship|connection|link|correlation|difference|similarity|"
+        r"interaction|interplay|interface|dynamic)$",
+        re.IGNORECASE,
+    )
+
+    # Strip leading question scaffolding to surface the actual concepts
+    stripped = re.sub(
+        r"^(?:how\s+(?:do(?:es)?|is|are|did)\s+|what\s+(?:is\s+the\s+)?|"
+        r"trace\s+(?:the\s+)?|explain\s+(?:the\s+)?)",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Pattern 1: "between X and Y" — handles "relationship between X and Y",
+    # "link between X and Y", "difference between X and Y", etc.
+    between_m = re.search(
+        r"\bbetween\s+(.+?)\s+and\s+(.+)$",
+        stripped,
+        flags=re.IGNORECASE,
+    )
+    if between_m:
+        left = between_m.group(1).strip()
+        right = between_m.group(2).strip()
+        if len(left) > 2 and len(right) > 2:
+            return [left, right, query]
+
+    # Pattern 2: "X <verb-connector> [to/with] Y"
+    m = re.match(
+        r"^(.+?)\s+\b(?:" + VERB_CONNECTOR + r")\b\s+(?:to\s+|with\s+)?(.+)$",
+        stripped,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        left = m.group(1).strip()
+        right = m.group(2).strip()
+        # Reject if left is itself a meta/connector word (not a real concept)
+        if len(left) > 2 and len(right) > 2 and not META_WORDS.match(left):
+            return [left, right, query]
+
+    # Fallback: original split on verb connectors + "between"
     parts = re.split(
-        r"\b(?:connect(?:s|ed|ion)?|relat(?:e|es|ed|ionship)?|between|and|link(?:s|ed)?|bridge)\b",
+        r"\b(?:" + VERB_CONNECTOR + r"|between)\b",
         query,
         flags=re.IGNORECASE,
     )
     sub_queries = [p.strip() for p in parts if len(p.strip()) > 2]
-    return sub_queries[:3]  # Max 3 sub-queries
+    return sub_queries[:3]
