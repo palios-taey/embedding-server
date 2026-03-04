@@ -39,7 +39,6 @@ COLBERT_DIM = 64       # Matryoshka: use first 64 dims for storage efficiency
 MAX_DOC_TOKENS = 512   # Max tokens per passage (ColBERT recommendation)
 MAX_QUERY_TOKENS = 64  # Max tokens per query
 BATCH_SIZE = 32        # Inference batch size (GPU)
-WRITE_BATCH_SIZE = 100 # Weaviate batch write size
 
 # Redis for checkpoint
 CHECKPOINT_KEY = "isma:colbert_pilot:checkpoint"
@@ -208,94 +207,106 @@ def create_class():
 
 
 # =============================================================================
-# TILE FETCHING
+# STREAMING INGEST — cursor → encode → write with no accumulation
 # =============================================================================
 
-def fetch_source_tiles(limit: int = 20000, skip: int = 0, scale: str = "context_2048") -> list:
-    """Fetch enriched tiles from ISMA_Quantum by scale.
+def _tile_from_obj(obj: dict) -> dict | None:
+    """Extract tile dict from Weaviate REST object. Returns None if text too short."""
+    props = obj.get("properties", {})
+    text = (props.get("rosetta_summary") or "").strip()
+    if len(text) < 50:
+        text = (text + " " + (props.get("content") or "")).strip()[:2000]
+    if len(text) < 20:
+        return None
+    return {
+        "uuid": obj["id"],
+        "content_hash": props.get("content_hash", ""),
+        "text": text,
+        "source_file": props.get("source_file", ""),
+        "platform": props.get("platform", ""),
+        "dominant_motifs": props.get("dominant_motifs") or [],
+        "rosetta_summary": props.get("rosetta_summary", ""),
+        "scale": props.get("scale", ""),
+    }
 
-    Args:
-        limit: Max tiles to return
-        skip: Offset into source tiles (for sharding across nodes)
-        scale: Weaviate scale filter — "context_2048" or "search_512" or "full_4096"
 
-    NOTE: Weaviate cursor API (after + where) is incompatible — uses offset pagination.
-    Requires QUERY_MAXIMUM_RESULTS >= limit + skip + 500.
+def run_streaming_ingest(model, tokenizer, scale: str, limit: int,
+                         existing_uuids: set, cursor_start: str | None = None):
+    """Cursor-based streaming ingest: fetch → encode → write with no accumulation.
+
+    Uses REST /v1/objects cursor (O(1) per page regardless of depth).
+    Filters by scale in Python. Encodes BATCH_SIZE tiles, writes immediately.
     """
-    log.info(f"Fetching {limit} tiles from {SOURCE_CLASS} (scale={scale}, skip={skip})...")
+    log.info(f"Streaming ingest: scale={scale} limit={limit} cursor_start={cursor_start or 'beginning'}")
+    cursor = cursor_start
+    t0 = time.monotonic()
+    success = failed = found = scanned = 0
+    encode_buf: list = []  # fixed max BATCH_SIZE, flushed immediately — not accumulation
 
-    # Use offset-based pagination
-    all_tiles = []
-    batch_size = 500
-    offset = skip  # start from skip position
-
-    while len(all_tiles) < limit:
-        fetch_limit = min(batch_size, limit - len(all_tiles) + 50)
-
-        gql = f"""{{
-            Get {{
-                {SOURCE_CLASS}(
-                    where: {{path: ["scale"], operator: Equal, valueText: "{scale}"}}
-                    limit: {fetch_limit}
-                    offset: {offset}
-                ) {{
-                    content_hash
-                    content
-                    rosetta_summary
-                    source_file
-                    platform
-                    dominant_motifs
-                    scale
-                    _additional {{ id }}
-                }}
-            }}
-        }}"""
-
+    while found < limit:
+        url = f"{WEAVIATE_URL}/v1/objects?class={SOURCE_CLASS}&limit=500"
+        if cursor:
+            url += f"&after={cursor}"
         try:
-            r = requests.post(
-                f"{WEAVIATE_URL}/v1/graphql",
-                json={"query": gql},
-                timeout=30,
-            )
-            results = (
-                r.json().get("data", {}).get("Get", {}).get(SOURCE_CLASS, []) or []
-            )
+            r = requests.get(url, timeout=30)
+            objects = r.json().get("objects", [])
         except Exception as e:
-            log.error(f"Fetch error at offset {offset}: {e}")
+            log.error(f"Fetch error at cursor {cursor}: {e}")
             break
 
-        if not results:
+        if not objects:
             break
 
-        for item in results:
-            # Build text from rosetta_summary + content (prefer rosetta for ColBERT)
-            text = (item.get("rosetta_summary") or "").strip()
-            if len(text) < 50:
-                content = (item.get("content") or "").strip()
-                text = (text + " " + content).strip()[:2000]
+        cursor = objects[-1]["id"]
+        scanned += len(objects)
 
-            if len(text) < 20:
+        for obj in objects:
+            if obj.get("properties", {}).get("scale") != scale:
+                continue
+            if obj["id"] in existing_uuids:
+                continue
+            tile = _tile_from_obj(obj)
+            if tile is None:
                 continue
 
-            all_tiles.append({
-                "uuid": item["_additional"]["id"],
-                "content_hash": item.get("content_hash", ""),
-                "text": text,
-                "source_file": item.get("source_file", ""),
-                "platform": item.get("platform", ""),
-                "dominant_motifs": item.get("dominant_motifs") or [],
-                "rosetta_summary": item.get("rosetta_summary", ""),
-                "scale": item.get("scale", ""),
-            })
+            encode_buf.append(tile)
+            found += 1
 
-        offset += len(results)
-        log.info(f"  Fetched {len(all_tiles)}/{limit} tiles (offset={offset})...")
+            if len(encode_buf) >= BATCH_SIZE:
+                try:
+                    vectors = encode_passages([t["text"] for t in encode_buf], model, tokenizer)
+                except Exception as e:
+                    log.error(f"Encode error: {e}")
+                    failed += len(encode_buf)
+                    encode_buf.clear()
+                    continue
+                ok, bad = ingest_batch(encode_buf, vectors)
+                success += ok
+                failed += bad
+                encode_buf.clear()
 
-        if len(results) < fetch_limit:
+                elapsed = time.monotonic() - t0
+                rate = found / elapsed if elapsed > 0 else 0
+                log.info(f"Progress: {found} | {rate:.1f} tiles/s | "
+                         f"scanned={scanned} ok={success} failed={failed}")
+
+        if len(objects) < 500:
+            log.info("Cursor exhausted — all objects scanned")
             break
 
-    log.info(f"Fetched {len(all_tiles)} source tiles")
-    return all_tiles[:limit]
+    # Flush tail (at most BATCH_SIZE-1 tiles — not accumulation, just remainder)
+    if encode_buf:
+        try:
+            vectors = encode_passages([t["text"] for t in encode_buf], model, tokenizer)
+            ok, bad = ingest_batch(encode_buf, vectors)
+            success += ok
+            failed += bad
+        except Exception as e:
+            log.error(f"Final encode error: {e}")
+
+    elapsed = time.monotonic() - t0
+    log.info(f"Done in {elapsed:.1f}s — {success} ingested, {failed} failed | "
+             f"scanned {scanned} objects to find {found} {scale} tiles")
 
 
 # =============================================================================
@@ -451,73 +462,12 @@ def main():
     # Load ColBERT model
     model, tokenizer = load_model()
 
-    # Fetch source tiles (offset by skip for sharding)
-    tiles = fetch_source_tiles(args.limit, skip=args.skip, scale=args.scale)
-    if not tiles:
-        log.error("No tiles fetched")
-        sys.exit(1)
+    # UUID dedup (fast for empty class, needed for safe resume)
+    existing_uuids = get_existing_source_uuids()
 
-    # Dedup by source UUID (allows multiple entries per content_hash from different passages)
-    existing = get_existing_source_uuids()
-    if existing:
-        tiles = [t for t in tiles if t["uuid"] not in existing]
-        log.info(f"After UUID dedup: {len(tiles)} tiles to ingest")
-
-    if not tiles:
-        log.info("All tiles already ingested")
-        return
-
-    # Encode + batch write
-    t0 = time.monotonic()
-    success = failed = 0
-    write_buf_tiles: list = []
-    write_buf_vecs: list = []
-
-    for i in range(0, len(tiles), BATCH_SIZE):
-        encode_batch = tiles[i : i + BATCH_SIZE]
-        texts = [t["text"] for t in encode_batch]
-
-        try:
-            vectors_batch = encode_passages(texts, model, tokenizer)
-        except Exception as e:
-            log.error(f"Encoding error at batch {i}: {e}")
-            failed += len(encode_batch)
-            continue
-
-        for tile, vectors in zip(encode_batch, vectors_batch):
-            if len(vectors) == 0:
-                log.warning(f"Zero tokens for {tile['content_hash'][:8]}, skipping")
-                failed += 1
-                continue
-            write_buf_tiles.append(tile)
-            write_buf_vecs.append(vectors)
-
-        # Flush write buffer when full
-        if len(write_buf_tiles) >= WRITE_BATCH_SIZE:
-            ok, bad = ingest_batch(write_buf_tiles, write_buf_vecs)
-            success += ok
-            failed += bad
-            write_buf_tiles.clear()
-            write_buf_vecs.clear()
-
-        elapsed = time.monotonic() - t0
-        done = i + len(encode_batch)
-        rate = done / elapsed if elapsed > 0 else 0
-        eta = (len(tiles) - done) / rate if rate > 0 else 0
-        log.info(
-            f"Progress: {done}/{len(tiles)} | "
-            f"{rate:.1f} tiles/s | ETA {eta:.0f}s | "
-            f"ok={success} failed={failed}"
-        )
-
-    # Flush remaining
-    if write_buf_tiles:
-        ok, bad = ingest_batch(write_buf_tiles, write_buf_vecs)
-        success += ok
-        failed += bad
-
-    elapsed = time.monotonic() - t0
-    log.info(f"Done in {elapsed:.1f}s — {success} ingested, {failed} failed")
+    # Stream: cursor → encode → write, no accumulation
+    run_streaming_ingest(model, tokenizer, scale=args.scale,
+                         limit=args.limit, existing_uuids=existing_uuids)
 
 
 if __name__ == "__main__":
