@@ -38,6 +38,14 @@ from isma.src.retrieval import (
 log = logging.getLogger(__name__)
 
 V2_CLASS = "ISMA_Quantum_v2"
+V1_CLASS = "ISMA_Quantum"
+
+# Properties to return from V1 tile searches (needed for TileResult + RRF fusion)
+V1_TILE_PROPS = (
+    "content content_hash platform source_type source_file session_id document_id "
+    "loaded_at scale tile_index token_count hmm_enriched rosetta_summary "
+    "dominant_motifs hmm_phi hmm_trust"
+)
 
 # Connection-pooled session for Weaviate GraphQL queries
 _wv_session = requests.Session()
@@ -257,6 +265,92 @@ class ISMARetrievalV2:
             for obj in results
         ]
 
+    # ── V1 Tile Search (Option E paths) ─────────────────────────
+
+    def search_v1_bm25(
+        self,
+        query: str,
+        top_k: int = 30,
+    ) -> List[Tuple[dict, float]]:
+        """BM25 search on ISMA_Quantum search_512 tiles (full tile text, no truncation).
+
+        This is the Option E replacement for the broken V2 BM25, which was limited
+        to the first tile's text (2048 chars). V1 tiles contain the real passage text.
+        """
+        safe_query = (
+            query.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", " ")
+            .replace("\r", " ")
+        )
+        scale_filter = '{ path: ["scale"], operator: Equal, valueText: "search_512" }'
+        q = (
+            f'{{ Get {{ {V1_CLASS}('
+            f'bm25: {{ query: "{safe_query}" properties: ["content^2", "rosetta_summary"] }}'
+            f', where: {scale_filter}'
+            f' limit: {top_k}'
+            f') {{ {V1_TILE_PROPS} _additional {{ score }} }} }} }}'
+        )
+        data = _graphql(q)
+        results = data.get("data", {}).get("Get", {}).get(V1_CLASS, []) or []
+        return [
+            (obj, float(obj.get("_additional", {}).get("score") or 0))
+            for obj in results
+        ]
+
+    def search_v1_vector(
+        self,
+        query: str,
+        top_k: int = 30,
+    ) -> List[Tuple[dict, float]]:
+        """NearVector search on ISMA_Quantum search_512 tiles.
+
+        This is the Option E replacement for the broken V2 raw vector, which was
+        embedded from the first tile only (2048 chars). V1 tile vectors represent
+        the actual passage content.
+        """
+        embedding = _get_embedding(query)
+        if not embedding:
+            return []
+        vector_str = str(embedding)
+        scale_filter = '{ path: ["scale"], operator: Equal, valueText: "search_512" }'
+        q = (
+            f'{{ Get {{ {V1_CLASS}('
+            f'nearVector: {{ vector: {vector_str} }}'
+            f', where: {scale_filter}'
+            f' limit: {top_k}'
+            f') {{ {V1_TILE_PROPS} _additional {{ score distance }} }} }} }}'
+        )
+        data = _graphql(q)
+        results = data.get("data", {}).get("Get", {}).get(V1_CLASS, []) or []
+        return [
+            # nearVector returns distance (lower=better), convert to score (1-distance)
+            (obj, 1.0 - float(obj.get("_additional", {}).get("distance") or 1.0))
+            for obj in results
+        ]
+
+    def _v1_tile_to_obj(self, tile: dict) -> dict:
+        """Convert a V1 ISMA_Quantum tile result to V2-compatible obj dict for RRF fusion."""
+        return {
+            "content": tile.get("content", ""),
+            "content_hash": tile.get("content_hash", ""),
+            "platform": tile.get("platform", ""),
+            "source_type": tile.get("source_type", ""),
+            "source_file": tile.get("source_file", ""),
+            "session_id": tile.get("session_id", ""),
+            "document_id": tile.get("document_id", ""),
+            "loaded_at": tile.get("loaded_at", ""),
+            "rosetta_summary": tile.get("rosetta_summary", "") or "",
+            "dominant_motifs": tile.get("dominant_motifs") or [],
+            "hmm_enriched": tile.get("hmm_enriched", False),
+            "hmm_phi": tile.get("hmm_phi") or 0.0,
+            "hmm_trust": tile.get("hmm_trust") or 0.0,
+            "total_tokens": tile.get("token_count") or 0,
+            "tile_ids_512": [], "tile_ids_2048": [], "tile_ids_4096": [],
+            "tile_count_512": 0, "tile_count_2048": 0, "tile_count_4096": 0,
+            "motif_annotations": "",
+        }
+
     # ── Hybrid Search (RRF Fusion) ──────────────────────────────
 
     def search(
@@ -265,38 +359,62 @@ class ISMARetrievalV2:
         top_k: int = 10,
         **filters,
     ) -> SearchResult:
-        """Hybrid search with RRF fusion of raw + rosetta + BM25 results."""
+        """Option E hybrid search: V2 rosetta + V1 BM25 + V1 nearVector via parallel RRF.
+
+        V2 raw nearVector and V2 BM25 are disabled — they were trained on the first
+        search_512 tile only (2048 chars), causing -28pt exact recall regression.
+
+        Paths (run in parallel):
+          - V2 rosetta nearVector: semantic summary signal (conceptual strength)
+          - V1 search_512 BM25: full passage text coverage (exact/temporal strength)
+          - V1 search_512 nearVector: per-tile embeddings (local evidence recovery)
+
+        Results fused at content_hash level via RRF (k=60).
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         t0 = time.monotonic()
+        fetch_k = max(top_k * 3, 30)
 
-        # Fetch candidates from all three paths
-        fetch_k = top_k * 2
-        raw_results = self.search_raw(query, top_k=fetch_k, **filters)
-        rosetta_results = self.search_rosetta(query, top_k=fetch_k, **filters)
-        bm25_results = self.search_bm25(query, top_k=fetch_k, **filters)
+        # Run all three paths in parallel
+        futures_map = {}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures_map["rosetta"] = executor.submit(
+                self.search_rosetta, query, top_k=fetch_k, **filters
+            )
+            futures_map["v1_bm25"] = executor.submit(
+                self.search_v1_bm25, query, top_k=fetch_k
+            )
+            futures_map["v1_vector"] = executor.submit(
+                self.search_v1_vector, query, top_k=fetch_k
+            )
+            results_by_path = {}
+            for name, fut in futures_map.items():
+                try:
+                    results_by_path[name] = fut.result(timeout=25)
+                except Exception as e:
+                    log.warning("Search path %s failed: %s", name, e)
+                    results_by_path[name] = []
 
-        # RRF fusion (k=60 is standard)
+        # RRF fusion at content_hash level (k=60 standard)
         k = 60
         rrf_scores: Dict[str, float] = {}
         obj_map: Dict[str, dict] = {}
 
-        for rank, (obj, _score) in enumerate(raw_results):
+        for rank, (obj, _score) in enumerate(results_by_path.get("rosetta", [])):
             ch = obj.get("content_hash", "")
             if ch:
                 rrf_scores[ch] = rrf_scores.get(ch, 0) + 1.0 / (k + rank + 1)
-                obj_map[ch] = obj
+                obj_map[ch] = obj  # V2 obj preferred (has rosetta_summary etc.)
 
-        for rank, (obj, _score) in enumerate(rosetta_results):
-            ch = obj.get("content_hash", "")
-            if ch:
-                rrf_scores[ch] = rrf_scores.get(ch, 0) + 1.0 / (k + rank + 1)
-                obj_map[ch] = obj
-
-        for rank, (obj, _score) in enumerate(bm25_results):
-            ch = obj.get("content_hash", "")
-            if ch:
-                rrf_scores[ch] = rrf_scores.get(ch, 0) + 1.0 / (k + rank + 1)
-                if ch not in obj_map:
-                    obj_map[ch] = obj
+        for path in ("v1_bm25", "v1_vector"):
+            for rank, (tile, _score) in enumerate(results_by_path.get(path, [])):
+                ch = tile.get("content_hash", "")
+                if ch:
+                    rrf_scores[ch] = rrf_scores.get(ch, 0) + 1.0 / (k + rank + 1)
+                    if ch not in obj_map:
+                        # Convert V1 tile to V2-compatible obj for TileResult creation
+                        obj_map[ch] = self._v1_tile_to_obj(tile)
 
         # Sort by RRF score
         sorted_hashes = sorted(rrf_scores.keys(), key=lambda ch: rrf_scores[ch], reverse=True)
