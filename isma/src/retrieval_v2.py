@@ -397,33 +397,57 @@ class ISMARetrievalV2:
                     results_by_path[name] = []
 
         # RRF fusion at content_hash level (k=60 standard)
+        # Two separate maps:
+        #   v2_meta_map: V2 doc objects for metadata (rosetta_summary, dominant_motifs, etc.)
+        #   v1_content_map: best V1 passage tile for each hash (for content — the specific passage)
+        # V1 tile content is passage-level (~512 tokens), fitting within the 2000-char recall window.
+        # V2 doc content is full concatenated document — evidence buried deep, fails recall[:2000].
         k = 60
         rrf_scores: Dict[str, float] = {}
-        obj_map: Dict[str, dict] = {}
+        v2_meta_map: Dict[str, dict] = {}
+        v1_content_map: Dict[str, dict] = {}  # hash → best V1 tile (first hit = highest scored)
 
         for rank, (obj, _score) in enumerate(results_by_path.get("rosetta", [])):
             ch = obj.get("content_hash", "")
             if ch:
                 rrf_scores[ch] = rrf_scores.get(ch, 0) + 1.0 / (k + rank + 1)
-                obj_map[ch] = obj  # V2 obj preferred (has rosetta_summary etc.)
+                v2_meta_map[ch] = obj  # V2 obj: rosetta_summary, dominant_motifs, etc.
 
         for path in ("v1_bm25", "v1_vector"):
             for rank, (tile, _score) in enumerate(results_by_path.get(path, [])):
                 ch = tile.get("content_hash", "")
                 if ch:
                     rrf_scores[ch] = rrf_scores.get(ch, 0) + 1.0 / (k + rank + 1)
-                    if ch not in obj_map:
-                        # Convert V1 tile to V2-compatible obj for TileResult creation
-                        obj_map[ch] = self._v1_tile_to_obj(tile)
+                    if ch not in v1_content_map:
+                        v1_content_map[ch] = tile  # First (highest scored) V1 tile for this doc
 
         # Sort by RRF score
         sorted_hashes = sorted(rrf_scores.keys(), key=lambda ch: rrf_scores[ch], reverse=True)
 
         tiles = []
         for ch in sorted_hashes[:top_k]:
-            obj = obj_map[ch]
-            tile = _v2_to_tile(obj, score=rrf_scores[ch])
-            tiles.append(tile)
+            v2_meta = v2_meta_map.get(ch)
+            v1_tile = v1_content_map.get(ch)
+
+            if v1_tile:
+                # Build from V1 tile content + V2 metadata overlay
+                obj = self._v1_tile_to_obj(v1_tile)
+                if v2_meta:
+                    # Overlay V2 metadata (richer: rosetta_summary, motifs, hmm_*)
+                    obj["rosetta_summary"] = v2_meta.get("rosetta_summary", "") or obj["rosetta_summary"]
+                    obj["dominant_motifs"] = v2_meta.get("dominant_motifs") or obj["dominant_motifs"]
+                    obj["hmm_phi"] = v2_meta.get("hmm_phi") or obj["hmm_phi"]
+                    obj["hmm_trust"] = v2_meta.get("hmm_trust") or obj["hmm_trust"]
+                    obj["hmm_enriched"] = v2_meta.get("hmm_enriched", False) or obj["hmm_enriched"]
+                    obj["motif_annotations"] = v2_meta.get("motif_annotations", "") or obj["motif_annotations"]
+            elif v2_meta:
+                # Only found via rosetta — use V2 obj (content will be concatenated but rosetta helps)
+                obj = v2_meta
+            else:
+                continue
+
+            tile_result = _v2_to_tile(obj, score=rrf_scores[ch])
+            tiles.append(tile_result)
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         total_tokens = sum(t.token_count for t in tiles)
