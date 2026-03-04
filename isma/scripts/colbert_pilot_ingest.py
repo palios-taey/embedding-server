@@ -344,8 +344,8 @@ def ingest_tile(tile: dict, vectors: List[List[float]]) -> bool:
         "class": PILOT_CLASS,
         "properties": {
             "content_hash": tile["content_hash"],
-            "content": tile.get("rosetta_summary", "")[:2000],
-            "rosetta_summary": tile.get("rosetta_summary", ""),
+            "content": (tile.get("rosetta_summary") or "")[:2000],
+            "rosetta_summary": (tile.get("rosetta_summary") or ""),
             "source_file": tile["source_file"],
             "platform": tile["platform"],
             "dominant_motifs": tile["dominant_motifs"][:10],
