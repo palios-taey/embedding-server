@@ -211,15 +211,18 @@ def create_class():
 # TILE FETCHING
 # =============================================================================
 
-def fetch_source_tiles(limit: int = 20000, skip: int = 0) -> list:
-    """Fetch enriched context_2048 tiles from ISMA_Quantum (one tile per unique document).
+def fetch_source_tiles(limit: int = 20000, skip: int = 0, scale: str = "context_2048") -> list:
+    """Fetch enriched tiles from ISMA_Quantum by scale.
 
-    Uses context_2048 scale only — avoids multi-scale duplicates (search_512/full_4096
-    share the same content_hash). Weaviate QUERY_MAXIMUM_RESULTS must be >= limit+skip+500.
+    Args:
+        limit: Max tiles to return
+        skip: Offset into source tiles (for sharding across nodes)
+        scale: Weaviate scale filter — "context_2048" or "search_512" or "full_4096"
 
     NOTE: Weaviate cursor API (after + where) is incompatible — uses offset pagination.
+    Requires QUERY_MAXIMUM_RESULTS >= limit + skip + 500.
     """
-    log.info(f"Fetching {limit} tiles from {SOURCE_CLASS} (skip={skip})...")
+    log.info(f"Fetching {limit} tiles from {SOURCE_CLASS} (scale={scale}, skip={skip})...")
 
     # Use offset-based pagination
     all_tiles = []
@@ -236,7 +239,7 @@ def fetch_source_tiles(limit: int = 20000, skip: int = 0) -> list:
                         operator: And
                         operands: [
                             {{path: ["hmm_enriched"], operator: Equal, valueBoolean: true}}
-                            {{path: ["scale"], operator: Equal, valueText: "context_2048"}}
+                            {{path: ["scale"], operator: Equal, valueText: "{scale}"}}
                         ]
                     }}
                     limit: {fetch_limit}
@@ -426,6 +429,9 @@ def main():
                         help="Number of tiles to ingest (default: 20000)")
     parser.add_argument("--skip", type=int, default=0,
                         help="Skip first N source tiles (for sharding across nodes)")
+    parser.add_argument("--scale", default="context_2048",
+                        choices=["search_512", "context_2048", "full_4096"],
+                        help="Source scale to ingest (default: context_2048)")
     parser.add_argument("--stats", action="store_true",
                         help="Show current ingest stats")
     args = parser.parse_args()
@@ -447,8 +453,8 @@ def main():
     # Load ColBERT model
     model, tokenizer = load_model()
 
-    # Fetch source tiles (context_2048 scale, offset by skip for sharding)
-    tiles = fetch_source_tiles(args.limit, skip=args.skip)
+    # Fetch source tiles (offset by skip for sharding)
+    tiles = fetch_source_tiles(args.limit, skip=args.skip, scale=args.scale)
     if not tiles:
         log.error("No tiles fetched")
         sys.exit(1)
