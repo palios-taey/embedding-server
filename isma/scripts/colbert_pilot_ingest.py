@@ -17,6 +17,8 @@ import json
 import logging
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future
 from typing import List, Optional
 
 import requests
@@ -62,19 +64,24 @@ def load_model():
     _model.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _model = _model.to(device)
+    if device == "cuda":
+        _model = _model.to(dtype=torch.bfloat16)
+        log.info("Model cast to BF16")
+        try:
+            _model = torch.compile(_model, mode="max-autotune")
+            log.info("torch.compile enabled")
+        except Exception as e:
+            log.warning(f"torch.compile skipped: {e}")
     log.info(f"Model loaded on {device}")
     return _model, _tokenizer
 
 
 def encode_passages(texts: List[str], model=None, tokenizer=None) -> List[List[List[float]]]:
-    """Encode a batch of passages. Returns list of multi-vectors (one per text).
-    Each multi-vector is a list of 64-dim token vectors (non-padding tokens only).
-    """
+    """Encode a batch of passages with BF16 autocast. Returns list of multi-vectors."""
     if model is None or tokenizer is None:
         model, tokenizer = load_model()
     device = next(model.parameters()).device
 
-    # Tokenize with passage prefix (ColBERT convention: [unused1] for passages)
     prefixed = [f"[unused1]{t}" for t in texts]
     inputs = tokenizer(
         prefixed,
@@ -85,24 +92,18 @@ def encode_passages(texts: List[str], model=None, tokenizer=None) -> List[List[L
     )
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         outputs = model(**inputs)
 
-    # Per-token embeddings [batch, seq_len, hidden_dim]
-    token_embs = outputs.last_hidden_state
-
-    # Slice to COLBERT_DIM (Matryoshka)
+    token_embs = outputs.last_hidden_state.float()  # back to FP32 for normalize
     token_embs = token_embs[:, :, :COLBERT_DIM]
-
-    # L2 normalize per token
     token_embs = F.normalize(token_embs, p=2, dim=-1)
 
-    # Return non-padding token vectors per passage
-    attention_mask = inputs["attention_mask"]  # [batch, seq_len]
+    attention_mask = inputs["attention_mask"]
     result = []
     for i in range(len(texts)):
         mask = attention_mask[i].bool()
-        vecs = token_embs[i][mask]  # [n_tokens, COLBERT_DIM]
+        vecs = token_embs[i][mask]
         result.append(vecs.cpu().tolist())
     return result
 
@@ -233,85 +234,141 @@ def _tile_from_obj(obj: dict) -> dict | None:
 def run_streaming_ingest(model, tokenizer, scale: str, limit: int,
                          existing_uuids: set, cursor_start: str | None = None,
                          shard_id: int = 0, num_shards: int = 1):
-    """Cursor-based streaming ingest: fetch → encode → write with no accumulation.
+    """Pipelined ingest: fetch and write overlap with GPU encode.
 
     Uses REST /v1/objects cursor (O(1) per page regardless of depth).
-    Filters by scale in Python. Encodes BATCH_SIZE tiles, writes immediately.
+    Filters by scale in Python. ThreadPoolExecutor overlaps fetch/write with encode.
 
     shard_id / num_shards: hash-based sharding so multiple nodes can run
     simultaneously on the same scale without coordination or duplicates.
     Each node writes only tiles where int(uuid_hex, 16) % num_shards == shard_id.
     """
-    log.info(f"Streaming ingest: scale={scale} limit={limit} "
+    log.info(f"Pipelined ingest: scale={scale} limit={limit} "
              f"shard={shard_id}/{num_shards} cursor_start={cursor_start or 'beginning'}")
+
     cursor = cursor_start
     t0 = time.monotonic()
     success = failed = found = scanned = 0
-    encode_buf: list = []  # fixed max BATCH_SIZE, flushed immediately — not accumulation
+
+    # Thread pool for IO operations (fetch + write)
+    io_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="io")
+
+    # --- Fetcher: produces batches of tiles ---
+    fetch_buf: list = []
+    fetch_exhausted = False
+
+    def fetch_page(cur):
+        """Fetch one page from Weaviate (runs in thread)."""
+        url = f"{WEAVIATE_URL}/v1/objects?class={SOURCE_CLASS}&limit=500"
+        if cur:
+            url += f"&after={cur}"
+        r = requests.get(url, timeout=30)
+        return r.json().get("objects", [])
+
+    def fill_encode_buffer():
+        """Fill buffer to BATCH_SIZE from fetched pages."""
+        nonlocal cursor, fetch_exhausted, found, scanned
+        buf = []
+        while len(buf) < BATCH_SIZE and not fetch_exhausted:
+            if not fetch_buf:
+                try:
+                    objects = fetch_page(cursor)
+                except Exception as e:
+                    log.error(f"Fetch error: {e}")
+                    fetch_exhausted = True
+                    break
+                if not objects:
+                    fetch_exhausted = True
+                    break
+                cursor = objects[-1]["id"]
+                scanned += len(objects)
+                if len(objects) < 500:
+                    fetch_exhausted = True
+                fetch_buf.extend(objects)
+
+            while fetch_buf and len(buf) < BATCH_SIZE:
+                obj = fetch_buf.pop(0)
+                if obj.get("properties", {}).get("scale") != scale:
+                    continue
+                if num_shards > 1 and int(obj["id"].replace("-", ""), 16) % num_shards != shard_id:
+                    continue
+                if obj["id"] in existing_uuids:
+                    continue
+                tile = _tile_from_obj(obj)
+                if tile is None:
+                    continue
+                buf.append(tile)
+                found += 1
+                if found >= limit:
+                    break
+            if found >= limit:
+                break
+        return buf
+
+    def write_batch_async(tiles, vectors):
+        """Submit batch write to thread pool, return future."""
+        return io_pool.submit(ingest_batch, tiles, vectors)
+
+    # --- Prefetch first page ---
+    try:
+        first_objects = fetch_page(cursor)
+        if first_objects:
+            cursor = first_objects[-1]["id"]
+            scanned += len(first_objects)
+            if len(first_objects) < 500:
+                fetch_exhausted = True
+            fetch_buf.extend(first_objects)
+    except Exception as e:
+        log.error(f"Initial fetch error: {e}")
+        io_pool.shutdown(wait=False)
+        return
+
+    # --- Main pipeline loop ---
+    pending_write: Future | None = None
 
     while found < limit:
-        url = f"{WEAVIATE_URL}/v1/objects?class={SOURCE_CLASS}&limit=500"
-        if cursor:
-            url += f"&after={cursor}"
+        # 1. Fill encode buffer (may fetch more pages)
+        batch_tiles = fill_encode_buffer()
+        if not batch_tiles:
+            break
+
+        # 2. Encode on GPU (this is the long pole)
         try:
-            r = requests.get(url, timeout=30)
-            objects = r.json().get("objects", [])
+            vectors = encode_passages(
+                [t["text"] for t in batch_tiles], model, tokenizer
+            )
         except Exception as e:
-            log.error(f"Fetch error at cursor {cursor}: {e}")
-            break
+            log.error(f"Encode error: {e}")
+            failed += len(batch_tiles)
+            continue
 
-        if not objects:
-            break
-
-        cursor = objects[-1]["id"]
-        scanned += len(objects)
-
-        for obj in objects:
-            if obj.get("properties", {}).get("scale") != scale:
-                continue
-            if num_shards > 1 and int(obj["id"].replace("-", ""), 16) % num_shards != shard_id:
-                continue
-            if obj["id"] in existing_uuids:
-                continue
-            tile = _tile_from_obj(obj)
-            if tile is None:
-                continue
-
-            encode_buf.append(tile)
-            found += 1
-
-            if len(encode_buf) >= BATCH_SIZE:
-                try:
-                    vectors = encode_passages([t["text"] for t in encode_buf], model, tokenizer)
-                except Exception as e:
-                    log.error(f"Encode error: {e}")
-                    failed += len(encode_buf)
-                    encode_buf.clear()
-                    continue
-                ok, bad = ingest_batch(encode_buf, vectors)
+        # 3. Wait for previous write to complete (if any)
+        if pending_write is not None:
+            try:
+                ok, bad = pending_write.result(timeout=120)
                 success += ok
                 failed += bad
-                encode_buf.clear()
+            except Exception as e:
+                log.error(f"Write future error: {e}")
 
-                elapsed = time.monotonic() - t0
-                rate = found / elapsed if elapsed > 0 else 0
-                log.info(f"Progress: {found} | {rate:.1f} tiles/s | "
-                         f"scanned={scanned} ok={success} failed={failed}")
+        # 4. Submit this batch's write asynchronously
+        pending_write = write_batch_async(batch_tiles, vectors)
 
-        if len(objects) < 500:
-            log.info("Cursor exhausted — all objects scanned")
-            break
+        elapsed = time.monotonic() - t0
+        rate = found / elapsed if elapsed > 0 else 0
+        log.info(f"Progress: {found} | {rate:.1f} tiles/s | "
+                 f"scanned={scanned} ok={success} failed={failed}")
 
-    # Flush tail (at most BATCH_SIZE-1 tiles — not accumulation, just remainder)
-    if encode_buf:
+    # Drain final write
+    if pending_write is not None:
         try:
-            vectors = encode_passages([t["text"] for t in encode_buf], model, tokenizer)
-            ok, bad = ingest_batch(encode_buf, vectors)
+            ok, bad = pending_write.result(timeout=120)
             success += ok
             failed += bad
         except Exception as e:
-            log.error(f"Final encode error: {e}")
+            log.error(f"Final write error: {e}")
 
+    io_pool.shutdown(wait=True)
     elapsed = time.monotonic() - t0
     log.info(f"Done in {elapsed:.1f}s — {success} ingested, {failed} failed | "
              f"scanned {scanned} objects to find {found} {scale} tiles")
