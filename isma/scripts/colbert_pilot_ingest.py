@@ -60,15 +60,10 @@ def load_model():
         return _model, _tokenizer
     log.info(f"Loading {COLBERT_MODEL}...")
     _tokenizer = AutoTokenizer.from_pretrained(COLBERT_MODEL)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    _model = AutoModel.from_pretrained(
-        COLBERT_MODEL, trust_remote_code=True, torch_dtype=dtype
-    )
+    _model = AutoModel.from_pretrained(COLBERT_MODEL, trust_remote_code=True)
     _model.eval()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     _model = _model.to(device)
-    if device == "cuda":
-        log.info("Model loaded in BF16")
     log.info(f"Model loaded on {device}")
     return _model, _tokenizer
 
