@@ -67,11 +67,6 @@ def load_model():
     if device == "cuda":
         _model = _model.to(dtype=torch.bfloat16)
         log.info("Model cast to BF16")
-        try:
-            _model = torch.compile(_model, mode="max-autotune")
-            log.info("torch.compile enabled")
-        except Exception as e:
-            log.warning(f"torch.compile skipped: {e}")
     log.info(f"Model loaded on {device}")
     return _model, _tokenizer
 
