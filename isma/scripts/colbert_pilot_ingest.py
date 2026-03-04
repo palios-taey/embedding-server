@@ -38,7 +38,7 @@ COLBERT_MODEL = "jinaai/jina-colbert-v2"
 COLBERT_DIM = 64       # Matryoshka: use first 64 dims for storage efficiency
 MAX_DOC_TOKENS = 512   # Max tokens per passage (ColBERT recommendation)
 MAX_QUERY_TOKENS = 64  # Max tokens per query
-BATCH_SIZE = 32        # Inference batch size (GPU)
+BATCH_SIZE = 256       # Inference batch size (GB10 has headroom — 32 was leaving GPU at ~5% util)
 
 # Redis for checkpoint
 CHECKPOINT_KEY = "isma:colbert_pilot:checkpoint"
