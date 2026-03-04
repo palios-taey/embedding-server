@@ -231,13 +231,19 @@ def _tile_from_obj(obj: dict) -> dict | None:
 
 
 def run_streaming_ingest(model, tokenizer, scale: str, limit: int,
-                         existing_uuids: set, cursor_start: str | None = None):
+                         existing_uuids: set, cursor_start: str | None = None,
+                         shard_id: int = 0, num_shards: int = 1):
     """Cursor-based streaming ingest: fetch → encode → write with no accumulation.
 
     Uses REST /v1/objects cursor (O(1) per page regardless of depth).
     Filters by scale in Python. Encodes BATCH_SIZE tiles, writes immediately.
+
+    shard_id / num_shards: hash-based sharding so multiple nodes can run
+    simultaneously on the same scale without coordination or duplicates.
+    Each node writes only tiles where int(uuid_hex, 16) % num_shards == shard_id.
     """
-    log.info(f"Streaming ingest: scale={scale} limit={limit} cursor_start={cursor_start or 'beginning'}")
+    log.info(f"Streaming ingest: scale={scale} limit={limit} "
+             f"shard={shard_id}/{num_shards} cursor_start={cursor_start or 'beginning'}")
     cursor = cursor_start
     t0 = time.monotonic()
     success = failed = found = scanned = 0
@@ -262,6 +268,8 @@ def run_streaming_ingest(model, tokenizer, scale: str, limit: int,
 
         for obj in objects:
             if obj.get("properties", {}).get("scale") != scale:
+                continue
+            if num_shards > 1 and int(obj["id"].replace("-", ""), 16) % num_shards != shard_id:
                 continue
             if obj["id"] in existing_uuids:
                 continue
@@ -436,8 +444,10 @@ def main():
                         help="Ingest tiles into the class")
     parser.add_argument("--limit", type=int, default=20000,
                         help="Number of tiles to ingest (default: 20000)")
-    parser.add_argument("--skip", type=int, default=0,
-                        help="Skip first N source tiles (for sharding across nodes)")
+    parser.add_argument("--shard-id", type=int, default=0,
+                        help="Shard index (0-based). With --num-shards, each node writes a distinct subset.")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Total number of shards. Splits load across nodes without coordination.")
     parser.add_argument("--scale", default="search_512",
                         choices=["rosetta", "search_512", "context_2048", "full_4096"],
                         help="Source scale to ingest (default: search_512 for full passage coverage)")
@@ -467,7 +477,8 @@ def main():
 
     # Stream: cursor → encode → write, no accumulation
     run_streaming_ingest(model, tokenizer, scale=args.scale,
-                         limit=args.limit, existing_uuids=existing_uuids)
+                         limit=args.limit, existing_uuids=existing_uuids,
+                         shard_id=args.shard_id, num_shards=args.num_shards)
 
 
 if __name__ == "__main__":
