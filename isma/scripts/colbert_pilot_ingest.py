@@ -211,25 +211,24 @@ def create_class():
 # TILE FETCHING
 # =============================================================================
 
-def fetch_source_tiles(limit: int = 20000) -> list:
-    """Fetch top N enriched tiles from ISMA_Quantum, prioritizing information density.
+def fetch_source_tiles(limit: int = 20000, skip: int = 0) -> list:
+    """Fetch enriched context_2048 tiles from ISMA_Quantum (one tile per unique document).
 
-    Selection strategy: hmm_enriched=True, sorted by Rosetta quality.
-    Targets diverse platforms and scale levels.
+    Uses context_2048 scale only — avoids multi-scale duplicates (search_512/full_4096
+    share the same content_hash). Weaviate QUERY_MAXIMUM_RESULTS must be >= limit+skip+500.
 
     NOTE: Weaviate cursor API (after + where) is incompatible — uses offset pagination.
     """
-    log.info(f"Fetching {limit} tiles from {SOURCE_CLASS}...")
+    log.info(f"Fetching {limit} tiles from {SOURCE_CLASS} (skip={skip})...")
 
-    # Use offset-based pagination (cursor pagination incompatible with where filter)
+    # Use offset-based pagination
     all_tiles = []
     batch_size = 500
-    offset = 0
+    offset = skip  # start from skip position
 
     while len(all_tiles) < limit:
         fetch_limit = min(batch_size, limit - len(all_tiles) + 50)
 
-        # Build GraphQL query with offset pagination
         gql = f"""{{
             Get {{
                 {SOURCE_CLASS}(
@@ -237,7 +236,7 @@ def fetch_source_tiles(limit: int = 20000) -> list:
                         operator: And
                         operands: [
                             {{path: ["hmm_enriched"], operator: Equal, valueBoolean: true}}
-                            {{path: ["scale"], operator: NotEqual, valueText: "theme"}}
+                            {{path: ["scale"], operator: Equal, valueText: "context_2048"}}
                         ]
                     }}
                     limit: {fetch_limit}
@@ -448,15 +447,11 @@ def main():
     # Load ColBERT model
     model, tokenizer = load_model()
 
-    # Fetch source tiles (fetch limit + skip to get correct slice)
-    fetch_total = args.limit + args.skip
-    all_tiles = fetch_source_tiles(fetch_total)
-    if not all_tiles:
+    # Fetch source tiles (context_2048 scale, offset by skip for sharding)
+    tiles = fetch_source_tiles(args.limit, skip=args.skip)
+    if not tiles:
         log.error("No tiles fetched")
         sys.exit(1)
-    tiles = all_tiles[args.skip:]
-    if args.skip:
-        log.info(f"Skipping first {args.skip} tiles (shard offset), {len(tiles)} remaining")
 
     # Skip already-ingested tiles (full dedup)
     existing = get_existing_hashes()
