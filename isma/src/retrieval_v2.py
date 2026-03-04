@@ -205,10 +205,11 @@ class ISMARetrievalV2:
         self,
         query: str,
         top_k: int = 10,
+        vector: Optional[list] = None,
         **filters,
     ) -> List[Tuple[dict, float]]:
         """Search using the rosetta (summary) named vector."""
-        embedding = _get_embedding(query)
+        embedding = vector or _get_embedding(query)
         if not embedding:
             return []
 
@@ -302,6 +303,7 @@ class ISMARetrievalV2:
         self,
         query: str,
         top_k: int = 30,
+        vector: Optional[list] = None,
     ) -> List[Tuple[dict, float]]:
         """NearVector search on ISMA_Quantum search_512 tiles.
 
@@ -309,7 +311,7 @@ class ISMARetrievalV2:
         embedded from the first tile only (2048 chars). V1 tile vectors represent
         the actual passage content.
         """
-        embedding = _get_embedding(query)
+        embedding = vector or _get_embedding(query)
         if not embedding:
             return []
         vector_str = str(embedding)
@@ -376,17 +378,22 @@ class ISMARetrievalV2:
         t0 = time.monotonic()
         fetch_k = max(top_k * 3, 30)
 
+        # Embed query ONCE — shared by rosetta nearVector + V1 nearVector paths.
+        # BM25 path needs no embedding. Embedding twice in parallel wastes server capacity
+        # and doubles latency under load (ColBERT ingest, etc.).
+        query_vector = _get_embedding(query)
+
         # Run all three paths in parallel
         futures_map = {}
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures_map["rosetta"] = executor.submit(
-                self.search_rosetta, query, top_k=fetch_k, **filters
+                self.search_rosetta, query, top_k=fetch_k, vector=query_vector, **filters
             )
             futures_map["v1_bm25"] = executor.submit(
                 self.search_v1_bm25, query, top_k=fetch_k
             )
             futures_map["v1_vector"] = executor.submit(
-                self.search_v1_vector, query, top_k=fetch_k
+                self.search_v1_vector, query, top_k=fetch_k, vector=query_vector
             )
             results_by_path = {}
             for name, fut in futures_map.items():
