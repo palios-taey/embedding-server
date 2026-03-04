@@ -444,7 +444,7 @@ def ingest_batch(tiles: list, vectors_list: List[List[List[float]]]) -> tuple[in
         r = requests.post(
             f"{WEAVIATE_URL}/v1/batch/objects",
             json={"objects": objects},
-            timeout=60,
+            timeout=300,
         )
         if r.status_code not in (200, 201):
             log.error(f"Batch write failed: {r.status_code} {r.text[:200]}")
