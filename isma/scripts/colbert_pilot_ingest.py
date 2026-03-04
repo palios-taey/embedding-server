@@ -215,19 +215,20 @@ def fetch_source_tiles(limit: int = 20000) -> list:
 
     Selection strategy: hmm_enriched=True, sorted by Rosetta quality.
     Targets diverse platforms and scale levels.
+
+    NOTE: Weaviate cursor API (after + where) is incompatible — uses offset pagination.
     """
     log.info(f"Fetching {limit} tiles from {SOURCE_CLASS}...")
 
-    # Fetch in batches using cursor pagination
+    # Use offset-based pagination (cursor pagination incompatible with where filter)
     all_tiles = []
-    after_uuid = None
     batch_size = 500
+    offset = 0
 
     while len(all_tiles) < limit:
         fetch_limit = min(batch_size, limit - len(all_tiles) + 50)
 
-        # Build GraphQL query
-        after_clause = f'after: "{after_uuid}"' if after_uuid else ""
+        # Build GraphQL query with offset pagination
         gql = f"""{{
             Get {{
                 {SOURCE_CLASS}(
@@ -238,8 +239,8 @@ def fetch_source_tiles(limit: int = 20000) -> list:
                             {{path: ["scale"], operator: NotEqual, valueText: "theme"}}
                         ]
                     }}
-                    {after_clause}
                     limit: {fetch_limit}
+                    offset: {offset}
                 ) {{
                     content_hash
                     content
@@ -263,7 +264,7 @@ def fetch_source_tiles(limit: int = 20000) -> list:
                 r.json().get("data", {}).get("Get", {}).get(SOURCE_CLASS, []) or []
             )
         except Exception as e:
-            log.error(f"Fetch error: {e}")
+            log.error(f"Fetch error at offset {offset}: {e}")
             break
 
         if not results:
@@ -290,8 +291,8 @@ def fetch_source_tiles(limit: int = 20000) -> list:
                 "scale": item.get("scale", ""),
             })
 
-        after_uuid = results[-1]["_additional"]["id"] if results else None
-        log.info(f"  Fetched {len(all_tiles)}/{limit} tiles...")
+        offset += len(results)
+        log.info(f"  Fetched {len(all_tiles)}/{limit} tiles (offset={offset})...")
 
         if len(results) < fetch_limit:
             break
