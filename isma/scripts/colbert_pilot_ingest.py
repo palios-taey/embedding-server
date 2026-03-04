@@ -429,9 +429,9 @@ def main():
                         help="Number of tiles to ingest (default: 20000)")
     parser.add_argument("--skip", type=int, default=0,
                         help="Skip first N source tiles (for sharding across nodes)")
-    parser.add_argument("--scale", default="context_2048",
-                        choices=["search_512", "context_2048", "full_4096"],
-                        help="Source scale to ingest (default: context_2048)")
+    parser.add_argument("--scale", default="rosetta",
+                        choices=["rosetta", "search_512", "context_2048", "full_4096"],
+                        help="Source scale to ingest (default: rosetta = one per source document)")
     parser.add_argument("--stats", action="store_true",
                         help="Show current ingest stats")
     args = parser.parse_args()
