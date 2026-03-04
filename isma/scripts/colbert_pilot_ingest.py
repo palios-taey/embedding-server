@@ -337,7 +337,7 @@ def run_streaming_ingest(model, tokenizer, scale: str, limit: int,
         # 3. Wait for previous write to complete (if any)
         if pending_write is not None:
             try:
-                ok, bad = pending_write.result(timeout=120)
+                ok, bad = pending_write.result(timeout=360)
                 success += ok
                 failed += bad
             except Exception as e:
@@ -354,7 +354,7 @@ def run_streaming_ingest(model, tokenizer, scale: str, limit: int,
     # Drain final write
     if pending_write is not None:
         try:
-            ok, bad = pending_write.result(timeout=120)
+            ok, bad = pending_write.result(timeout=360)
             success += ok
             failed += bad
         except Exception as e:
