@@ -98,17 +98,23 @@ def search_colbert(query_vectors: list[list[float]], top_k: int = 20) -> list[di
     """
     Submit query multi-vectors to Weaviate ISMA_ColBERT_Pilot using MaxSim.
     Returns list of {"content_hash": ..., "distance": ..., "rank": ...}
+
+    Weaviate 1.30+ multi-vector query format:
+    - Use `vector` field (2D array) with `targets` sub-object (NOT vectorPerTarget + targetVectors)
+    - `combinationMethod: minimum` routes through the correct multi-vector code path
+    - Distances are negative (dot product); more negative = more similar
     """
-    # Weaviate multi-vector nearVector query
-    gql = f"""
-    {{
+    gql = f"""{{
       Get {{
         {PILOT_CLASS}(
-          nearVector: {{
-            vectorPerTarget: {{ colbert: {json.dumps(query_vectors)} }}
-            targetVectors: ["colbert"]
-          }}
           limit: {top_k}
+          nearVector: {{
+            vector: {json.dumps(query_vectors)}
+            targets: {{
+              targetVectors: ["colbert"]
+              combinationMethod: minimum
+            }}
+          }}
         ) {{
           content_hash
           platform
@@ -119,8 +125,7 @@ def search_colbert(query_vectors: list[list[float]], top_k: int = 20) -> list[di
           }}
         }}
       }}
-    }}
-    """
+    }}"""
     try:
         r = requests.post(
             f"{WEAVIATE_URL}/v1/graphql",
@@ -128,13 +133,18 @@ def search_colbert(query_vectors: list[list[float]], top_k: int = 20) -> list[di
             timeout=15,
         )
         r.raise_for_status()
-        items = r.json().get("data", {}).get("Get", {}).get(PILOT_CLASS, []) or []
+        data = r.json()
+        if "errors" in data:
+            log.error(f"ColBERT GraphQL error: {data['errors']}")
+            return []
+        items = data.get("data", {}).get("Get", {}).get(PILOT_CLASS, []) or []
         results = []
         for rank, item in enumerate(items, 1):
+            dist = item["_additional"].get("distance", 0.0)
             results.append({
                 "content_hash": item.get("content_hash", ""),
-                "distance": item["_additional"].get("distance", 1.0),
-                "score": 1.0 - item["_additional"].get("distance", 1.0),  # convert distance to score
+                "distance": dist,
+                "score": -dist,  # dot product: more negative distance = higher score
                 "platform": item.get("platform", ""),
                 "dominant_motifs": item.get("dominant_motifs", []),
                 "rank": rank,
