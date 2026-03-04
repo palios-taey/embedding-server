@@ -321,6 +321,10 @@ def main():
                         help="Label for this benchmark run (e.g., 'baseline', 'phase1')")
     parser.add_argument("--v2", action="store_true",
                         help="Use ISMARetrievalV2.adaptive_search() instead of v1")
+    parser.add_argument("--colbert", action="store_true",
+                        help="Add ColBERT MaxSim signal via RRF fusion with V1 (requires ISMA_ColBERT_Pilot)")
+    parser.add_argument("--colbert-weight", type=float, default=0.3,
+                        help="RRF weight for ColBERT signal (default: 0.3, V1 gets 0.7)")
     args = parser.parse_args()
 
     # Load queries
@@ -351,6 +355,13 @@ def main():
         print("Initializing ISMARetrieval...")
     retrieval = ISMARetrieval()
 
+    colbert_retrieval = None
+    if args.colbert:
+        print(f"Initializing ColBERT retrieval (weight={args.colbert_weight}, V1 weight={1.0 - args.colbert_weight})...")
+        from isma.scripts.colbert_retrieval import ColBERTRetrieval, rrf_fusion
+        colbert_retrieval = ColBERTRetrieval()
+        print("ColBERT ready.")
+
     # Run queries
     results = []
     total = len(queries)
@@ -363,6 +374,25 @@ def main():
                 result = run_query_v2(retrieval_v2, q, top_k=args.top_k)
             else:
                 result = run_query(retrieval, q, top_k=args.top_k)
+
+            # ColBERT RRF fusion: re-rank using ColBERT MaxSim + V1 combined
+            if colbert_retrieval and not args.v2:
+                try:
+                    v1_hashes = [t.content_hash for t in result.get("tiles", [])]
+                    cb_hashes = colbert_retrieval.search_content_hashes(q["query"], top_k=args.top_k * 2)
+                    fused_hashes = rrf_fusion(
+                        [v1_hashes, cb_hashes],
+                        weights=[1.0 - args.colbert_weight, args.colbert_weight],
+                        top_n=args.top_k,
+                    )
+                    # Re-score with fused ranking
+                    expected = q.get("expected_content", [])
+                    result["recall_10_colbert"] = recall_at_k(fused_hashes, expected, k=10)
+                    result["recall_5_colbert"] = recall_at_k(fused_hashes, expected, k=5)
+                    result["colbert_fused_hashes"] = fused_hashes
+                except Exception as ce:
+                    log.warning(f"ColBERT fusion failed for {q['id']}: {ce}")
+
             results.append(result)
             status = f" R@10={result['recall_10']:.2f} MRR={result['mrr']:.2f} {result['latency_ms']:.0f}ms"
             print(status)
@@ -389,6 +419,24 @@ def main():
     summary = aggregate_results(results)
 
     # Build output
+    # ColBERT comparison summary (if run)
+    colbert_summary = None
+    if colbert_retrieval:
+        cb_results = [r for r in results if "recall_10_colbert" in r]
+        if cb_results:
+            cb_r10 = sum(r["recall_10_colbert"] for r in cb_results) / len(cb_results)
+            v1_r10 = sum(r.get("recall_10", 0) for r in cb_results) / len(cb_results)
+            colbert_summary = {
+                "queries_with_colbert": len(cb_results),
+                "v1_recall_10": round(v1_r10, 4),
+                "v1_colbert_rrf_recall_10": round(cb_r10, 4),
+                "delta": round(cb_r10 - v1_r10, 4),
+                "colbert_weight": args.colbert_weight,
+                "gate_passed": cb_r10 - v1_r10 >= 0.05,  # +5% gate
+            }
+            print(f"\nColBERT RRF result: V1={v1_r10:.4f} → V1+ColBERT={cb_r10:.4f} "
+                  f"(delta={cb_r10 - v1_r10:+.4f}, gate={'PASS' if colbert_summary['gate_passed'] else 'FAIL'})")
+
     output = {
         "benchmark_version": query_data.get("version", "1.0.0"),
         "label": args.label or "baseline",
@@ -398,8 +446,11 @@ def main():
             "category_filter": args.category,
             "total_queries": len(queries),
             "total_time_seconds": round(elapsed, 2),
+            "colbert_enabled": bool(colbert_retrieval),
+            "colbert_weight": args.colbert_weight if colbert_retrieval else None,
         },
         "summary": summary,
+        "colbert_comparison": colbert_summary,
         "details": results,
     }
 
