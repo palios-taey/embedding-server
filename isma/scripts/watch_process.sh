@@ -55,10 +55,9 @@ else
     fi
 fi
 
-# Notify via tmux — use -l (literal) + separate Enter, same as tmux-send helper
-# (Claude Code intercepts Enter when passed as part of the same send-keys call)
-tmux send-keys -t "$TMUX_SESSION" "" 2>/dev/null
-tmux send-keys -t "$TMUX_SESSION" -l "echo '$MSG'" 2>/dev/null
+# Notify via tmux — use '--' separator + separate Enter (matches tmux-send helper)
+tmux send-keys -t "$TMUX_SESSION" -- "echo '$MSG'" 2>/dev/null
+sleep 0.5
 tmux send-keys -t "$TMUX_SESSION" Enter 2>/dev/null
 
 # Also push to Redis if available
