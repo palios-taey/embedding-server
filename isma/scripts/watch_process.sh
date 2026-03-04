@@ -27,9 +27,21 @@ while kill -0 "$PID" 2>/dev/null; do
     sleep 10
 done
 
-# Get exit code (from /proc if still available, otherwise assume gone = done)
+# Get exit code. Note: wait only works for child PIDs of this shell.
+# For background PIDs launched by other shells, wait returns 127 (not an error).
+# Check /tmp/$LABEL.exitcode if the wrapped launcher wrote one; otherwise default 0.
 wait "$PID" 2>/dev/null
-EXIT_CODE=$?
+WAIT_CODE=$?
+if [ $WAIT_CODE -eq 127 ]; then
+    # Not a child of this shell — check for explicit exitcode file, else assume 0
+    if [ -f "/tmp/${LABEL}.exitcode" ]; then
+        EXIT_CODE=$(cat "/tmp/${LABEL}.exitcode" 2>/dev/null || echo 0)
+    else
+        EXIT_CODE=0
+    fi
+else
+    EXIT_CODE=$WAIT_CODE
+fi
 
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
@@ -43,9 +55,11 @@ else
     fi
 fi
 
-# Notify via tmux
+# Notify via tmux — use -l (literal) + separate Enter, same as tmux-send helper
+# (Claude Code intercepts Enter when passed as part of the same send-keys call)
 tmux send-keys -t "$TMUX_SESSION" "" 2>/dev/null
-tmux send-keys -t "$TMUX_SESSION" "echo '$MSG'" Enter 2>/dev/null
+tmux send-keys -t "$TMUX_SESSION" -l "echo '$MSG'" 2>/dev/null
+tmux send-keys -t "$TMUX_SESSION" Enter 2>/dev/null
 
 # Also push to Redis if available
 redis-cli -h 192.168.100.10 -p 6379 \
