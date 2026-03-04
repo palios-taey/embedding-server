@@ -235,13 +235,7 @@ def fetch_source_tiles(limit: int = 20000, skip: int = 0, scale: str = "context_
         gql = f"""{{
             Get {{
                 {SOURCE_CLASS}(
-                    where: {{
-                        operator: And
-                        operands: [
-                            {{path: ["hmm_enriched"], operator: Equal, valueBoolean: true}}
-                            {{path: ["scale"], operator: Equal, valueText: "{scale}"}}
-                        ]
-                    }}
+                    where: {{path: ["scale"], operator: Equal, valueText: "{scale}"}}
                     limit: {fetch_limit}
                     offset: {offset}
                 ) {{
@@ -319,15 +313,19 @@ def get_redis():
         return None
 
 
-def get_existing_hashes() -> set:
-    """Return set of ALL content_hashes already ingested into ISMA_ColBERT_Pilot (paginated)."""
-    all_hashes = set()
+def get_existing_source_uuids() -> set:
+    """Return set of source_uuids already ingested (dedup by source tile UUID, not content_hash).
+
+    This allows multiple entries per content_hash (different passages from same document)
+    while preventing re-ingestion of the same source tile on resume.
+    """
+    all_uuids = set()
     offset = 0
     page_size = 2000
     while True:
         gql = f"""{{
             Get {{
-                {PILOT_CLASS}(limit: {page_size} offset: {offset}) {{ content_hash }}
+                {PILOT_CLASS}(limit: {page_size} offset: {offset}) {{ source_uuid }}
             }}
         }}"""
         try:
@@ -338,18 +336,18 @@ def get_existing_hashes() -> set:
             )
             results = r.json().get("data", {}).get("Get", {}).get(PILOT_CLASS, []) or []
         except Exception as e:
-            log.warning(f"Could not fetch existing hashes at offset {offset}: {e}")
+            log.warning(f"Could not fetch existing UUIDs at offset {offset}: {e}")
             break
         if not results:
             break
         for t in results:
-            if t.get("content_hash"):
-                all_hashes.add(t["content_hash"])
+            if t.get("source_uuid"):
+                all_uuids.add(t["source_uuid"])
         if len(results) < page_size:
             break
         offset += len(results)
-    log.info(f"Found {len(all_hashes)} already-ingested tiles")
-    return all_hashes
+    log.info(f"Found {len(all_uuids)} already-ingested source tiles")
+    return all_uuids
 
 
 def ingest_batch(tiles: list, vectors_list: List[List[List[float]]]) -> tuple[int, int]:
@@ -429,9 +427,9 @@ def main():
                         help="Number of tiles to ingest (default: 20000)")
     parser.add_argument("--skip", type=int, default=0,
                         help="Skip first N source tiles (for sharding across nodes)")
-    parser.add_argument("--scale", default="rosetta",
+    parser.add_argument("--scale", default="search_512",
                         choices=["rosetta", "search_512", "context_2048", "full_4096"],
-                        help="Source scale to ingest (default: rosetta = one per source document)")
+                        help="Source scale to ingest (default: search_512 for full passage coverage)")
     parser.add_argument("--stats", action="store_true",
                         help="Show current ingest stats")
     args = parser.parse_args()
@@ -459,11 +457,11 @@ def main():
         log.error("No tiles fetched")
         sys.exit(1)
 
-    # Skip already-ingested tiles (full dedup)
-    existing = get_existing_hashes()
+    # Dedup by source UUID (allows multiple entries per content_hash from different passages)
+    existing = get_existing_source_uuids()
     if existing:
-        tiles = [t for t in tiles if t["content_hash"] not in existing]
-        log.info(f"After dedup: {len(tiles)} tiles to ingest")
+        tiles = [t for t in tiles if t["uuid"] not in existing]
+        log.info(f"After UUID dedup: {len(tiles)} tiles to ingest")
 
     if not tiles:
         log.info("All tiles already ingested")
