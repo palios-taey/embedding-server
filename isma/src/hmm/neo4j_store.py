@@ -613,35 +613,69 @@ class HMMNeo4jStore:
         tile_ids: List[str],
         depth: int = 2,
         follow_supersedes: bool = True,
+        relates_to_jaccard_min: float = 0.6,
     ) -> List[Dict]:
-        """Expand from seed tiles through RELATES_TO, SUPERSEDES, and CONTRADICTS.
+        """Expand from seed tiles through SUPERSEDES, CONTRADICTS, and filtered RELATES_TO.
 
-        For SUPERSEDES chains, prefers the latest version (no incoming SUPERSEDES).
-        Returns expanded tile info with relationship context.
+        RELATES_TO edges are fetched separately at depth-1 only, filtered by jaccard
+        threshold (default 0.6). This prevents the dense RELATES_TO graph (5M+ edges)
+        from overwhelming results when doing multi-hop SUPERSEDES traversals.
         """
-        rel_types = "RELATES_TO"
         if follow_supersedes:
-            rel_types = "RELATES_TO|SUPERSEDES|CONTRADICTS"
+            struct_types = "SUPERSEDES|CONTRADICTS"
+        else:
+            struct_types = "SUPERSEDES"
 
-        query = f"""
+        # Query 1: structural multi-hop traversal (SUPERSEDES / CONTRADICTS)
+        struct_query = f"""
         UNWIND $tile_ids AS seed_id
         MATCH (seed:HMMTile {{tile_id: seed_id}})
-        OPTIONAL MATCH path = (seed)-[:{rel_types}*1..{depth}]-(neighbor:HMMTile)
+        OPTIONAL MATCH path = (seed)-[:{struct_types}*1..{depth}]-(neighbor:HMMTile)
         WHERE coalesce(neighbor.is_snapshot, false) = false
-        WITH DISTINCT neighbor, seed
-        WHERE neighbor IS NOT NULL AND neighbor.tile_id <> seed.tile_id
-        RETURN neighbor.tile_id AS tile_id,
+              AND neighbor.tile_id <> seed.tile_id
+        RETURN DISTINCT neighbor.tile_id AS tile_id,
+               neighbor.content_hash AS content_hash,
+               neighbor.rosetta_summary AS rosetta_summary,
+               neighbor.dominant_motifs AS dominant_motifs,
+               neighbor.platform AS platform,
+               neighbor.enriched_at AS enriched_at
+        ORDER BY enriched_at DESC
+        LIMIT 80
+        """
+
+        # Query 2: high-confidence RELATES_TO neighbors (depth-1 only, jaccard-filtered)
+        relates_query = """
+        UNWIND $tile_ids AS seed_id
+        MATCH (seed:HMMTile {tile_id: seed_id})
+        MATCH (seed)-[r:RELATES_TO]-(neighbor:HMMTile)
+        WHERE r.jaccard >= $jmin
+              AND coalesce(neighbor.is_snapshot, false) = false
+              AND neighbor.tile_id <> seed.tile_id
+        RETURN DISTINCT neighbor.tile_id AS tile_id,
                neighbor.content_hash AS content_hash,
                neighbor.rosetta_summary AS rosetta_summary,
                neighbor.dominant_motifs AS dominant_motifs,
                neighbor.platform AS platform,
                neighbor.enriched_at AS enriched_at
         ORDER BY neighbor.enriched_at DESC
-        LIMIT 100
+        LIMIT 20
         """
+
+        seen: set = set()
+        neighbors: List[Dict] = []
         with self.driver.session() as session:
-            result = session.run(query, tile_ids=tile_ids)
-            return [dict(r) for r in result]
+            for row in session.run(struct_query, tile_ids=tile_ids):
+                d = dict(row)
+                if d.get("tile_id") and d["tile_id"] not in seen:
+                    seen.add(d["tile_id"])
+                    neighbors.append(d)
+            for row in session.run(relates_query, tile_ids=tile_ids,
+                                   jmin=relates_to_jaccard_min):
+                d = dict(row)
+                if d.get("tile_id") and d["tile_id"] not in seen:
+                    seen.add(d["tile_id"])
+                    neighbors.append(d)
+        return neighbors[:100]
 
     def wipe(self):
         """Delete all HMM nodes and relationships (for rebuild)."""
