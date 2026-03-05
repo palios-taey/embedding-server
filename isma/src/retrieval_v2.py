@@ -563,14 +563,18 @@ class ISMARetrievalV2:
 
         # Route to strategy
         if strategy == "relational" and plan.sub_queries:
-            # V1-Plus: use _search_relational with graph expansion (depth=3).
-            # Graph densification v2 (52.8M RELATES_TO edges) makes this viable —
-            # was disabled before densification when graph was too sparse to help.
-            result = self._search_relational(
-                query, plan.sub_queries, top_k,
+            # V1-Plus: route relational through _v1_plus_search — same V1 hybrid +
+            # V2 metadata overlay + Qwen3-Reranker-8B pipeline as conceptual queries.
+            # Sub-query decomposition + _search_relational was tried (619107b) and gave
+            # R@10=0.379 vs _v1_plus_search's R@10=0.487. The sub-query decomposition
+            # produces poor sub-queries that dilute recall rather than amplify it.
+            # Graph expansion (via 52.8M RELATES_TO edges) should be wired as a
+            # post-rerank boost inside _v1_plus_search, not as a parallel sub-query path.
+            result = self._v1_plus_search(
+                query, top_k,
                 instruction=plan.reranker_instruction,
-                expand_graph=True,
-                graph_depth=3,
+                query_type="relational",
+                v1=v1,
                 **merged_filters,
             )
         elif strategy == "motif" and plan.detected_motifs:
