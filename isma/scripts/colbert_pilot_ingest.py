@@ -175,15 +175,15 @@ def create_class():
         ],
         "vectorConfig": {
             "colbert": {
-                "vectorIndexType": "hnsw",
+                "vectorIndexType": "flat",
                 "vectorIndexConfig": {
                     "distance": "dot",
-                    "efConstruction": 128,
-                    "maxConnections": 32,
-                    "ef": -1,
                     "multivector": {
                         "enabled": True,
                         "aggregation": "maxSim",
+                    },
+                    "bq": {
+                        "enabled": False,
                     },
                 },
                 "vectorizer": {"none": {}},
