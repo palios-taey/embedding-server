@@ -529,25 +529,25 @@ class ISMARetrievalV2:
         graph_depth: int = 2,
         **filters,
     ) -> Dict[str, Any]:
-        """Query-adaptive search with automatic strategy selection.
+        """Query-adaptive search — V1-Plus architecture.
 
-        Classifies the query, selects optimal retrieval strategy,
-        applies temporal decay, optionally expands through Neo4j graph,
-        and returns reranked results.
+        Classifies the query, routes to the appropriate V1-Plus strategy,
+        applies temporal decay post-hoc, and returns reranked results.
+
+        All non-relational strategies use V1 hybrid_retrieve_hmm as the base,
+        with lazy V2 metadata overlay before the Qwen3-Reranker-8B step.
 
         Strategies:
-          - exact: hybrid search with factual precision instruction
-          - temporal: hybrid search + temporal decay scoring
-          - conceptual: hybrid search with thematic depth instruction
-          - relational: parallel sub-queries + RRF merge + graph expansion
-          - motif: motif-filtered search + hybrid fallback
-          - default: standard hybrid search
+          - exact:      V1 hybrid + V2 overlay + reranker (factual precision)
+          - temporal:   V1 hybrid + V2 overlay + reranker + post-hoc decay
+          - conceptual: V1 hybrid + V2 overlay + reranker + theme-motif logging
+          - relational: parallel sub-queries + RRF + graph expansion (unchanged)
+          - motif:      V1 motif-filtered hybrid + Redis/Neo4j motif RRF + V2 overlay
+          - default:    V1 hybrid + V2 overlay + reranker
         """
         from isma.src.query_classifier import classify_query
-        from isma.src.temporal_query import (
-            apply_temporal_decay,
-            HALF_LIVES,
-        )
+        from isma.src.temporal_query import apply_temporal_decay, HALF_LIVES
+        from isma.src.retrieval import get_retrieval
 
         t0 = time.monotonic()
 
@@ -559,41 +559,44 @@ class ISMARetrievalV2:
         if plan.detected_platform and "platform" not in merged_filters:
             merged_filters["platform"] = plan.detected_platform
 
+        v1 = get_retrieval()
+
         # Route to strategy
         if strategy == "relational" and plan.sub_queries:
             result = self._search_relational(
                 query, plan.sub_queries, top_k,
                 instruction=plan.reranker_instruction,
                 expand_graph=expand_graph,
-                graph_depth=max(graph_depth, 3),  # relational queries need deeper graph traversal
+                graph_depth=max(graph_depth, 3),
+                **merged_filters,
+            )
+        elif strategy == "motif" and plan.detected_motifs:
+            # Wire detected_motifs into retrieval (previously ignored → R@10=0.000)
+            result = self._search_motif(
+                query, plan.detected_motifs, top_k,
+                instruction=plan.reranker_instruction,
+                v1=v1,
                 **merged_filters,
             )
         else:
-            instruction = plan.reranker_instruction
-
-            # Theme routing via ISMA_Themes (sub-ms, 24 objects) — replaces the old
-            # _get_theme_context() which scanned 1M tiles causing 3.8x latency spike.
-            # Logs matched theme for debugging; does NOT inject into reranker instruction
-            # (that caused -3.3pt conceptual regression). Motif-filtered result blending
-            # is the next step after benchmarking.
+            # V1-Plus: V1 search + lazy V2 metadata overlay + reranker
             theme_motifs = []
             if strategy == "conceptual":
+                # Theme routing for audit/logging — not a hard filter to avoid recall regression
                 theme_motifs = self._get_theme_motifs(query)
 
-            result = self.hybrid_search(
-                query,
-                top_k=top_k,
-                rerank=True,
+            result = self._v1_plus_search(
+                query, top_k,
+                instruction=plan.reranker_instruction,
                 query_type=strategy,
-                instruction=instruction,
+                v1=v1,
                 **merged_filters,
             )
 
-            # Annotate result with theme routing info (for debugging/audit — no retrieval impact yet)
             if theme_motifs:
                 result["theme_routing"] = theme_motifs
 
-        # Apply temporal decay for temporal queries
+        # Apply temporal decay post-hoc for temporal queries
         if strategy == "temporal":
             half_life = HALF_LIVES.get(strategy, 90)
             tiles = result.get("tiles", [])
@@ -613,6 +616,262 @@ class ISMARetrievalV2:
             "temporal_window": plan.temporal_window,
         }
 
+        return result
+
+    def _v1_plus_search(
+        self,
+        query: str,
+        top_k: int,
+        instruction: str,
+        query_type: str,
+        v1,
+        **filters,
+    ) -> Dict[str, Any]:
+        """V1 hybrid search + lazy V2 metadata overlay before reranking.
+
+        Replaces Option E (V2 rosetta nearVector path) as the default non-relational
+        strategy. V2 metadata (richer doc-level rosetta_summary, dominant_motifs)
+        is overlaid onto V1 passage tiles before the cross-encoder sees them,
+        improving reranker quality without the latency of V2 vector search.
+
+        Sequence:
+          1. V1 search (nearVector + BM25, 3x candidate pool)
+          2. Lazy V2 metadata overlay (batch-fetch by content_hash OR-filter)
+          3. Qwen3-Reranker-8B cross-encoder on enriched candidates
+          4. Dedup by content_hash + truncate to top_k
+        """
+        from dataclasses import replace as dc_replace
+
+        fetch_k = top_k * 3
+
+        # Step 1: V1 vector + BM25 search
+        search_result = v1.search(query, top_k=fetch_k, expand_parents=True, **filters)
+        if not search_result.tiles:
+            return {
+                "query": query, "tiles": [], "total_tokens": 0,
+                "hmm_reranked": False, "version": "v1plus",
+            }
+
+        # Step 2: Lazy V2 metadata overlay
+        content_hashes = [t.content_hash for t in search_result.tiles if t.content_hash]
+        if content_hashes:
+            v2_meta = self._fetch_v2_metadata(content_hashes)
+            if v2_meta:
+                enriched = []
+                for tile in search_result.tiles:
+                    ch = tile.content_hash
+                    if ch and ch in v2_meta:
+                        meta = v2_meta[ch]
+                        tile = dc_replace(
+                            tile,
+                            rosetta_summary=meta.get("rosetta_summary") or tile.rosetta_summary,
+                            dominant_motifs=meta.get("dominant_motifs") or tile.dominant_motifs,
+                        )
+                    enriched.append(tile)
+                search_result = SearchResult(
+                    query=search_result.query,
+                    tiles=enriched,
+                    total_tokens=search_result.total_tokens,
+                    search_time_ms=search_result.search_time_ms,
+                )
+
+        # Step 3: Neural rerank (Qwen3-Reranker-8B)
+        reranked_result = v1.hmm_rerank(
+            search_result, query, query_type=query_type, instruction=instruction,
+        )
+
+        # Step 4: Dedup by content_hash
+        seen: set = set()
+        deduped = []
+        for tile in reranked_result.tiles:
+            key = tile.content_hash or id(tile)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(tile)
+
+        tiles = deduped[:top_k]
+        return {
+            "query": query,
+            "tiles": tiles,
+            "total_tokens": sum(t.token_count for t in tiles),
+            "hmm_reranked": True,
+            "version": "v1plus",
+        }
+
+    def _search_motif(
+        self,
+        query: str,
+        detected_motifs: List[str],
+        top_k: int,
+        instruction: str,
+        v1,
+        **filters,
+    ) -> Dict[str, Any]:
+        """Motif-aware search: RRF of V1 hybrid + Redis/Neo4j motif candidates.
+
+        Wires detected_motifs into actual retrieval, replacing the previous
+        hybrid_search() call that ignored motifs entirely (R@10=0.000).
+
+        Sequence:
+          1a. V1 nearVector+BM25 with dominant_motifs Weaviate pre-filter (base signal)
+          1b. Redis inverted index → Neo4j amplitude sort per detected motif (1.5x weight)
+          2.  RRF merge of all paths
+          3.  Lazy V2 metadata overlay on candidate pool
+          4.  Backfill passage content for motif-only tiles
+          5.  Qwen3-Reranker-8B rerank + dedup
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        from dataclasses import replace as dc_replace
+
+        k = 60
+        rrf_scores: Dict[str, float] = {}
+        obj_map: Dict[str, TileResult] = {}
+
+        # Step 1: Run V1 hybrid (motif-filtered) + motif searches in parallel
+        motif_filters = dict(filters, dominant_motifs=detected_motifs)
+        with ThreadPoolExecutor(max_workers=len(detected_motifs) + 1) as executor:
+            hybrid_fut = executor.submit(
+                v1.search, query, top_k=top_k * 3, expand_parents=True, **motif_filters
+            )
+            motif_futs = {
+                m: executor.submit(v1.motif_search, m, limit=top_k * 3)
+                for m in detected_motifs
+            }
+
+            # Collect V1 hybrid results (base weight = 1.0)
+            try:
+                hybrid_result = hybrid_fut.result(timeout=20)
+                for rank, tile in enumerate(hybrid_result.tiles):
+                    ch = tile.content_hash
+                    if ch:
+                        rrf_scores[ch] = rrf_scores.get(ch, 0) + 1.0 / (k + rank + 1)
+                        obj_map[ch] = tile
+            except Exception as e:
+                log.warning("Motif hybrid search failed: %s", e)
+
+            # Collect Redis+Neo4j motif results (boosted weight = 1.5, amplitude-sorted)
+            for motif_id, fut in motif_futs.items():
+                try:
+                    msr = fut.result(timeout=10)
+                    for rank, tw in enumerate(msr.tiles_with_amplitude):
+                        ch = tw.get("tile_hash", "")
+                        if ch:
+                            rrf_scores[ch] = rrf_scores.get(ch, 0) + 1.5 / (k + rank + 1)
+                            if ch not in obj_map:
+                                obj_map[ch] = TileResult(
+                                    content="",
+                                    score=0.0,
+                                    tile_id=ch,
+                                    scale="search_512",
+                                    source_type="",
+                                    source_file="",
+                                    content_hash=ch,
+                                    platform=tw.get("platform", ""),
+                                    rosetta_summary=tw.get("rosetta_summary", ""),
+                                    dominant_motifs=tw.get("dominant_motifs") or [],
+                                )
+                except Exception as e:
+                    log.warning("Motif search %s failed: %s", motif_id, e)
+
+        if not rrf_scores:
+            # All paths failed — fall back to plain V1-Plus
+            return self._v1_plus_search(
+                query, top_k, instruction=instruction, query_type="motif", v1=v1, **filters
+            )
+
+        # Step 2: Sort by RRF and take candidate pool
+        sorted_hashes = sorted(rrf_scores, key=lambda ch: rrf_scores[ch], reverse=True)
+        candidate_hashes = sorted_hashes[:top_k * 2]
+
+        # Step 3: Lazy V2 metadata overlay
+        v2_meta = self._fetch_v2_metadata([ch for ch in candidate_hashes if ch])
+        tiles = []
+        for ch in candidate_hashes:
+            if ch not in obj_map:
+                continue
+            tile = obj_map[ch]
+            if ch in v2_meta:
+                meta = v2_meta[ch]
+                tile = dc_replace(
+                    tile,
+                    rosetta_summary=meta.get("rosetta_summary") or tile.rosetta_summary,
+                    dominant_motifs=meta.get("dominant_motifs") or tile.dominant_motifs,
+                )
+            tiles.append(dc_replace(tile, score=rrf_scores[ch]))
+
+        # Step 4: Backfill passage content for motif-only tiles (no V1 content)
+        backfill_map: Dict[str, TileResult] = {
+            t.content_hash: t for t in tiles if not t.content and t.content_hash
+        }
+        if backfill_map:
+            self._fill_content(list(backfill_map.keys()), backfill_map)
+            tiles = [
+                backfill_map.get(t.content_hash, t) if not t.content and t.content_hash else t
+                for t in tiles
+            ]
+
+        # Step 5: Rerank
+        try:
+            from isma.src.reranker import get_reranker
+            reranker = get_reranker()
+            if reranker.is_available():
+                tiles = reranker.rerank(query, tiles, instruction=instruction, query_type="motif")
+        except Exception as e:
+            log.debug("Reranker unavailable for motif: %s", e)
+
+        # Dedup + truncate
+        seen: set = set()
+        deduped = []
+        for tile in tiles:
+            key = tile.content_hash or id(tile)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(tile)
+
+        result_tiles = deduped[:top_k]
+        return {
+            "query": query,
+            "tiles": result_tiles,
+            "total_tokens": sum(t.token_count for t in result_tiles),
+            "hmm_reranked": True,
+            "version": "v1plus_motif",
+        }
+
+    def _fetch_v2_metadata(self, content_hashes: List[str]) -> Dict[str, dict]:
+        """Batch-fetch rosetta_summary and dominant_motifs from V2 by content_hash.
+
+        Uses OR-filter batches of 50 to stay within GraphQL complexity limits.
+        Returns dict: content_hash → {rosetta_summary, dominant_motifs}
+        """
+        result: Dict[str, dict] = {}
+        batch_size = 50
+        for i in range(0, len(content_hashes), batch_size):
+            batch = content_hashes[i:i + batch_size]
+            if len(batch) == 1:
+                where = (
+                    f'{{ path: ["content_hash"], operator: Equal, '
+                    f'valueText: "{_escape_gql(batch[0])}" }}'
+                )
+            else:
+                operands = ", ".join(
+                    f'{{ path: ["content_hash"], operator: Equal, valueText: "{_escape_gql(ch)}" }}'
+                    for ch in batch
+                )
+                where = f'{{ operator: Or, operands: [{operands}] }}'
+            q = (
+                f'{{ Get {{ {V2_CLASS}('
+                f'where: {where}'
+                f' limit: {len(batch)}'
+                f') {{ content_hash rosetta_summary dominant_motifs }} }} }}'
+            )
+            try:
+                data = _graphql(q)
+                for obj in data.get("data", {}).get("Get", {}).get(V2_CLASS, []):
+                    ch = obj.get("content_hash", "")
+                    if ch:
+                        result[ch] = obj
+            except Exception as e:
+                log.debug("V2 metadata fetch failed for batch %d: %s", i // batch_size, e)
         return result
 
     def _search_relational(
