@@ -301,19 +301,26 @@ def run_streaming_ingest(model, tokenizer, scale: str, limit: int,
         """Submit batch write to thread pool, return future."""
         return io_pool.submit(ingest_batch, tiles, vectors)
 
-    # --- Prefetch first page ---
-    try:
-        first_objects = fetch_page(cursor)
-        if first_objects:
-            cursor = first_objects[-1]["id"]
-            scanned += len(first_objects)
-            if len(first_objects) < 500:
-                fetch_exhausted = True
-            fetch_buf.extend(first_objects)
-    except Exception as e:
-        log.error(f"Initial fetch error: {e}")
-        io_pool.shutdown(wait=False)
-        return
+    # --- Prefetch first page (with retry) ---
+    for attempt in range(6):
+        try:
+            first_objects = fetch_page(cursor)
+            if first_objects:
+                cursor = first_objects[-1]["id"]
+                scanned += len(first_objects)
+                if len(first_objects) < 500:
+                    fetch_exhausted = True
+                fetch_buf.extend(first_objects)
+            break
+        except Exception as e:
+            wait = 15 * (2 ** attempt)
+            log.warning(f"Initial fetch error (attempt {attempt+1}/6, retry in {wait}s): {e}")
+            if attempt < 5:
+                time.sleep(wait)
+            else:
+                log.error("Initial fetch failed after 6 attempts — aborting")
+                io_pool.shutdown(wait=False)
+                return
 
     # --- Main pipeline loop ---
     pending_write: Future | None = None
@@ -396,16 +403,25 @@ def get_existing_source_uuids() -> set:
                 {PILOT_CLASS}(limit: {page_size} offset: {offset}) {{ source_uuid }}
             }}
         }}"""
-        try:
-            r = requests.post(
-                f"{WEAVIATE_URL}/v1/graphql",
-                json={"query": gql},
-                timeout=30,
-            )
-            results = r.json().get("data", {}).get("Get", {}).get(PILOT_CLASS, []) or []
-        except Exception as e:
-            log.warning(f"Could not fetch existing UUIDs at offset {offset}: {e}")
+        fetched = None
+        for attempt in range(4):
+            try:
+                r = requests.post(
+                    f"{WEAVIATE_URL}/v1/graphql",
+                    json={"query": gql},
+                    timeout=120,
+                )
+                fetched = r.json().get("data", {}).get("Get", {}).get(PILOT_CLASS, []) or []
+                break
+            except Exception as e:
+                wait = 20 * (2 ** attempt)
+                log.warning(f"Could not fetch existing UUIDs at offset {offset} (attempt {attempt+1}/4, retry in {wait}s): {e}")
+                if attempt < 3:
+                    time.sleep(wait)
+        if fetched is None:
+            log.warning(f"UUID fetch failed at offset {offset} — using partial dedup set ({len(all_uuids)} uuids)")
             break
+        results = fetched
         if not results:
             break
         for t in results:
