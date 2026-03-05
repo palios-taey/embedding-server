@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from isma.src.retrieval import ISMARetrieval, SearchResult, TileResult
+from isma.src.retrieval_v2 import ISMARetrievalV2
 
 
 # =============================================================================
@@ -91,12 +92,28 @@ def dedup_ratio(tiles: List[TileResult], k: int) -> float:
     return unique / len(top_k)
 
 
+def motif_precision_at_k(tiles: List[TileResult], expected_motifs: List[str], k: int) -> float:
+    """Fraction of top-k tiles that contain at least one expected motif.
+
+    Uses dominant_motifs field — measures whether motif routing returned
+    motif-relevant tiles rather than random semantic matches.
+    """
+    if not expected_motifs or not tiles:
+        return -1.0
+    expected_set = set(expected_motifs)
+    hits = sum(
+        1 for t in tiles[:k]
+        if expected_set & set(t.dominant_motifs or [])
+    )
+    return hits / min(k, len(tiles))
+
+
 # =============================================================================
 # QUERY RUNNER
 # =============================================================================
 
 def run_query(retrieval: ISMARetrieval, query_def: Dict[str, Any],
-              top_k: int = 10) -> Dict[str, Any]:
+              top_k: int = 10, v2: Optional["ISMARetrievalV2"] = None) -> Dict[str, Any]:
     """Run a single benchmark query and compute metrics."""
     query = query_def["query"]
     category = query_def["category"]
@@ -111,52 +128,15 @@ def run_query(retrieval: ISMARetrieval, query_def: Dict[str, Any],
     t0 = time.monotonic()
 
     if category == "motif":
-        # Motif queries use motif_search for the first motif, then vector search
+        # Motif queries use ISMARetrievalV2.adaptive_search() which routes
+        # motif-classified queries through _search_motif() (V1 motif-filtered
+        # hybrid + Redis/Neo4j amplitude sort + RRF + reranker).
+        # Scored by motif_precision@10: fraction of results containing expected motif.
         expected_motifs = query_def.get("expected_motifs", [])
-        min_amp = query_def.get("min_amplitude", 0.5)
-
-        # Run motif search for primary motif
-        motif_result = None
-        if expected_motifs:
-            motif_result = retrieval.motif_search(
-                expected_motifs[0], min_amplitude=min_amp, limit=top_k * 2
-            )
-
-        # Also run vector search for the query text
-        search_result = retrieval.search(query, top_k=top_k * 2, **filters)
-
-        # Combine: motif tiles first, then vector results (deduped)
-        seen_hashes = set()
-        combined_tiles = []
-
-        if motif_result and motif_result.tile_hashes:
-            # Fetch tile content from Weaviate for motif results
-            for tile_info in motif_result.tiles_with_amplitude[:top_k]:
-                th = tile_info["tile_hash"]
-                if th not in seen_hashes:
-                    seen_hashes.add(th)
-                    # Create a minimal TileResult from motif data
-                    combined_tiles.append(TileResult(
-                        content=tile_info.get("rosetta_summary", ""),
-                        score=tile_info.get("amplitude", 0),
-                        tile_id="",
-                        scale="",
-                        source_type="",
-                        source_file="",
-                        content_hash=th,
-                        platform=tile_info.get("platform", ""),
-                        rosetta_summary=tile_info.get("rosetta_summary", ""),
-                        dominant_motifs=tile_info.get("dominant_motifs", []),
-                        hmm_enriched=True,
-                    ))
-
-        for tile in search_result.tiles:
-            if tile.content_hash not in seen_hashes:
-                seen_hashes.add(tile.content_hash)
-                combined_tiles.append(tile)
-
-        tiles = combined_tiles[:top_k]
-        latency_ms = (time.monotonic() - t0) * 1000
+        _v2 = v2 or ISMARetrievalV2()
+        result = _v2.adaptive_search(query, top_k=top_k, **filters)
+        tiles = result.get("tiles", [])
+        latency_ms = result.get("search_time_ms", (time.monotonic() - t0) * 1000)
 
     else:
         # All other categories: use hybrid_retrieve_hmm
@@ -171,24 +151,49 @@ def run_query(retrieval: ISMARetrieval, query_def: Dict[str, Any],
         latency_ms = hmm_result.get("search_time_ms", (time.monotonic() - t0) * 1000)
 
     # Compute metrics
-    result = {
-        "query_id": query_def["id"],
-        "category": category,
-        "difficulty": query_def.get("difficulty", "medium"),
-        "query": query,
-        "latency_ms": round(latency_ms, 2),
-        "num_results": len(tiles),
-        "recall_5": round(recall_at_k([], expected_content, tiles, 5), 4),
-        "recall_10": round(recall_at_k([], expected_content, tiles, 10), 4),
-        "mrr": round(mrr(expected_content, tiles), 4),
-        "precision_5": round(precision_at_k(expected_content, tiles, 5), 4),
-        "precision_10": round(precision_at_k(expected_content, tiles, 10), 4),
-        "dedup_5": round(dedup_ratio(tiles, 5), 4),
-        "dedup_10": round(dedup_ratio(tiles, 10), 4),
-        "top_3_hashes": [t.content_hash[:12] for t in tiles[:3]],
-        "top_3_platforms": [t.platform for t in tiles[:3]],
-        "enriched_in_top10": sum(1 for t in tiles[:10] if t.hmm_enriched),
-    }
+    if category == "motif":
+        # Motif: use motif_precision@10 as R@10 (fraction of results containing expected motif)
+        expected_motifs = query_def.get("expected_motifs", [])
+        mp10 = motif_precision_at_k(tiles, expected_motifs, 10)
+        mp5 = motif_precision_at_k(tiles, expected_motifs, 5)
+        result = {
+            "query_id": query_def["id"],
+            "category": category,
+            "difficulty": query_def.get("difficulty", "medium"),
+            "query": query,
+            "latency_ms": round(latency_ms, 2),
+            "num_results": len(tiles),
+            "recall_5": round(mp5, 4),   # motif precision@5 reported as recall_5
+            "recall_10": round(mp10, 4), # motif precision@10 reported as recall_10
+            "mrr": round(mp10, 4),
+            "precision_5": round(mp5, 4),
+            "precision_10": round(mp10, 4),
+            "dedup_5": round(dedup_ratio(tiles, 5), 4),
+            "dedup_10": round(dedup_ratio(tiles, 10), 4),
+            "top_3_hashes": [t.content_hash[:12] for t in tiles[:3]],
+            "top_3_platforms": [t.platform for t in tiles[:3]],
+            "enriched_in_top10": sum(1 for t in tiles[:10] if t.hmm_enriched),
+            "expected_motifs": expected_motifs,
+        }
+    else:
+        result = {
+            "query_id": query_def["id"],
+            "category": category,
+            "difficulty": query_def.get("difficulty", "medium"),
+            "query": query,
+            "latency_ms": round(latency_ms, 2),
+            "num_results": len(tiles),
+            "recall_5": round(recall_at_k([], expected_content, tiles, 5), 4),
+            "recall_10": round(recall_at_k([], expected_content, tiles, 10), 4),
+            "mrr": round(mrr(expected_content, tiles), 4),
+            "precision_5": round(precision_at_k(expected_content, tiles, 5), 4),
+            "precision_10": round(precision_at_k(expected_content, tiles, 10), 4),
+            "dedup_5": round(dedup_ratio(tiles, 5), 4),
+            "dedup_10": round(dedup_ratio(tiles, 10), 4),
+            "top_3_hashes": [t.content_hash[:12] for t in tiles[:3]],
+            "top_3_platforms": [t.platform for t in tiles[:3]],
+            "enriched_in_top10": sum(1 for t in tiles[:10] if t.hmm_enriched),
+        }
 
     return result
 
@@ -346,13 +351,13 @@ def main():
         print(f"\nDry run complete. {len(queries)} queries parsed.")
         return
 
-    # Initialize retrieval
+    # Initialize retrieval (always init V2 for motif queries)
     if args.v2:
         print("Initializing ISMARetrievalV2 (adaptive)...")
-        from isma.src.retrieval_v2 import ISMARetrievalV2
         retrieval_v2 = ISMARetrievalV2()
     else:
         print("Initializing ISMARetrieval...")
+        retrieval_v2 = ISMARetrievalV2()  # needed for motif category regardless
     retrieval = ISMARetrieval()
 
     colbert_retrieval = None
@@ -373,7 +378,7 @@ def main():
             if args.v2:
                 result = run_query_v2(retrieval_v2, q, top_k=args.top_k)
             else:
-                result = run_query(retrieval, q, top_k=args.top_k)
+                result = run_query(retrieval, q, top_k=args.top_k, v2=retrieval_v2)
 
             # ColBERT RRF fusion: re-rank using ColBERT MaxSim + V1 combined
             if colbert_retrieval and not args.v2:
