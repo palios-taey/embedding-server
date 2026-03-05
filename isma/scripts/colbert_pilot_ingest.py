@@ -440,26 +440,31 @@ def ingest_batch(tiles: list, vectors_list: List[List[List[float]]]) -> tuple[in
         })
     if not objects:
         return 0, len(tiles)
-    try:
-        r = requests.post(
-            f"{WEAVIATE_URL}/v1/batch/objects",
-            json={"objects": objects},
-            timeout=300,
-        )
-        if r.status_code not in (200, 201):
-            log.error(f"Batch write failed: {r.status_code} {r.text[:200]}")
-            return 0, len(objects)
-        results = r.json()
-        if isinstance(results, list):
-            ok = sum(1 for res in results if res.get("result", {}).get("status") == "SUCCESS")
-            failed = len(results) - ok
-        else:
-            ok = len(objects)
-            failed = 0
-        return ok, failed
-    except Exception as e:
-        log.error(f"Batch write error: {e}")
-        return 0, len(objects)
+    for attempt in range(5):
+        try:
+            r = requests.post(
+                f"{WEAVIATE_URL}/v1/batch/objects",
+                json={"objects": objects},
+                timeout=300,
+            )
+            if r.status_code not in (200, 201):
+                log.error(f"Batch write failed: {r.status_code} {r.text[:200]}")
+                return 0, len(objects)
+            results = r.json()
+            if isinstance(results, list):
+                ok = sum(1 for res in results if res.get("result", {}).get("status") == "SUCCESS")
+                failed = len(results) - ok
+            else:
+                ok = len(objects)
+                failed = 0
+            return ok, failed
+        except Exception as e:
+            wait = 10 * (2 ** attempt)
+            log.warning(f"Batch write error (attempt {attempt+1}/5, retry in {wait}s): {e}")
+            if attempt < 4:
+                time.sleep(wait)
+    log.error(f"Batch write failed after 5 attempts — dropping {len(objects)} tiles")
+    return 0, len(objects)
 
 
 # =============================================================================
