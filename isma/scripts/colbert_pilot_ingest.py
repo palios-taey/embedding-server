@@ -391,45 +391,41 @@ def get_redis():
 def get_existing_source_uuids() -> set:
     """Return set of source_uuids already ingested (dedup by source tile UUID, not content_hash).
 
-    This allows multiple entries per content_hash (different passages from same document)
-    while preventing re-ingestion of the same source tile on resume.
+    Uses cursor-based REST pagination (O(1) per page) — NOT offset pagination
+    which is O(N) per page and causes Weaviate timeouts on 193K+ records.
     """
     all_uuids = set()
-    offset = 0
+    cursor = None
     page_size = 2000
     while True:
-        gql = f"""{{
-            Get {{
-                {PILOT_CLASS}(limit: {page_size} offset: {offset}) {{ source_uuid }}
-            }}
-        }}"""
+        url = f"{WEAVIATE_URL}/v1/objects?class={PILOT_CLASS}&limit={page_size}"
+        if cursor:
+            url += f"&after={cursor}"
         fetched = None
         for attempt in range(4):
             try:
-                r = requests.post(
-                    f"{WEAVIATE_URL}/v1/graphql",
-                    json={"query": gql},
-                    timeout=120,
-                )
-                fetched = r.json().get("data", {}).get("Get", {}).get(PILOT_CLASS, []) or []
+                r = requests.get(url, timeout=60)
+                fetched = r.json().get("objects", []) or []
                 break
             except Exception as e:
                 wait = 20 * (2 ** attempt)
-                log.warning(f"Could not fetch existing UUIDs at offset {offset} (attempt {attempt+1}/4, retry in {wait}s): {e}")
+                log.warning(f"Could not fetch existing UUIDs at cursor={cursor} (attempt {attempt+1}/4, retry in {wait}s): {e}")
                 if attempt < 3:
                     time.sleep(wait)
         if fetched is None:
-            log.warning(f"UUID fetch failed at offset {offset} — using partial dedup set ({len(all_uuids)} uuids)")
+            log.warning(f"UUID fetch failed — using partial dedup set ({len(all_uuids)} uuids)")
             break
-        results = fetched
-        if not results:
+        if not fetched:
             break
-        for t in results:
-            if t.get("source_uuid"):
-                all_uuids.add(t["source_uuid"])
-        if len(results) < page_size:
+        for obj in fetched:
+            uuid = obj.get("properties", {}).get("source_uuid")
+            if uuid:
+                all_uuids.add(uuid)
+        if len(fetched) < page_size:
             break
-        offset += len(results)
+        cursor = fetched[-1]["id"]
+        if len(all_uuids) % 20000 == 0 and len(all_uuids) > 0:
+            log.info(f"  Dedup scan: {len(all_uuids)} uuids loaded...")
     log.info(f"Found {len(all_uuids)} already-ingested source tiles")
     return all_uuids
 
