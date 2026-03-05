@@ -184,12 +184,6 @@ def create_class():
                         "enabled": True,
                         "aggregation": "maxSim",
                     },
-                    "sq": {
-                        "enabled": True,
-                        "rescoreLimit": 20,
-                    },
-                    "efConstruction": 128,
-                    "maxConnections": 16,
                 },
                 "vectorizer": {"none": {}},
             }
