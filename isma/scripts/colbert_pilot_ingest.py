@@ -21,6 +21,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import List, Optional
 
+import os
+
 import requests
 import torch
 import torch.nn.functional as F
@@ -32,7 +34,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-WEAVIATE_URL = "http://192.168.100.10:8088"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
 PILOT_CLASS = "ISMA_ColBERT_Pilot"
 SOURCE_CLASS = "ISMA_Quantum"
 
@@ -380,7 +382,9 @@ def run_streaming_ingest(model, tokenizer, scale: str, limit: int,
 def get_redis():
     try:
         import redis
-        r = redis.Redis(host="192.168.100.10", port=6379, decode_responses=True)
+        redis_host = os.environ.get("REDIS_HOST", "192.168.100.10")
+        redis_port = int(os.environ.get("REDIS_PORT", "6379"))
+        r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
         r.ping()
         return r
     except Exception:
