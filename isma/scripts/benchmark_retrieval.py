@@ -33,21 +33,29 @@ from isma.src.retrieval_v2 import ISMARetrievalV2
 # METRICS
 # =============================================================================
 
+def _tile_text(tile: "TileResult") -> str:
+    """Build searchable text for a tile: content + rosetta_summary + dominant_motifs.
+
+    dominant_motifs (e.g. ['HMM.SACRED_TRUST']) are included so that expected_content
+    terms like 'SACRED_TRUST' match even when they don't appear verbatim in the prose.
+    Term check: 'sacred_trust' is a substring of 'hmm.sacred_trust' → correct match.
+    """
+    motif_text = " ".join(tile.dominant_motifs or [])
+    return ((tile.content or "") + " " + (tile.rosetta_summary or "") + " " + motif_text).lower()
+
+
 def recall_at_k(retrieved_hashes: List[str], expected_content: List[str],
                 tiles: List[TileResult], k: int) -> float:
     """Fraction of expected content terms found in top-k tiles.
 
-    Each tile is scored independently (max 2000 chars) to prevent
-    cross-tile boundary matches from inflating recall.
+    Each tile is scored independently (max 2000 chars content+rosetta, full motifs)
+    to prevent cross-tile boundary matches from inflating recall.
     """
     if not expected_content:
         return -1.0  # No ground truth available
 
-    # Build per-tile text (capped at 2000 chars for V1/V2 parity)
-    tile_texts = [
-        ((t.content or "") + " " + (t.rosetta_summary or "")).lower()[:2000]
-        for t in tiles[:k]
-    ]
+    # Build per-tile text (content+rosetta capped at 2000 chars, motifs uncapped)
+    tile_texts = [_tile_text(t)[:2000] for t in tiles[:k]]
     # A term is "found" if ANY individual tile contains it
     found = sum(
         1 for term in expected_content
@@ -62,7 +70,7 @@ def mrr(expected_content: List[str], tiles: List[TileResult]) -> float:
         return -1.0
 
     for i, tile in enumerate(tiles):
-        text = ((tile.content or "") + " " + (tile.rosetta_summary or "")).lower()[:2000]
+        text = _tile_text(tile)[:2000]
         if any(term.lower() in text for term in expected_content):
             return 1.0 / (i + 1)
     return 0.0
@@ -76,7 +84,7 @@ def precision_at_k(expected_content: List[str], tiles: List[TileResult],
 
     relevant = 0
     for tile in tiles[:k]:
-        text = ((tile.content or "") + " " + (tile.rosetta_summary or "")).lower()[:2000]
+        text = _tile_text(tile)[:2000]
         if any(term.lower() in text for term in expected_content):
             relevant += 1
     return relevant / min(k, len(tiles)) if tiles else 0.0
