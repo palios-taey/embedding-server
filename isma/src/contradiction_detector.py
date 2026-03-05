@@ -27,7 +27,8 @@ from neo4j import GraphDatabase
 
 log = logging.getLogger(__name__)
 
-NEO4J_URI = "bolt://192.168.100.10:7689"
+import os as _os
+NEO4J_URI = _os.environ.get("NEO4J_URI", "bolt://10.0.0.163:7689")
 
 # Minimum reranker score to confirm a contradiction
 CONTRADICTION_THRESHOLD = 0.3

@@ -23,7 +23,8 @@ from .motifs import MotifAssignment, DICTIONARY_VERSION
 log = logging.getLogger(__name__)
 
 # Neo4j connection (same as ISMA - shared instance)
-NEO4J_URI = "bolt://192.168.100.10:7689"
+import os as _os
+NEO4J_URI = _os.environ.get("NEO4J_URI", "bolt://10.0.0.163:7689")
 
 # Shared driver singleton — avoids creating new connection pools per request
 _shared_driver = None
