@@ -563,14 +563,14 @@ class ISMARetrievalV2:
 
         # Route to strategy
         if strategy == "relational" and plan.sub_queries:
-            # V1-Plus: treat relational like conceptual — V1 hybrid + V2 overlay + reranker.
-            # Sub-query decomposition + graph expansion showed no recall gain vs V1 baseline
-            # and added 7-10s latency. _v1_plus_search targets ≥0.4375 (V1 baseline).
-            result = self._v1_plus_search(
-                query, top_k,
+            # V1-Plus: use _search_relational with graph expansion (depth=3).
+            # Graph densification v2 (52.8M RELATES_TO edges) makes this viable —
+            # was disabled before densification when graph was too sparse to help.
+            result = self._search_relational(
+                query, plan.sub_queries, top_k,
                 instruction=plan.reranker_instruction,
-                query_type="relational",
-                v1=v1,
+                expand_graph=True,
+                graph_depth=3,
                 **merged_filters,
             )
         elif strategy == "motif" and plan.detected_motifs:
