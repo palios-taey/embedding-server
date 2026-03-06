@@ -674,8 +674,15 @@ class ISMARetrieval:
                             total_tokens=sum(t.token_count for t in tiles))
 
     def search_bm25(self, query: str, top_k: int = 10,
+                    properties: List[str] = None,
                     **filters) -> SearchResult:
-        """BM25 keyword search (no vectors, fast)."""
+        """BM25 keyword search (no vectors, fast).
+
+        Args:
+            properties: Optional list of property names to search. If None,
+                searches all text properties. Supports boost syntax like
+                "rosetta_summary^2" for weighted fields.
+        """
         where = _build_where_filter(**filters)
         props = " ".join(TILE_PROPERTIES)
         safe_q = _escape_graphql(query)
@@ -687,10 +694,16 @@ class ISMARetrieval:
         if filter_str:
             filter_str = ", " + filter_str
 
+        # Optional property-scoped BM25 search
+        bm25_props = ""
+        if properties:
+            prop_list = ", ".join(f'"{p}"' for p in properties)
+            bm25_props = f", properties: [{prop_list}]"
+
         gql = f"""{{
             Get {{
                 {WEAVIATE_CLASS}(
-                    bm25: {{ query: "{safe_q}" }}
+                    bm25: {{ query: "{safe_q}"{bm25_props} }}
                     limit: {top_k}
                     {filter_str}
                 ) {{
