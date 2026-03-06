@@ -405,6 +405,12 @@ def v2_search(req: V2SearchRequest):
 
 @app.post("/v2/search/hmm")
 def v2_search_hmm(req: V2SearchRequest):
+    """V1-Plus adaptive search. Formerly called hybrid_search() (V1 only).
+
+    Fixed (2026-03-06 Phase 6B close): ChatGPT audit found hybrid_search() bypasses
+    adaptive_search() — production path ≠ benchmarked path. Now routes to adaptive_search()
+    for consistent V1-Plus behavior (query classification, motif routing, temporal decay).
+    """
     from isma.src.retrieval_v2 import get_retrieval_v2
     r = get_retrieval_v2()
 
@@ -417,12 +423,9 @@ def v2_search_hmm(req: V2SearchRequest):
         if val is not None:
             filters[field_name] = val
 
-    result = r.hybrid_search(
+    result = r.adaptive_search(
         req.query,
         top_k=req.top_k,
-        rerank=req.rerank,
-        query_type=req.query_type,
-        instruction=req.instruction or "",
         **filters,
     )
 
