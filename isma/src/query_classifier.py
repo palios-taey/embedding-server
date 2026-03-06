@@ -487,10 +487,10 @@ def _extract_temporal_window(q: str) -> Optional[Dict[str, str]]:
     """Extract time window from temporal query."""
     window = {}
 
-    # Match "MONTH YEAR" patterns
+    # Match "MONTH [DAY] YEAR" patterns (e.g., "December 2025", "December 17 2025")
     month_year = re.search(
         r"\b(january|february|march|april|may|june|july|august|september|october|november|december"
-        r"|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\s+(20\d{2})\b",
+        r"|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\s+(?:\d{1,2}\s+)?(20\d{2})\b",
         q, re.IGNORECASE,
     )
     if month_year:

@@ -417,13 +417,14 @@ def _build_where_filter(
     if min_hmm_trust is not None:
         conditions.append(
             f'{{ path: ["hmm_trust"], operator: GreaterThanEqual, valueNumber: {min_hmm_trust} }}')
-    # 6C.1 Temporal prefilter — uses loaded_at text field (ISO 8601, lexicographic order works)
+    # 6C.2 Temporal prefilter — uses timestamp field (source conversation time, not ingest time)
+    # ISO 8601 format means lexicographic string comparison gives correct date ordering
     if time_after:
         conditions.append(
-            f'{{ path: ["loaded_at"], operator: GreaterThanEqual, valueText: "{_escape_graphql(time_after)}" }}')
+            f'{{ path: ["timestamp"], operator: GreaterThanEqual, valueText: "{_escape_graphql(time_after)}" }}')
     if time_before:
         conditions.append(
-            f'{{ path: ["loaded_at"], operator: LessThan, valueText: "{_escape_graphql(time_before)}" }}')
+            f'{{ path: ["timestamp"], operator: LessThan, valueText: "{_escape_graphql(time_before)}" }}')
 
     if not conditions:
         return None

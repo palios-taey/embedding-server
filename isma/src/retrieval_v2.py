@@ -66,7 +66,7 @@ V2_PROPS_STR = " ".join(V2_PROPERTIES)
 # 6C.1 Query-aware alpha bands — BM25/dense weighting per query type
 # alpha=0.0 → pure BM25, alpha=1.0 → pure vector
 ALPHA_BANDS = {
-    "exact": 0.0,       # Pure BM25 — no dense vector dilution (Gemini/Family consensus)
+    "exact": 0.3,       # Balanced — pure BM25 (0.0) fails on queries with common words
     "temporal": 0.3,    # Moderate vector — BM25 still important for date terms
     "conceptual": 0.65, # Same as default — alpha=0.8 regressed conceptual by -0.046
     "relational": 0.5,  # Balanced — graph does heavy lifting
@@ -570,17 +570,21 @@ class ISMARetrievalV2:
         if plan.detected_platform and "platform" not in merged_filters:
             merged_filters["platform"] = plan.detected_platform
 
-        # 6C.1 Temporal prefilter: DISABLED — loaded_at is ingest time, not source time.
-        # Queries for "December 2025" or "January 2026" return 0 candidates because
-        # tiles were ingested at different times than their content dates.
-        # TODO 6C.2: Parse session_id → source_date DATE property, then enable.
-        # The temporal_window is still used for post-hoc temporal decay weighting.
-        # if strategy == "temporal" and plan.temporal_window:
-        #     tw = plan.temporal_window
-        #     if tw.get("after") and "time_after" not in merged_filters:
-        #         merged_filters["time_after"] = tw["after"]
-        #     if tw.get("before") and "time_before" not in merged_filters:
-        #         merged_filters["time_before"] = tw["before"]
+        # 6C.2 Temporal prefilter — uses `timestamp` field (source conversation time)
+        # instead of `loaded_at` (ingest time). ISO 8601 lexicographic comparison works.
+        if strategy == "temporal" and plan.temporal_window:
+            tw = plan.temporal_window
+            if tw.get("after") and "time_after" not in merged_filters:
+                merged_filters["time_after"] = tw["after"]
+            if tw.get("before") and "time_before" not in merged_filters:
+                merged_filters["time_before"] = tw["before"]
+            # "recent"/"latest" → last 30 days from now
+            if tw.get("recent") and "time_after" not in merged_filters:
+                from datetime import datetime, timedelta
+                days = int(tw["recent"].rstrip("d"))
+                merged_filters["time_after"] = (
+                    datetime.utcnow() - timedelta(days=days)
+                ).strftime("%Y-%m-%d")
 
         v1 = get_retrieval()
 
@@ -701,9 +705,23 @@ class ISMARetrievalV2:
 
         fetch_k = top_k * 3
 
-        # 6C.1: Query-aware alpha — use per-type band if not explicitly set
+        # 6C.2: Dynamic alpha — base band adjusted by stop-word ratio for exact queries
+        # Queries with high stop-word content (e.g., "SOUL equals INFRA equals...") need
+        # more vector weight since BM25 is polluted by common words.
         if alpha is None:
             alpha = ALPHA_BANDS.get(query_type, ALPHA_BANDS["default"])
+            if query_type == "exact":
+                import re
+                _STOP = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be',
+                         'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
+                         'from', 'as', 'into', 'about', 'equals', 'equal',
+                         'divided', 'between', 'and', 'or', 'not', 'but'}
+                words = re.findall(r'[a-zA-Z]+', query.lower())
+                if words:
+                    stop_ratio = sum(1 for w in words if w in _STOP) / len(words)
+                    # Blend: alpha goes from 0.3 (0% stops) to 0.65 (50%+ stops)
+                    alpha = 0.3 + stop_ratio * 0.7  # capped by max alpha of ~0.65
+                    alpha = min(alpha, 0.65)
 
         # Step 1: V1 vector + BM25 search with query-aware alpha
         # 6C.1: Pass semantic_query as vector_query for temporal token stripping
@@ -718,6 +736,29 @@ class ISMARetrievalV2:
                 "hmm_reranked": False, "version": "v1plus",
                 "diagnostics": {"candidate_count": 0},
             }
+
+        # 6C.2: BM25 supplementary lane for exact queries
+        # Hybrid search may miss keyword-only matches; pure BM25 lane widens pool
+        bm25_lane_count = 0
+        if query_type == "exact":
+            try:
+                bm25_result = v1.search_bm25(query, top_k=fetch_k, **filters)
+                if bm25_result.tiles:
+                    existing_hashes = {t.content_hash for t in search_result.tiles if t.content_hash}
+                    new_bm25_tiles = [
+                        t for t in bm25_result.tiles
+                        if t.content_hash and t.content_hash not in existing_hashes
+                    ]
+                    if new_bm25_tiles:
+                        bm25_lane_count = len(new_bm25_tiles)
+                        merged = list(search_result.tiles) + new_bm25_tiles[:10]
+                        search_result = SearchResult(
+                            query=search_result.query, tiles=merged,
+                            total_tokens=sum(t.token_count for t in merged),
+                            search_time_ms=search_result.search_time_ms,
+                        )
+            except Exception as e:
+                log.debug("BM25 lane failed: %s", e)
 
         # 6C.1: V2 rosetta supplementary lane for conceptual queries
         rosetta_lane_count = 0
@@ -805,6 +846,7 @@ class ISMARetrievalV2:
             "reranked_hashes": post_rerank_hashes,
             "alpha": alpha,
             "rosetta_lane_count": rosetta_lane_count,
+            "bm25_lane_count": bm25_lane_count,
         }
 
         return {
