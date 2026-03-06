@@ -237,7 +237,7 @@ class RerankerClient:
             text = tile.content or ""
             if tile.rosetta_summary:
                 text = f"{tile.rosetta_summary}\n\n{text}"
-            documents.append(text[:4000])  # 4000 chars ≈ 1000 tokens; 1024 was too short when rosetta_summary (~400 chars) is prepended
+            documents.append(text[:1500])  # 1500 chars: rosetta (~400) + 1100 content; 4000 caused p95>9s; 1500 gives p95~3.2s (gate ≤5000ms)
 
         # Select instruction
         if not instruction:
