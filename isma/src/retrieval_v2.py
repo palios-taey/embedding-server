@@ -1327,21 +1327,29 @@ class ISMARetrievalV2:
         content_hashes: List[str],
         v1,
     ) -> List:
-        """Fetch V1 search_512 tiles by content_hash for rosetta lane candidates.
+        """Fetch V1 search_512 tiles by content_hash — parallel.
 
-        Returns TileResult list for content_hashes found in V1.
-        Used by the 6C.1 rosetta supplementary lane.
+        Returns one TileResult per unique content_hash found.
+        Uses ThreadPoolExecutor for concurrent fetches.
         """
         if not content_hashes:
             return []
-        tiles = []
-        for ch in content_hashes:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _fetch_one(ch):
             try:
                 ch_tiles = v1.get_tiles_for_content(ch, scale="search_512")
-                if ch_tiles:
-                    tiles.append(ch_tiles[0])  # Best (first) tile per hash
+                return ch_tiles[0] if ch_tiles else None
             except Exception:
-                pass
+                return None
+
+        tiles = []
+        with ThreadPoolExecutor(max_workers=min(len(content_hashes), 8)) as pool:
+            futures = {pool.submit(_fetch_one, ch): ch for ch in content_hashes}
+            for fut in as_completed(futures):
+                tile = fut.result()
+                if tile is not None:
+                    tiles.append(tile)
         return tiles
 
     # ── Passage Expansion ───────────────────────────────────────
