@@ -230,14 +230,23 @@ class RerankerClient:
 
         # Build document texts for scoring
         # Rosetta summary first (semantic compression), then content.
-        # 1024 chars tested optimal — larger windows (2048/3000/6000) hurt latency
-        # without improving quality (rosetta already captures key signal).
+        # Query-type-specific content window (tuned empirically via Phase 6B benchmarks):
+        #   exact: 3000 chars — needs full context for precise quotes (4000 was p95>9s; 3000=best)
+        #   temporal: 2000 chars — recall NOT sensitive to window size (tested 2000/3000/4000);
+        #     2000 chosen as minimum-latency option (content selection is the real bottleneck)
+        #   others: 1500 chars — rosetta summary captures semantic signal sufficiently
+        #   NOTE: conceptual tested at 2500c — NO recall improvement. 1500 default retained.
+        _CONTENT_WINDOW = {
+            "exact": 3000,
+            "temporal": 2000,
+        }
+        max_chars = _CONTENT_WINDOW.get(query_type, 1500)
         documents = []
         for tile in tiles:
             text = tile.content or ""
             if tile.rosetta_summary:
                 text = f"{tile.rosetta_summary}\n\n{text}"
-            documents.append(text[:1500])  # 1500 chars: rosetta (~400) + 1100 content; 4000 caused p95>9s; 1500 gives p95~3.2s (gate ≤5000ms)
+            documents.append(text[:max_chars])
 
         # Select instruction
         if not instruction:
