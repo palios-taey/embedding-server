@@ -39,6 +39,42 @@ log = logging.getLogger(__name__)
 
 V2_CLASS = "ISMA_Quantum_v2"
 V1_CLASS = "ISMA_Quantum"
+COLBERT_CLASS = "ISMA_ColBERT"
+
+# Lazy-loaded ColBERT model for MuVera multi-vector queries
+_colbert_model = None
+_colbert_lock = threading.Lock()
+_colbert_available = None  # None = unknown, True/False = checked
+
+
+def _get_colbert_model():
+    """Load ColBERT model lazily (thread-safe, ~1s load on first call)."""
+    global _colbert_model
+    if _colbert_model is not None:
+        return _colbert_model
+    with _colbert_lock:
+        if _colbert_model is not None:
+            return _colbert_model
+        try:
+            from pylate import models
+            _colbert_model = models.ColBERT("lightonai/answerai-colbert-small-v1")
+            log.info("ColBERT model loaded for MuVera queries")
+        except Exception as e:
+            log.warning("ColBERT model unavailable: %s", e)
+    return _colbert_model
+
+
+def _colbert_collection_exists() -> bool:
+    """Check if ISMA_ColBERT collection exists (cached)."""
+    global _colbert_available
+    if _colbert_available is not None:
+        return _colbert_available
+    try:
+        r = requests.get(f"{WEAVIATE_URL}/v1/schema/{COLBERT_CLASS}", timeout=5)
+        _colbert_available = r.status_code == 200
+    except Exception:
+        _colbert_available = False
+    return _colbert_available
 
 # Properties to return from V1 tile searches (needed for TileResult + RRF fusion)
 V1_TILE_PROPS = (
@@ -764,6 +800,28 @@ class ISMARetrievalV2:
             except Exception as e:
                 log.debug("BM25 lane failed: %s", e)
 
+        # 6C.4: ColBERT MuVera lane for exact queries — multi-vector token matching
+        # catches special-char terms that BM25 word tokenization breaks on
+        colbert_lane_count = 0
+        if query_type == "exact" and _colbert_collection_exists():
+            try:
+                colbert_hashes = self._search_colbert(query, top_k=fetch_k)
+                if colbert_hashes:
+                    existing_hashes = {t.content_hash for t in search_result.tiles if t.content_hash}
+                    new_hashes = [h for h in colbert_hashes if h not in existing_hashes]
+                    if new_hashes:
+                        colbert_tiles = self._fetch_v1_tiles_by_hash(new_hashes[:10], v1)
+                        if colbert_tiles:
+                            colbert_lane_count = len(colbert_tiles)
+                            merged = list(search_result.tiles) + colbert_tiles
+                            search_result = SearchResult(
+                                query=search_result.query, tiles=merged,
+                                total_tokens=sum(t.token_count for t in merged),
+                                search_time_ms=search_result.search_time_ms,
+                            )
+            except Exception as e:
+                log.debug("ColBERT lane failed: %s", e)
+
         # 6C.1: V2 rosetta supplementary lane for conceptual queries
         rosetta_lane_count = 0
         if query_type == "conceptual" and self.is_available():
@@ -851,6 +909,7 @@ class ISMARetrievalV2:
             "alpha": alpha,
             "rosetta_lane_count": rosetta_lane_count,
             "bm25_lane_count": bm25_lane_count,
+            "colbert_lane_count": colbert_lane_count,
         }
 
         return {
@@ -1228,6 +1287,40 @@ class ISMARetrievalV2:
                     )
                     filled += 1
         log.debug("Backfilled content for %d/%d graph-expanded tiles", filled, len(content_hashes))
+
+    def _search_colbert(self, query: str, top_k: int = 30) -> List[str]:
+        """Search ISMA_ColBERT with multi-vector query embedding.
+
+        Returns content_hashes ranked by MaxSim (ColBERT late interaction).
+        Uses MuVera FDE for efficient approximate MaxSim in HNSW.
+        """
+        import json as _json
+
+        model = _get_colbert_model()
+        if model is None:
+            return []
+
+        # Encode query as multi-vector
+        emb = model.encode([query], is_query=True)
+        vectors = emb[0]
+        if hasattr(vectors, "tolist"):
+            vectors = vectors.tolist()
+
+        # Named vector nearVector query
+        gql = (
+            f'{{ Get {{ {COLBERT_CLASS}('
+            f'nearVector: {{ vector: {_json.dumps(vectors)}, '
+            f'targetVectors: ["colbert"] }}'
+            f' limit: {top_k}'
+            f') {{ content_hash _additional {{ distance }} }} }} }}'
+        )
+        data = _graphql(gql)
+        results = (
+            data.get("data", {})
+            .get("Get", {})
+            .get(COLBERT_CLASS, [])
+        )
+        return [obj["content_hash"] for obj in results if obj.get("content_hash")]
 
     def _fetch_v1_tiles_by_hash(
         self,
