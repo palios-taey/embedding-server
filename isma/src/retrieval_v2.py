@@ -708,6 +708,7 @@ class ISMARetrievalV2:
         # 6C.2: Dynamic alpha — base band adjusted by stop-word ratio for exact queries
         # Queries with high stop-word content (e.g., "SOUL equals INFRA equals...") need
         # more vector weight since BM25 is polluted by common words.
+        _stop_ratio = 0.0
         if alpha is None:
             alpha = ALPHA_BANDS.get(query_type, ALPHA_BANDS["default"])
             if query_type == "exact":
@@ -718,10 +719,13 @@ class ISMARetrievalV2:
                          'divided', 'between', 'and', 'or', 'not', 'but'}
                 words = re.findall(r'[a-zA-Z]+', query.lower())
                 if words:
-                    stop_ratio = sum(1 for w in words if w in _STOP) / len(words)
+                    _stop_ratio = sum(1 for w in words if w in _STOP) / len(words)
                     # Blend: alpha goes from 0.3 (0% stops) to 0.65 (50%+ stops)
-                    alpha = 0.3 + stop_ratio * 0.7  # capped by max alpha of ~0.65
+                    alpha = 0.3 + _stop_ratio * 0.7
                     alpha = min(alpha, 0.65)
+                    # High stop-word queries also need wider pool (BM25 noise)
+                    if _stop_ratio > 0.3:
+                        fetch_k = top_k * 4
 
         # Step 1: V1 vector + BM25 search with query-aware alpha
         # 6C.1: Pass semantic_query as vector_query for temporal token stripping
