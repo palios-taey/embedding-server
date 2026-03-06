@@ -45,12 +45,12 @@ log = logging.getLogger("store_results")
 # Configuration
 # ============================================================================
 
-WEAVIATE_URL = "http://192.168.100.10:8088"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
 WEAVIATE_CLASS = "ISMA_Quantum"
 REDIS_HOST = "192.168.100.10"
 REDIS_PORT = 6379
-NEO4J_URI = "bolt://192.168.100.10:7689"
-EMBEDDING_URL = "http://192.168.100.10:8091/v1/embeddings"
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://10.0.0.163:7689")
+EMBEDDING_URL = os.environ.get("EMBEDDING_URL", "http://192.168.100.10:8091/v1/embeddings")
 EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
 
 V2_CLASS = "ISMA_Quantum_v2"
