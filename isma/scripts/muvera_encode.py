@@ -72,21 +72,27 @@ def create_collection():
     schema = {
         "class": COLBERT_CLASS,
         "description": "MuVera ColBERT multi-vector encodings for ISMA tiles",
-        "vectorizer": "none",
-        "vectorIndexType": "hnsw",
-        "vectorIndexConfig": {
-            "distance": "cosine",
-            "efConstruction": 128,
-            "maxConnections": 32,
-            "ef": -1,
-            "multivector": {
-                "enabled": True,
-                "aggregation": "maxSim",
-                "muvera": {
-                    "enabled": True,
-                    "ksim": 4,
-                    "dprojections": 16,
-                    "repetitions": 20,
+        "vectorConfig": {
+            "colbert": {
+                "vectorIndexType": "hnsw",
+                "vectorIndexConfig": {
+                    "distance": "cosine",
+                    "efConstruction": 128,
+                    "maxConnections": 32,
+                    "ef": -1,
+                    "multivector": {
+                        "enabled": True,
+                        "aggregation": "maxSim",
+                        "muvera": {
+                            "enabled": True,
+                            "ksim": 4,
+                            "dprojections": 16,
+                            "repetitions": 20,
+                        },
+                    },
+                },
+                "vectorizer": {
+                    "none": {},
                 },
             },
         },
@@ -186,17 +192,15 @@ def get_content_hashes(shard: int = 0, total_shards: int = 1,
 
     # Get all unique content_hashes from source (use search_512 scale for dedup)
     all_hashes = []
-    cursor = None
+    offset = 0
     batch_size = 10000
 
     while True:
-        after_clause = f', after: "{cursor}"' if cursor else ""
         r = _gql(f'''{{ Get {{ {SOURCE_CLASS}(
             limit: {batch_size}
+            offset: {offset}
             where: {{ path: ["scale"], operator: Equal, valueText: "search_512" }}
-            sort: [{{ path: ["content_hash"], order: asc }}]
-            {after_clause}
-        ) {{ content_hash _additional {{ id }} }} }} }}''')
+        ) {{ content_hash }} }} }}''')
         batch = r["data"]["Get"][SOURCE_CLASS]
         if not batch:
             break
@@ -204,7 +208,7 @@ def get_content_hashes(shard: int = 0, total_shards: int = 1,
             ch = obj.get("content_hash")
             if ch and ch not in encoded:
                 all_hashes.append(ch)
-        cursor = batch[-1]["_additional"]["id"]
+        offset += len(batch)
         if len(batch) < batch_size:
             break
 
@@ -224,32 +228,30 @@ def get_content_hashes(shard: int = 0, total_shards: int = 1,
 
 
 def fetch_tile_content(content_hashes: List[str]) -> Dict[str, dict]:
-    """Batch-fetch tile content from source collection."""
-    result = {}
-    for i in range(0, len(content_hashes), 50):
-        batch = content_hashes[i:i + 50]
-        if len(batch) == 1:
-            where = f'{{ path: ["content_hash"], operator: Equal, valueText: "{batch[0]}" }}'
-        else:
-            operands = ", ".join(
-                f'{{ path: ["content_hash"], operator: Equal, valueText: "{ch}" }}'
-                for ch in batch
-            )
-            where = f'{{ operator: Or, operands: [{operands}] }}'
+    """Batch-fetch tile content from source collection.
 
+    Fetches each hash individually to avoid Or-operand limits.
+    Prefers search_512 scale, falls back to any scale with content.
+    """
+    result = {}
+    for i, ch in enumerate(content_hashes):
+        if ch in result:
+            continue
         try:
             r = _gql(f'''{{ Get {{ {SOURCE_CLASS}(
-                where: {where}
-                limit: {len(batch)}
-                sort: [{{ path: ["scale"], order: asc }}]
+                where: {{ path: ["content_hash"], operator: Equal, valueText: "{ch}" }}
+                limit: 5
             ) {{ content_hash content platform scale content_preview
                  rosetta_summary dominant_motifs }} }} }}''')
-            for obj in r["data"]["Get"][SOURCE_CLASS]:
-                ch = obj.get("content_hash")
-                if ch and ch not in result:
-                    result[ch] = obj
+            tiles = r["data"]["Get"][SOURCE_CLASS]
+            if not tiles:
+                continue
+            # Prefer tile with most content
+            best = max(tiles, key=lambda t: len(t.get("content") or ""))
+            result[ch] = best
         except Exception as e:
-            log.warning("Failed to fetch batch %d: %s", i, e)
+            if i < 3:  # Only log first few
+                log.warning("Failed to fetch hash %s: %s", ch[:12], e)
 
     return result
 
@@ -319,7 +321,7 @@ def encode_and_insert(model, content_hashes: List[str]):
                     "scale": tile.get("scale") or "search_512",
                     "encoded_at": now,
                 },
-                "vector": vectors,
+                "vectors": {"colbert": vectors},
             }
             objects.append(obj)
 
