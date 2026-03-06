@@ -325,6 +325,94 @@ def estimate_full_tokens(content_hash: str) -> int:
 
 
 # ============================================================================
+# Direct Weaviate Fallback (for tiles not captured by theme index)
+# ============================================================================
+
+# Weaviate offset pagination cursor — persisted in Redis so multiple workers
+# don't re-fetch the same pages
+_WEAVIATE_OFFSET_KEY = f"{PFX}weaviate_sweep_offset"
+_WEAVIATE_SWEEP_PAGE = 500  # tiles per page
+
+
+def _sweep_weaviate_direct(n: int = 2000, seen_hashes: set = None) -> list:
+    """Directly paginate ISMA_Quantum for unenriched tiles not in the theme index.
+
+    Used as a fallback when the theme index is exhausted. Fetches up to `n`
+    unique content_hashes, skipping completed/in-progress ones.
+
+    Returns list of dicts: {content_hash, source_file, source_type, token_estimate}
+    """
+    r = get_redis()
+    seen = seen_hashes or set()
+    completed = r.smembers(f"{PFX}completed")
+
+    results = []
+    offset = int(r.get(_WEAVIATE_OFFSET_KEY) or 0)
+    checked = 0
+    max_pages = 200  # safety cap (200 × 500 = 100K tiles checked per call)
+
+    while len(results) < n and checked < max_pages:
+        q = f"""{{
+            Get {{
+                {WEAVIATE_CLASS}(
+                    where: {{
+                        operator: And,
+                        operands: [
+                            {{ path: ["scale"], operator: Equal, valueText: "search_512" }},
+                            {{ path: ["hmm_enriched"], operator: Equal, valueBoolean: false }}
+                        ]
+                    }}
+                    limit: {_WEAVIATE_SWEEP_PAGE}
+                    offset: {offset}
+                ) {{
+                    content_hash source_file source_type token_count
+                }}
+            }}
+        }}"""
+
+        data = weaviate_gql(q, timeout=60)
+        tiles = data.get("Get", {}).get(WEAVIATE_CLASS, [])
+        if not tiles:
+            # Reached end of dataset — reset offset for next round
+            log.info(f"Sweep: reached end at offset {offset}, resetting to 0")
+            r.set(_WEAVIATE_OFFSET_KEY, 0)
+            break
+
+        offset += len(tiles)
+        checked += 1
+
+        # Batch check availability
+        page_hashes = [t["content_hash"] for t in tiles if t.get("content_hash")]
+        new_hashes = [h for h in page_hashes
+                      if h not in seen and h not in completed]
+        if new_hashes:
+            available = batch_check_available(new_hashes)
+            for t in tiles:
+                ch = t.get("content_hash", "")
+                if ch and ch in available and ch not in seen:
+                    results.append({
+                        "content_hash": ch,
+                        "source_file": t.get("source_file", ""),
+                        "source_type": t.get("source_type", ""),
+                        "score": 0.0,
+                        "token_estimate": t.get("token_count", 0) or 0,
+                    })
+                    seen.add(ch)
+                    if len(results) >= n:
+                        break
+
+        if len(results) < n and len(tiles) == _WEAVIATE_SWEEP_PAGE:
+            continue  # more pages available
+        else:
+            break
+
+    # Persist updated offset
+    r.set(_WEAVIATE_OFFSET_KEY, offset)
+    log.info(f"Sweep: found {len(results)} items after checking {checked} pages (offset now {offset})")
+    return results
+
+
+# ============================================================================
 # Package Building
 # ============================================================================
 
@@ -429,9 +517,64 @@ def build_package(platform: str) -> str:
     tried_themes = set()
     primary_theme_data = None
 
+    used_sweep = False  # Track whether we've fallen back to direct sweep
+
     while actual_tokens < content_budget * 0.8:  # Keep filling until 80%+ of budget
         theme_key, theme_data = select_theme(exclude_ids=tried_themes)
         if not theme_data:
+            # Theme index exhausted — fall back to direct Weaviate sweep
+            if not used_sweep:
+                log.info("Theme index exhausted — falling back to direct Weaviate sweep")
+                sweep_items = _sweep_weaviate_direct(n=500, seen_hashes=seen_hashes)
+                if sweep_items:
+                    used_sweep = True
+                    # Use a synthetic theme_data for sweep items
+                    primary_theme_data = primary_theme_data or {
+                        "theme_id": "sweep",
+                        "display_name": "Direct Sweep",
+                        "description": "Tiles not captured by thematic nearVector search",
+                        "required_motifs": [],
+                        "supporting_motifs": [],
+                        "anchor_rosettas": [],
+                    }
+                    themes_used.append("sweep (direct)")
+                    added_sweep = 0
+                    for item in sweep_items:
+                        ch = item["content_hash"]
+                        if ch in seen_hashes:
+                            continue
+                        seen_hashes.add(ch)
+                        content = fetch_full_content(ch)
+                        if not content:
+                            continue
+                        content_tokens = int(len(content) / CHARS_PER_TOKEN)
+                        if content_tokens > content_budget:
+                            skipped_large += 1
+                            continue
+                        remaining = content_budget - actual_tokens
+                        if content_tokens > remaining and len(pkg_items) >= 1:
+                            break
+                        meta = get_item_metadata(ch)
+                        src_type = item.get("source_type", meta.get("source_type", ""))
+                        item_type = "TRANSCRIPT" if src_type == "transcript" else "CORPUS"
+                        pkg_items.append({
+                            "type": item_type,
+                            "content_hash": ch,
+                            "source_file": item.get("source_file", meta.get("source_file", "")),
+                            "platform": meta.get("platform", ""),
+                            "session_id": meta.get("session_id", ""),
+                            "exchange_index": meta.get("exchange_index"),
+                            "content": content,
+                            "token_count": content_tokens,
+                            "score": 0.0,
+                        })
+                        actual_tokens += content_tokens
+                        added_sweep += 1
+                        if actual_tokens >= content_budget:
+                            break
+                    log.info(f"  Sweep added {added_sweep} items")
+                else:
+                    log.info("Sweep found no new items — queue truly empty")
             break
         theme_id = theme_data["theme_id"]
         tried_themes.add(theme_id)
