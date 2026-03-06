@@ -176,6 +176,7 @@ class QueryPlan:
     detected_platform: Optional[str] = None
     temporal_window: Optional[Dict[str, str]] = None  # {after, before}
     sub_queries: List[str] = field(default_factory=list)  # For multi-hop decomposition
+    semantic_query: Optional[str] = None  # Query with temporal tokens stripped (6C.1)
 
 
 def classify_query(query: str) -> QueryPlan:
@@ -231,9 +232,10 @@ def classify_query(query: str) -> QueryPlan:
     # Extract motifs
     plan.detected_motifs = _detect_motifs(q_lower)
 
-    # Extract temporal window
+    # Extract temporal window and strip temporal tokens from embedding query
     if best == "temporal":
         plan.temporal_window = _extract_temporal_window(q_lower)
+        plan.semantic_query = _strip_temporal_tokens(query)
 
     # Decompose multi-hop queries
     if best == "relational":
@@ -441,6 +443,44 @@ def _detect_motifs(q: str) -> List[str]:
         if keyword in q and motif_id not in motifs:
             motifs.append(motif_id)
     return motifs
+
+
+def _strip_temporal_tokens(query: str) -> str:
+    """Strip temporal phrases from query before embedding (6C.1).
+
+    Removes month names, year numbers, and date phrases so the embedding
+    focuses on semantic content, not temporal tokens.
+    "What happened in January 2026 with infrastructure" → "What happened with infrastructure"
+    """
+    # Strip month+year patterns ("January 2026", "Jan 2026")
+    stripped = re.sub(
+        r"\b(?:january|february|march|april|may|june|july|august|september|"
+        r"october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)"
+        r"\s+\d{1,2}(?:,?\s+\d{4})?\b",
+        "", query, flags=re.IGNORECASE,
+    )
+    stripped = re.sub(
+        r"\b(?:january|february|march|april|may|june|july|august|september|"
+        r"october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)"
+        r"\s+\d{4}\b",
+        "", stripped, flags=re.IGNORECASE,
+    )
+    # Strip standalone year
+    stripped = re.sub(r"\b20\d{2}\b", "", stripped)
+    # Strip standalone month names
+    stripped = re.sub(
+        r"\b(?:january|february|march|april|may|june|july|august|september|"
+        r"october|november|december)\b",
+        "", stripped, flags=re.IGNORECASE,
+    )
+    # Strip temporal prepositions left dangling ("in", "during", "from")
+    stripped = re.sub(r"\b(?:in|during|from|before|after|since)\s+(?=\s|$)", "", stripped)
+    # Collapse whitespace
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    # If stripping removed too much, fall back to original
+    if len(stripped) < 5:
+        return query
+    return stripped
 
 
 def _extract_temporal_window(q: str) -> Optional[Dict[str, str]]:

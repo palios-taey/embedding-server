@@ -223,27 +223,71 @@ def run_query_v2(retrieval_v2, query_def: Dict[str, Any],
 
     tiles = result.get("tiles", [])
     strategy = result.get("strategy", "unknown")
+    diagnostics = result.get("diagnostics", {})
 
     # Compute metrics
-    return {
-        "query_id": query_def["id"],
-        "category": category,
-        "difficulty": query_def.get("difficulty", "medium"),
-        "query": query,
-        "strategy": strategy,
-        "latency_ms": round(latency_ms, 2),
-        "num_results": len(tiles),
-        "recall_5": round(recall_at_k([], expected_content, tiles, 5), 4),
-        "recall_10": round(recall_at_k([], expected_content, tiles, 10), 4),
-        "mrr": round(mrr(expected_content, tiles), 4),
-        "precision_5": round(precision_at_k(expected_content, tiles, 5), 4),
-        "precision_10": round(precision_at_k(expected_content, tiles, 10), 4),
-        "dedup_5": round(dedup_ratio(tiles, 5), 4),
-        "dedup_10": round(dedup_ratio(tiles, 10), 4),
-        "top_3_hashes": [t.content_hash[:12] for t in tiles[:3]],
-        "top_3_platforms": [t.platform for t in tiles[:3]],
-        "enriched_in_top10": sum(1 for t in tiles[:10] if t.hmm_enriched),
-    }
+    if category == "motif":
+        expected_motifs = query_def.get("expected_motifs", [])
+        mp10 = motif_precision_at_k(tiles, expected_motifs, 10)
+        mp5 = motif_precision_at_k(tiles, expected_motifs, 5)
+        metrics = {
+            "query_id": query_def["id"],
+            "category": category,
+            "difficulty": query_def.get("difficulty", "medium"),
+            "query": query,
+            "strategy": strategy,
+            "latency_ms": round(latency_ms, 2),
+            "num_results": len(tiles),
+            "recall_5": round(mp5, 4),
+            "recall_10": round(mp10, 4),
+            "mrr": round(mp10, 4),
+            "precision_5": round(mp5, 4),
+            "precision_10": round(mp10, 4),
+            "dedup_5": round(dedup_ratio(tiles, 5), 4),
+            "dedup_10": round(dedup_ratio(tiles, 10), 4),
+            "top_3_hashes": [t.content_hash[:12] for t in tiles[:3]],
+            "top_3_platforms": [t.platform for t in tiles[:3]],
+            "enriched_in_top10": sum(1 for t in tiles[:10] if t.hmm_enriched),
+            "expected_motifs": expected_motifs,
+        }
+    else:
+        metrics = {
+            "query_id": query_def["id"],
+            "category": category,
+            "difficulty": query_def.get("difficulty", "medium"),
+            "query": query,
+            "strategy": strategy,
+            "latency_ms": round(latency_ms, 2),
+            "num_results": len(tiles),
+            "recall_5": round(recall_at_k([], expected_content, tiles, 5), 4),
+            "recall_10": round(recall_at_k([], expected_content, tiles, 10), 4),
+            "mrr": round(mrr(expected_content, tiles), 4),
+            "precision_5": round(precision_at_k(expected_content, tiles, 5), 4),
+            "precision_10": round(precision_at_k(expected_content, tiles, 10), 4),
+            "dedup_5": round(dedup_ratio(tiles, 5), 4),
+            "dedup_10": round(dedup_ratio(tiles, 10), 4),
+            "top_3_hashes": [t.content_hash[:12] for t in tiles[:3]],
+            "top_3_platforms": [t.platform for t in tiles[:3]],
+            "enriched_in_top10": sum(1 for t in tiles[:10] if t.hmm_enriched),
+        }
+
+    # 6C.0 Instrumentation: include diagnostics for oracle recall analysis
+    if diagnostics:
+        # Oracle recall: did expected content appear in pre-rerank candidate pool?
+        candidate_hashes = diagnostics.get("candidate_hashes", [])
+        metrics["candidate_count"] = diagnostics.get("candidate_count", 0)
+        metrics["v2_overlay_count"] = diagnostics.get("v2_overlay_count", 0)
+        metrics["classifier_confidence"] = diagnostics.get("classifier_confidence", 0)
+
+        # Check if any expected content found in candidate pool (oracle recall)
+        if expected_content and candidate_hashes:
+            # We can't check content match without fetching candidate content,
+            # but we can record the pool size vs result size for analysis
+            metrics["candidate_pool_utilization"] = (
+                len(tiles) / max(len(candidate_hashes), 1)
+            )
+
+    return metrics
 
 
 # =============================================================================

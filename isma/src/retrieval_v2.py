@@ -63,6 +63,17 @@ V2_PROPERTIES = [
 ]
 V2_PROPS_STR = " ".join(V2_PROPERTIES)
 
+# 6C.1 Query-aware alpha bands — BM25/dense weighting per query type
+# alpha=0.0 → pure BM25, alpha=1.0 → pure vector
+ALPHA_BANDS = {
+    "exact": 0.0,       # Pure BM25 — no dense vector dilution (Gemini/Family consensus)
+    "temporal": 0.3,    # Moderate vector — BM25 still important for date terms
+    "conceptual": 0.65, # Same as default — alpha=0.8 regressed conceptual by -0.046
+    "relational": 0.5,  # Balanced — graph does heavy lifting
+    "motif": 0.6,       # Moderate vector + motif boost
+    "default": 0.65,    # Original V1 default
+}
+
 
 def _escape_gql(s: str) -> str:
     """Escape a string for embedding in a GraphQL value literal."""
@@ -559,6 +570,18 @@ class ISMARetrievalV2:
         if plan.detected_platform and "platform" not in merged_filters:
             merged_filters["platform"] = plan.detected_platform
 
+        # 6C.1 Temporal prefilter: DISABLED — loaded_at is ingest time, not source time.
+        # Queries for "December 2025" or "January 2026" return 0 candidates because
+        # tiles were ingested at different times than their content dates.
+        # TODO 6C.2: Parse session_id → source_date DATE property, then enable.
+        # The temporal_window is still used for post-hoc temporal decay weighting.
+        # if strategy == "temporal" and plan.temporal_window:
+        #     tw = plan.temporal_window
+        #     if tw.get("after") and "time_after" not in merged_filters:
+        #         merged_filters["time_after"] = tw["after"]
+        #     if tw.get("before") and "time_before" not in merged_filters:
+        #         merged_filters["time_before"] = tw["before"]
+
         v1 = get_retrieval()
 
         # Route to strategy
@@ -597,10 +620,29 @@ class ISMARetrievalV2:
                 instruction=plan.reranker_instruction,
                 query_type=strategy,
                 v1=v1,
+                semantic_query=plan.semantic_query,
                 **merged_filters,
             )
 
-            if theme_motifs:
+            # 6C.1 Motif soft boost for conceptual queries — Jaccard overlap bonus
+            if theme_motifs and result.get("tiles"):
+                from dataclasses import replace as dc_replace
+                theme_set = set(m.upper() for m in theme_motifs)
+                boosted = []
+                for tile in result["tiles"]:
+                    tile_motifs = set(
+                        m.upper() for m in (tile.dominant_motifs or [])
+                    )
+                    if tile_motifs and theme_set:
+                        jaccard = len(tile_motifs & theme_set) / len(tile_motifs | theme_set)
+                        # Soft boost: up to 10% score increase for perfect motif match
+                        boost = 0.10 * jaccard
+                        boosted.append(dc_replace(tile, score=tile.score + boost))
+                    else:
+                        boosted.append(tile)
+                # Re-sort by boosted score
+                boosted.sort(key=lambda t: t.score, reverse=True)
+                result["tiles"] = boosted[:top_k]
                 result["theme_routing"] = theme_motifs
 
         # Apply temporal decay post-hoc for temporal queries
@@ -623,6 +665,12 @@ class ISMARetrievalV2:
             "temporal_window": plan.temporal_window,
         }
 
+        # 6C.0 Instrumentation: ensure diagnostics present
+        if "diagnostics" not in result:
+            result["diagnostics"] = {}
+        result["diagnostics"]["strategy"] = strategy
+        result["diagnostics"]["classifier_confidence"] = plan.confidence
+
         return result
 
     def _v1_plus_search(
@@ -632,6 +680,8 @@ class ISMARetrievalV2:
         instruction: str,
         query_type: str,
         v1,
+        alpha: Optional[float] = None,
+        semantic_query: Optional[str] = None,
         **filters,
     ) -> Dict[str, Any]:
         """V1 hybrid search + lazy V2 metadata overlay before reranking.
@@ -642,7 +692,7 @@ class ISMARetrievalV2:
         improving reranker quality without the latency of V2 vector search.
 
         Sequence:
-          1. V1 search (nearVector + BM25, 3x candidate pool)
+          1. V1 search (nearVector + BM25, 3x candidate pool, query-aware alpha)
           2. Lazy V2 metadata overlay (batch-fetch by content_hash OR-filter)
           3. Qwen3-Reranker-8B cross-encoder on enriched candidates
           4. Dedup by content_hash + truncate to top_k
@@ -651,19 +701,66 @@ class ISMARetrievalV2:
 
         fetch_k = top_k * 3
 
-        # Step 1: V1 vector + BM25 search
-        search_result = v1.search(query, top_k=fetch_k, expand_parents=True, **filters)
+        # 6C.1: Query-aware alpha — use per-type band if not explicitly set
+        if alpha is None:
+            alpha = ALPHA_BANDS.get(query_type, ALPHA_BANDS["default"])
+
+        # Step 1: V1 vector + BM25 search with query-aware alpha
+        # 6C.1: Pass semantic_query as vector_query for temporal token stripping
+        search_result = v1.search(
+            query, top_k=fetch_k, expand_parents=True, alpha=alpha,
+            vector_query=semantic_query,
+            **filters,
+        )
         if not search_result.tiles:
             return {
                 "query": query, "tiles": [], "total_tokens": 0,
                 "hmm_reranked": False, "version": "v1plus",
+                "diagnostics": {"candidate_count": 0},
             }
+
+        # 6C.1: V2 rosetta supplementary lane for conceptual queries
+        rosetta_lane_count = 0
+        if query_type == "conceptual" and self.is_available():
+            try:
+                rosetta_results = self.search_rosetta(query, top_k=fetch_k // 2)
+                if rosetta_results:
+                    # Get content_hashes from V1 results to avoid duplicate work
+                    existing_hashes = {t.content_hash for t in search_result.tiles if t.content_hash}
+                    # New hashes from rosetta not in V1 results
+                    new_hashes = []
+                    rosetta_meta = {}
+                    for obj, score in rosetta_results:
+                        ch = obj.get("content_hash", "")
+                        if ch and ch not in existing_hashes:
+                            new_hashes.append(ch)
+                            rosetta_meta[ch] = obj
+                    # Fetch V1 tiles for new hashes
+                    if new_hashes:
+                        rosetta_tiles = self._fetch_v1_tiles_by_hash(new_hashes[:15], v1)
+                        if rosetta_tiles:
+                            rosetta_lane_count = len(rosetta_tiles)
+                            # Merge into search result
+                            merged_tiles = list(search_result.tiles) + rosetta_tiles
+                            search_result = SearchResult(
+                                query=search_result.query,
+                                tiles=merged_tiles,
+                                total_tokens=sum(t.token_count for t in merged_tiles),
+                                search_time_ms=search_result.search_time_ms,
+                            )
+            except Exception as e:
+                log.debug("Rosetta lane failed: %s", e)
+
+        # 6C.0 Instrumentation: capture pre-rerank candidate pool
+        pre_rerank_hashes = [t.content_hash for t in search_result.tiles if t.content_hash]
 
         # Step 2: Lazy V2 metadata overlay
         content_hashes = [t.content_hash for t in search_result.tiles if t.content_hash]
+        v2_overlay_count = 0
         if content_hashes:
             v2_meta = self._fetch_v2_metadata(content_hashes)
             if v2_meta:
+                v2_overlay_count = len(v2_meta)
                 enriched = []
                 for tile in search_result.tiles:
                     ch = tile.content_hash
@@ -697,12 +794,26 @@ class ISMARetrievalV2:
                 deduped.append(tile)
 
         tiles = deduped[:top_k]
+
+        # 6C.0 Instrumentation: diagnostics for benchmark oracle recall
+        post_rerank_hashes = [t.content_hash for t in tiles if t.content_hash]
+        diagnostics = {
+            "candidate_count": len(pre_rerank_hashes),
+            "candidate_hashes": pre_rerank_hashes,
+            "v2_overlay_count": v2_overlay_count,
+            "reranked_count": len(post_rerank_hashes),
+            "reranked_hashes": post_rerank_hashes,
+            "alpha": alpha,
+            "rosetta_lane_count": rosetta_lane_count,
+        }
+
         return {
             "query": query,
             "tiles": tiles,
             "total_tokens": sum(t.token_count for t in tiles),
             "hmm_reranked": True,
             "version": "v1plus",
+            "diagnostics": diagnostics,
         }
 
     def _search_motif(
@@ -786,6 +897,24 @@ class ISMARetrievalV2:
                 query, top_k, instruction=instruction, query_type="motif", v1=v1, **filters
             )
 
+        # 6C.0 Instrumentation: track per-lane contributions
+        hybrid_lane_hashes = set()
+        motif_lane_hashes: Dict[str, set] = {}  # motif_id → set of hashes
+        # Re-scan to attribute lanes (rrf_scores already accumulated)
+        try:
+            hybrid_result_tiles = hybrid_fut.result(timeout=0)  # already resolved
+            hybrid_lane_hashes = {t.content_hash for t in hybrid_result_tiles.tiles if t.content_hash}
+        except Exception:
+            pass
+        for motif_id, fut in motif_futs.items():
+            try:
+                msr = fut.result(timeout=0)
+                motif_lane_hashes[motif_id] = {
+                    tw.get("tile_hash", "") for tw in msr.tiles_with_amplitude if tw.get("tile_hash")
+                }
+            except Exception:
+                pass
+
         # Step 2: Sort by RRF and take candidate pool
         sorted_hashes = sorted(rrf_scores, key=lambda ch: rrf_scores[ch], reverse=True)
         candidate_hashes = sorted_hashes[:top_k * 2]
@@ -836,12 +965,28 @@ class ISMARetrievalV2:
                 deduped.append(tile)
 
         result_tiles = deduped[:top_k]
+
+        # 6C.0 Instrumentation: motif search diagnostics
+        all_motif_hashes = set()
+        for mh in motif_lane_hashes.values():
+            all_motif_hashes |= mh
+        diagnostics = {
+            "candidate_count": len(candidate_hashes),
+            "candidate_hashes": candidate_hashes,
+            "hybrid_lane_count": len(hybrid_lane_hashes),
+            "motif_lane_count": len(all_motif_hashes),
+            "motif_lane_detail": {m: len(h) for m, h in motif_lane_hashes.items()},
+            "reranked_count": len(result_tiles),
+            "reranked_hashes": [t.content_hash for t in result_tiles if t.content_hash],
+        }
+
         return {
             "query": query,
             "tiles": result_tiles,
             "total_tokens": sum(t.token_count for t in result_tiles),
             "hmm_reranked": True,
             "version": "v1plus_motif",
+            "diagnostics": diagnostics,
         }
 
     def _fetch_v2_metadata(self, content_hashes: List[str]) -> Dict[str, dict]:
@@ -1037,6 +1182,28 @@ class ISMARetrievalV2:
                     )
                     filled += 1
         log.debug("Backfilled content for %d/%d graph-expanded tiles", filled, len(content_hashes))
+
+    def _fetch_v1_tiles_by_hash(
+        self,
+        content_hashes: List[str],
+        v1,
+    ) -> List:
+        """Fetch V1 search_512 tiles by content_hash for rosetta lane candidates.
+
+        Returns TileResult list for content_hashes found in V1.
+        Used by the 6C.1 rosetta supplementary lane.
+        """
+        if not content_hashes:
+            return []
+        tiles = []
+        for ch in content_hashes:
+            try:
+                ch_tiles = v1.get_tiles_for_content(ch, scale="search_512")
+                if ch_tiles:
+                    tiles.append(ch_tiles[0])  # Best (first) tile per hash
+            except Exception:
+                pass
+        return tiles
 
     # ── Passage Expansion ───────────────────────────────────────
 

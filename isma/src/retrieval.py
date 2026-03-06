@@ -355,6 +355,9 @@ def _build_where_filter(
     hmm_consensus: bool = None,
     min_hmm_phi: float = None,
     min_hmm_trust: float = None,
+    # Temporal filters (6C.1)
+    time_after: str = None,
+    time_before: str = None,
 ) -> Optional[str]:
     """Build a Weaviate where filter from keyword arguments."""
     conditions = []
@@ -414,6 +417,13 @@ def _build_where_filter(
     if min_hmm_trust is not None:
         conditions.append(
             f'{{ path: ["hmm_trust"], operator: GreaterThanEqual, valueNumber: {min_hmm_trust} }}')
+    # 6C.1 Temporal prefilter — uses loaded_at text field (ISO 8601, lexicographic order works)
+    if time_after:
+        conditions.append(
+            f'{{ path: ["loaded_at"], operator: GreaterThanEqual, valueText: "{_escape_graphql(time_after)}" }}')
+    if time_before:
+        conditions.append(
+            f'{{ path: ["loaded_at"], operator: LessThan, valueText: "{_escape_graphql(time_before)}" }}')
 
     if not conditions:
         return None
@@ -481,6 +491,7 @@ class ISMARetrieval:
 
     def search(self, query: str, top_k: int = 10,
                expand_parents: bool = False,
+               alpha: float = 0.65,
                # Filters
                platform: str = None,
                source_type: str = None,
@@ -501,6 +512,11 @@ class ISMARetrieval:
                # Theme/band expansion
                theme_id: str = None,
                motif_band: str = None,
+               # Temporal filters (6C.1)
+               time_after: str = None,
+               time_before: str = None,
+               # 6C.1: Separate query for embedding (temporal token stripping)
+               vector_query: str = None,
                ) -> SearchResult:
         """Semantic vector search with optional filters.
 
@@ -547,7 +563,9 @@ class ISMARetrieval:
             else:
                 dominant_motifs = band_motifs
 
-        embedding = _get_embedding(query)
+        # 6C.1: Use vector_query for embedding if provided (temporal token stripping)
+        embed_text = vector_query or query
+        embedding = _get_embedding(embed_text)
         if not embedding:
             return SearchResult(query=query, tiles=[])
 
@@ -559,6 +577,7 @@ class ISMARetrieval:
             dominant_motifs=dominant_motifs, hmm_enriched=hmm_enriched,
             hmm_consensus=hmm_consensus, min_hmm_phi=min_hmm_phi,
             min_hmm_trust=min_hmm_trust,
+            time_after=time_after, time_before=time_before,
         )
 
         props = " ".join(TILE_PROPERTIES)
@@ -578,7 +597,7 @@ class ISMARetrieval:
                 {WEAVIATE_CLASS}(
                     hybrid: {{
                         query: "{safe_q}"
-                        alpha: 0.65
+                        alpha: {alpha}
                         vector: {json.dumps(embedding)}
                     }}
                     limit: {top_k}
