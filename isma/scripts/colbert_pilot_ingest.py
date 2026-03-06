@@ -15,13 +15,13 @@ Usage:
 import argparse
 import json
 import logging
+import os
+import subprocess
 import sys
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import List, Optional
-
-import os
 
 import requests
 import torch
@@ -46,6 +46,65 @@ BATCH_SIZE = 32        # Reduced from 256 — GB10 OOM-kills Weaviate with 256-t
 
 # Redis for checkpoint
 CHECKPOINT_KEY = "isma:colbert_pilot:checkpoint"
+
+# ── Alert / circuit-breaker config ────────────────────────────────────────────
+SHARD_LABEL    = os.environ.get("COLBERT_SHARD_LABEL", "s?")   # e.g. s0, s1
+SUPERVISOR     = os.environ.get("TMUX_SUPERVISOR", "weaver")
+MAX_CONSEC_FAIL = 3      # consecutive batch failures before hard stop
+STALL_SECS      = 1200   # 20 min with no successful writes → alarm + exit
+
+# Shared mutable state (main thread writes, io threads set stop event)
+_consecutive_failures = [0]
+_stop_event = threading.Event()
+
+
+def send_alert(msg: str):
+    """Send critical alert to supervisor tmux session and log it.
+
+    Tries tmux-send first (works if binary is in container/PATH).
+    Falls back to Redis PUBLISH so host-side watchers can pick it up.
+    Always writes to an alert file so watch scripts can detect it.
+    """
+    full_msg = f"COLBERT-{SHARD_LABEL}: {msg}"
+    log.error(f"ALERT: {full_msg}")
+
+    # Always write to file — watch script checks this
+    try:
+        with open(f"/tmp/colbert_{SHARD_LABEL}.alert", "a") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {full_msg}\n")
+    except Exception:
+        pass
+
+    # Try tmux-send (available on host, may not be in container)
+    try:
+        subprocess.run(
+            ["tmux-send", SUPERVISOR, full_msg],
+            timeout=5, capture_output=True
+        )
+        return
+    except Exception:
+        pass
+
+    # Try Redis PUBLISH as fallback
+    try:
+        import redis as _redis
+        r = _redis.Redis(
+            host=os.environ.get("REDIS_HOST", "192.168.100.10"),
+            port=int(os.environ.get("REDIS_PORT", "6379")),
+            decode_responses=True
+        )
+        r.publish("colbert:alerts", full_msg)
+    except Exception:
+        pass
+
+
+def write_exit_code(code: int):
+    """Write exit code file so watch scripts can detect process termination."""
+    try:
+        with open(f"/tmp/colbert_{SHARD_LABEL}.exitcode", "w") as f:
+            f.write(str(code))
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -241,6 +300,10 @@ def run_streaming_ingest(model, tokenizer, scale: str, limit: int,
     t0 = time.monotonic()
     success = failed = found = scanned = 0
 
+    # Stall detection: track when we last made write progress
+    last_ok_time = time.monotonic()
+    last_ok_count = 0
+
     # Thread pool for IO operations (fetch + write)
     io_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="io")
 
@@ -317,14 +380,43 @@ def run_streaming_ingest(model, tokenizer, scale: str, limit: int,
             if attempt < 5:
                 time.sleep(wait)
             else:
-                log.error("Initial fetch failed after 6 attempts — aborting")
+                msg = f"Initial fetch failed after 6 attempts — Weaviate unreachable. Aborting."
+                send_alert(msg)
                 io_pool.shutdown(wait=False)
-                return
+                write_exit_code(2)
+                sys.exit(2)
 
     # --- Main pipeline loop ---
     pending_write: Future | None = None
 
     while found < limit:
+        # ── Circuit breaker / stall checks ──────────────────────────────────
+        if _stop_event.is_set():
+            send_alert(
+                f"Circuit breaker triggered after {MAX_CONSEC_FAIL} consecutive "
+                f"batch failures. Stopping. ok={success} found={found} scanned={scanned}"
+            )
+            if pending_write is not None:
+                pending_write.cancel()
+            io_pool.shutdown(wait=False)
+            write_exit_code(2)
+            sys.exit(2)
+
+        now = time.monotonic()
+        if success > last_ok_count:
+            last_ok_time = now
+            last_ok_count = success
+        elif now - last_ok_time > STALL_SECS and found > 0:
+            send_alert(
+                f"STALL: no successful writes in {STALL_SECS//60}min. "
+                f"ok={success} found={found} scanned={scanned} — Weaviate down?"
+            )
+            if pending_write is not None:
+                pending_write.cancel()
+            io_pool.shutdown(wait=False)
+            write_exit_code(2)
+            sys.exit(2)
+
         # 1. Fill encode buffer (may fetch more pages)
         batch_tiles = fill_encode_buffer()
         if not batch_tiles:
@@ -347,7 +439,14 @@ def run_streaming_ingest(model, tokenizer, scale: str, limit: int,
                 success += ok
                 failed += bad
             except Exception as e:
-                log.error(f"Write future error: {e}")
+                # Future itself threw (timeout, thread crash) — count as dropped
+                failed += BATCH_SIZE
+                _consecutive_failures[0] += 1
+                send_alert(
+                    f"Write future exception (consec={_consecutive_failures[0]}): {e}"
+                )
+                if _consecutive_failures[0] >= MAX_CONSEC_FAIL:
+                    _stop_event.set()
 
         # 4. Submit this batch's write asynchronously
         pending_write = write_batch_async(batch_tiles, vectors)
@@ -358,18 +457,25 @@ def run_streaming_ingest(model, tokenizer, scale: str, limit: int,
                  f"scanned={scanned} ok={success} failed={failed}")
 
     # Drain final write
-    if pending_write is not None:
+    if pending_write is not None and not _stop_event.is_set():
         try:
             ok, bad = pending_write.result(timeout=360)
             success += ok
             failed += bad
         except Exception as e:
-            log.error(f"Final write error: {e}")
+            failed += BATCH_SIZE
+            send_alert(f"Final write error: {e}")
 
     io_pool.shutdown(wait=True)
     elapsed = time.monotonic() - t0
     log.info(f"Done in {elapsed:.1f}s — {success} ingested, {failed} failed | "
              f"scanned {scanned} objects to find {found} {scale} tiles")
+
+    if failed > 0 and success == 0:
+        send_alert(
+            f"ZERO successful writes. {failed} tiles dropped. "
+            f"Weaviate was unreachable the entire run."
+        )
 
 
 # =============================================================================
@@ -453,6 +559,7 @@ def ingest_batch(tiles: list, vectors_list: List[List[List[float]]]) -> tuple[in
         })
     if not objects:
         return 0, len(tiles)
+    last_exc = None
     for attempt in range(5):
         try:
             r = requests.post(
@@ -466,17 +573,31 @@ def ingest_batch(tiles: list, vectors_list: List[List[List[float]]]) -> tuple[in
             results = r.json()
             if isinstance(results, list):
                 ok = sum(1 for res in results if res.get("result", {}).get("status") == "SUCCESS")
-                failed = len(results) - ok
+                bad = len(results) - ok
             else:
                 ok = len(objects)
-                failed = 0
-            return ok, failed
+                bad = 0
+            # Success — reset consecutive failure counter
+            _consecutive_failures[0] = 0
+            return ok, bad
         except Exception as e:
+            last_exc = e
             wait = 10 * (2 ** attempt)
             log.warning(f"Batch write error (attempt {attempt+1}/5, retry in {wait}s): {e}")
             if attempt < 4:
                 time.sleep(wait)
-    log.error(f"Batch write failed after 5 attempts — dropping {len(objects)} tiles")
+
+    # All 5 retries exhausted — this is a hard failure
+    _consecutive_failures[0] += 1
+    msg = (
+        f"Batch DROPPED after 5 retries (consec={_consecutive_failures[0]}). "
+        f"{len(objects)} tiles lost. Last error: {last_exc}"
+    )
+    send_alert(msg)
+    if _consecutive_failures[0] >= MAX_CONSEC_FAIL:
+        # Signal main loop to stop — don't call sys.exit() from a thread
+        _stop_event.set()
+
     return 0, len(objects)
 
 
@@ -549,4 +670,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    exit_code = 0
+    try:
+        main()
+        write_exit_code(0)
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else 1
+        write_exit_code(exit_code)
+        sys.exit(exit_code)
+    except Exception as e:
+        exit_code = 1
+        send_alert(f"CRASH: unhandled exception: {e}")
+        write_exit_code(exit_code)
+        log.exception("Unhandled exception in main")
+        sys.exit(exit_code)
