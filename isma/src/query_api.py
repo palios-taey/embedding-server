@@ -54,9 +54,9 @@ async def lifespan(app: FastAPI):
         from isma.src.reranker import get_reranker
         reranker = get_reranker()
         if reranker.is_available():
-            log.info("Reranker prewarmed successfully")
+            logging.info("Reranker prewarmed successfully")
     except Exception as e:
-        log.warning("Reranker prewarm failed: %s", e)
+        logging.warning("Reranker prewarm failed: %s", e)
 
     yield
 
