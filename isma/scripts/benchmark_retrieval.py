@@ -434,6 +434,15 @@ def main():
         retrieval_v2 = ISMARetrievalV2()  # needed for motif category regardless
     retrieval = ISMARetrieval()
 
+    # Prewarm reranker to avoid 5-9s cold-start penalty on first query
+    try:
+        from isma.src.reranker import get_reranker
+        reranker = get_reranker()
+        if reranker.is_available():
+            print("Reranker prewarmed")
+    except Exception:
+        pass
+
     colbert_retrieval = None
     if args.colbert:
         print(f"Initializing ColBERT retrieval (weight={args.colbert_weight}, V1 weight={1.0 - args.colbert_weight})...")

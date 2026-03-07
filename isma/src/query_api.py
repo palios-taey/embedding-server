@@ -44,10 +44,20 @@ from isma.src.semantic_cache import SemanticCache
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Increase thread pool for sync endpoints (default 40 is too low)."""
+    """Increase thread pool and prewarm reranker model."""
     import anyio
     limiter = anyio.to_thread.current_default_thread_limiter()
     limiter.total_tokens = 100
+
+    # Prewarm gte reranker — loads model to GPU, avoiding 5-9s first-query penalty
+    try:
+        from isma.src.reranker import get_reranker
+        reranker = get_reranker()
+        if reranker.is_available():
+            log.info("Reranker prewarmed successfully")
+    except Exception as e:
+        log.warning("Reranker prewarm failed: %s", e)
+
     yield
 
 
