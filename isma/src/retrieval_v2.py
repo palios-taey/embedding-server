@@ -765,11 +765,13 @@ class ISMARetrievalV2:
 
         # Step 1: V1 vector + BM25 search with query-aware alpha
         # 6C.1: Pass semantic_query as vector_query for temporal token stripping
+        _t_v1 = time.monotonic()
         search_result = v1.search(
             query, top_k=fetch_k, expand_parents=True, alpha=alpha,
             vector_query=semantic_query,
             **filters,
         )
+        _t_v1_ms = (time.monotonic() - _t_v1) * 1000
         if not search_result.tiles:
             return {
                 "query": query, "tiles": [], "total_tokens": 0,
@@ -777,87 +779,154 @@ class ISMARetrievalV2:
                 "diagnostics": {"candidate_count": 0},
             }
 
-        # 6C.2: BM25 supplementary lane for exact queries
-        # Hybrid search may miss keyword-only matches; pure BM25 lane widens pool
+        # 6C.2+6C.4: Supplementary lanes run IN PARALLEL (BM25, ColBERT, rosetta)
+        # Previously sequential — parallelizing saves ~1-3s on exact queries.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         bm25_lane_count = 0
-        if query_type == "exact":
+        colbert_lane_count = 0
+        rosetta_lane_count = 0
+        _t_lanes = time.monotonic()
+
+        def _bm25_lane():
+            """BM25 supplementary for exact queries — keyword-only matches."""
             try:
-                bm25_result = v1.search_bm25(query, top_k=fetch_k, **filters)
-                if bm25_result.tiles:
-                    existing_hashes = {t.content_hash for t in search_result.tiles if t.content_hash}
-                    new_bm25_tiles = [
-                        t for t in bm25_result.tiles
-                        if t.content_hash and t.content_hash not in existing_hashes
-                    ]
-                    if new_bm25_tiles:
-                        bm25_lane_count = len(new_bm25_tiles)
-                        merged = list(search_result.tiles) + new_bm25_tiles[:10]
-                        search_result = SearchResult(
-                            query=search_result.query, tiles=merged,
-                            total_tokens=sum(t.token_count for t in merged),
-                            search_time_ms=search_result.search_time_ms,
-                        )
+                return v1.search_bm25(query, top_k=fetch_k, **filters)
             except Exception as e:
                 log.debug("BM25 lane failed: %s", e)
+                return None
 
-        # 6C.4: ColBERT MuVera lane for exact queries — multi-vector token matching
-        # catches special-char terms that BM25 word tokenization breaks on
-        colbert_lane_count = 0
-        if query_type == "exact" and _colbert_collection_exists():
+        def _colbert_lane():
+            """ColBERT MuVera for exact queries — multi-vector token matching."""
             try:
-                colbert_hashes = self._search_colbert(query, top_k=fetch_k)
-                if colbert_hashes:
-                    existing_hashes = {t.content_hash for t in search_result.tiles if t.content_hash}
-                    new_hashes = [h for h in colbert_hashes if h not in existing_hashes]
-                    if new_hashes:
-                        colbert_tiles = self._fetch_v1_tiles_by_hash(new_hashes[:10], v1)
-                        if colbert_tiles:
-                            colbert_lane_count = len(colbert_tiles)
-                            merged = list(search_result.tiles) + colbert_tiles
-                            search_result = SearchResult(
-                                query=search_result.query, tiles=merged,
-                                total_tokens=sum(t.token_count for t in merged),
-                                search_time_ms=search_result.search_time_ms,
-                            )
+                hashes = self._search_colbert(query, top_k=fetch_k)
+                if hashes:
+                    return hashes
             except Exception as e:
                 log.debug("ColBERT lane failed: %s", e)
+            return None
 
-        # 6C.1: V2 rosetta supplementary lane for conceptual queries
-        rosetta_lane_count = 0
-        if query_type == "conceptual" and self.is_available():
+        def _rosetta_lane():
+            """V2 rosetta for conceptual queries — semantic summary matching."""
             try:
-                rosetta_results = self.search_rosetta(query, top_k=fetch_k // 2)
-                if rosetta_results:
-                    # Get content_hashes from V1 results to avoid duplicate work
-                    existing_hashes = {t.content_hash for t in search_result.tiles if t.content_hash}
-                    # New hashes from rosetta not in V1 results
-                    new_hashes = []
-                    rosetta_meta = {}
-                    for obj, score in rosetta_results:
-                        ch = obj.get("content_hash", "")
-                        if ch and ch not in existing_hashes:
-                            new_hashes.append(ch)
-                            rosetta_meta[ch] = obj
-                    # Fetch V1 tiles for new hashes
-                    if new_hashes:
-                        rosetta_tiles = self._fetch_v1_tiles_by_hash(new_hashes[:15], v1)
-                        if rosetta_tiles:
-                            rosetta_lane_count = len(rosetta_tiles)
-                            # Merge into search result
-                            merged_tiles = list(search_result.tiles) + rosetta_tiles
-                            search_result = SearchResult(
-                                query=search_result.query,
-                                tiles=merged_tiles,
-                                total_tokens=sum(t.token_count for t in merged_tiles),
-                                search_time_ms=search_result.search_time_ms,
-                            )
+                return self.search_rosetta(query, top_k=fetch_k // 2)
             except Exception as e:
                 log.debug("Rosetta lane failed: %s", e)
+            return None
+
+        # Dispatch parallel lanes based on query type
+        lane_futures = {}
+        with ThreadPoolExecutor(max_workers=3) as lane_pool:
+            if query_type == "exact":
+                lane_futures["bm25"] = lane_pool.submit(_bm25_lane)
+                if _colbert_collection_exists():
+                    lane_futures["colbert"] = lane_pool.submit(_colbert_lane)
+            elif query_type == "conceptual" and self.is_available():
+                lane_futures["rosetta"] = lane_pool.submit(_rosetta_lane)
+
+            # Collect results
+            bm25_result = None
+            colbert_hashes = None
+            rosetta_results = None
+
+            for name, fut in lane_futures.items():
+                try:
+                    r = fut.result(timeout=15)
+                    if name == "bm25":
+                        bm25_result = r
+                    elif name == "colbert":
+                        colbert_hashes = r
+                    elif name == "rosetta":
+                        rosetta_results = r
+                except Exception as e:
+                    log.debug("Lane %s timed out or failed: %s", name, e)
+
+        # Merge BM25 results
+        if bm25_result and bm25_result.tiles:
+            existing_hashes = {t.content_hash for t in search_result.tiles if t.content_hash}
+            new_bm25_tiles = [
+                t for t in bm25_result.tiles
+                if t.content_hash and t.content_hash not in existing_hashes
+            ]
+            if new_bm25_tiles:
+                bm25_lane_count = len(new_bm25_tiles)
+                merged = list(search_result.tiles) + new_bm25_tiles[:10]
+                search_result = SearchResult(
+                    query=search_result.query, tiles=merged,
+                    total_tokens=sum(t.token_count for t in merged),
+                    search_time_ms=search_result.search_time_ms,
+                )
+
+        # Merge ColBERT results
+        if colbert_hashes:
+            existing_hashes = {t.content_hash for t in search_result.tiles if t.content_hash}
+            new_hashes = [h for h in colbert_hashes if h not in existing_hashes]
+            if new_hashes:
+                colbert_tiles = self._fetch_v1_tiles_by_hash(new_hashes[:10], v1)
+                if colbert_tiles:
+                    colbert_lane_count = len(colbert_tiles)
+                    merged = list(search_result.tiles) + colbert_tiles
+                    search_result = SearchResult(
+                        query=search_result.query, tiles=merged,
+                        total_tokens=sum(t.token_count for t in merged),
+                        search_time_ms=search_result.search_time_ms,
+                    )
+
+        # Merge rosetta results
+        if rosetta_results:
+            existing_hashes = {t.content_hash for t in search_result.tiles if t.content_hash}
+            new_hashes = []
+            for obj, score in rosetta_results:
+                ch = obj.get("content_hash", "")
+                if ch and ch not in existing_hashes:
+                    new_hashes.append(ch)
+            if new_hashes:
+                rosetta_tiles = self._fetch_v1_tiles_by_hash(new_hashes[:15], v1)
+                if rosetta_tiles:
+                    rosetta_lane_count = len(rosetta_tiles)
+                    merged_tiles = list(search_result.tiles) + rosetta_tiles
+                    search_result = SearchResult(
+                        query=search_result.query,
+                        tiles=merged_tiles,
+                        total_tokens=sum(t.token_count for t in merged_tiles),
+                        search_time_ms=search_result.search_time_ms,
+                    )
+
+        _t_lanes_ms = (time.monotonic() - _t_lanes) * 1000
+
+        # 6C.3: Asymmetric quota — cap candidate pool at fetch_k before reranker.
+        # Supplementary lanes add tiles V1 missed (valuable), growing pool to 40-50.
+        # The reranker scales ~200ms/doc under GPU contention, so keep pool bounded.
+        # Strategy: keep ALL supplementary tiles (they were specifically found),
+        # truncate low-ranked V1 tiles to make room.
+        _supplementary_count = bm25_lane_count + colbert_lane_count + rosetta_lane_count
+        if len(search_result.tiles) > fetch_k and _supplementary_count > 0:
+            # V1 tiles are first, supplementary tiles appended at end
+            v1_count = len(search_result.tiles) - _supplementary_count
+            v1_keep = max(fetch_k - _supplementary_count, top_k)  # keep at least top_k V1
+            capped = search_result.tiles[:v1_keep] + search_result.tiles[v1_count:]
+            capped = capped[:fetch_k]
+            search_result = SearchResult(
+                query=search_result.query,
+                tiles=capped,
+                total_tokens=sum(t.token_count for t in capped),
+                search_time_ms=search_result.search_time_ms,
+            )
 
         # 6C.0 Instrumentation: capture pre-rerank candidate pool
         pre_rerank_hashes = [t.content_hash for t in search_result.tiles if t.content_hash]
+        # Oracle recall: text snippets of ALL candidates (for benchmark to check gold terms)
+        _pre_rerank_texts = []
+        for t in search_result.tiles:
+            text = (t.content or "")[:1000]
+            if t.rosetta_summary:
+                text += " " + t.rosetta_summary[:500]
+            if t.dominant_motifs:
+                text += " " + " ".join(t.dominant_motifs)
+            _pre_rerank_texts.append(text)
 
         # Step 2: Lazy V2 metadata overlay
+        _t_v2 = time.monotonic()
         content_hashes = [t.content_hash for t in search_result.tiles if t.content_hash]
         v2_overlay_count = 0
         if content_hashes:
@@ -882,10 +951,30 @@ class ISMARetrievalV2:
                     search_time_ms=search_result.search_time_ms,
                 )
 
+        _t_v2_ms = (time.monotonic() - _t_v2) * 1000
+
+        # 6C p95: Data-driven rerank_k per query type (oracle recall validated).
+        # Oracle R@K shows where gold docs sit in the candidate pool:
+        #   exact:      R@18=0.842 = R@30=0.842 → safe to cut at 18
+        #   temporal:   R@25=0.870, R@30=0.898 → cut at 25
+        #   conceptual: R@30=0.771 spread wide → NEVER cut (reranker finds deep gold)
+        #   relational: R@18=0.917 = R@20=0.917 → safe to cut at 20
+        RERANK_K = {"exact": 25, "temporal": 25, "conceptual": 30, "relational": 22}
+        rerank_k = RERANK_K.get(query_type, 30)
+        if len(search_result.tiles) > rerank_k:
+            search_result = SearchResult(
+                query=search_result.query,
+                tiles=search_result.tiles[:rerank_k],
+                total_tokens=sum(t.token_count for t in search_result.tiles[:rerank_k]),
+                search_time_ms=search_result.search_time_ms,
+            )
+
         # Step 3: Neural rerank (Qwen3-Reranker-8B)
+        _t_rerank = time.monotonic()
         reranked_result = v1.hmm_rerank(
             search_result, query, query_type=query_type, instruction=instruction,
         )
+        _t_rerank_ms = (time.monotonic() - _t_rerank) * 1000
 
         # Step 4: Dedup by content_hash
         seen: set = set()
@@ -898,11 +987,12 @@ class ISMARetrievalV2:
 
         tiles = deduped[:top_k]
 
-        # 6C.0 Instrumentation: diagnostics for benchmark oracle recall
+        # 6C.0 Instrumentation: diagnostics for benchmark oracle recall + timing
         post_rerank_hashes = [t.content_hash for t in tiles if t.content_hash]
         diagnostics = {
             "candidate_count": len(pre_rerank_hashes),
             "candidate_hashes": pre_rerank_hashes,
+            "candidate_texts": _pre_rerank_texts,
             "v2_overlay_count": v2_overlay_count,
             "reranked_count": len(post_rerank_hashes),
             "reranked_hashes": post_rerank_hashes,
@@ -910,6 +1000,12 @@ class ISMARetrievalV2:
             "rosetta_lane_count": rosetta_lane_count,
             "bm25_lane_count": bm25_lane_count,
             "colbert_lane_count": colbert_lane_count,
+            "timing_ms": {
+                "v1_search": round(_t_v1_ms, 1),
+                "supplementary_lanes": round(_t_lanes_ms, 1),
+                "v2_overlay": round(_t_v2_ms, 1),
+                "reranker": round(_t_rerank_ms, 1),
+            },
         }
 
         return {
@@ -1051,14 +1147,11 @@ class ISMARetrievalV2:
                 for t in tiles
             ]
 
-        # Step 5: Rerank
-        try:
-            from isma.src.reranker import get_reranker
-            reranker = get_reranker()
-            if reranker.is_available():
-                tiles = reranker.rerank(query, tiles, instruction=instruction, query_type="motif")
-        except Exception as e:
-            log.debug("Reranker unavailable for motif: %s", e)
+        # Step 5: Skip reranker for motif queries (6C p95 consultation — unanimous)
+        # R@10=0.930 without reranker. Domain-specific routing (Redis inverted index +
+        # Neo4j amplitude sort + RRF fusion) IS the reranker for motif. Neural re-evaluation
+        # of graph-proven amplitudes wastes ~5000ms for zero recall benefit.
+        # RRF score ordering is sufficient.
 
         # Dedup + truncate
         seen: set = set()

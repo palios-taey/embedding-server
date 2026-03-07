@@ -122,6 +122,11 @@ def apply_temporal_decay(
 
         temporal_score = temporal_decay_score(loaded_at, half_life_days, now)
         original_score = getattr(tile, "score", 0.0) or 0.0
+        if isinstance(original_score, str):
+            try:
+                original_score = float(original_score)
+            except (ValueError, TypeError):
+                original_score = 0.0
 
         adjusted = (1 - decay_weight) * original_score + decay_weight * temporal_score
         # Create copy with updated score (never mutate in-place — may be cached)

@@ -59,10 +59,10 @@ from phi_tiling import multi_scale_tile, MultiScaleTile
 # CONFIGURATION
 # =============================================================================
 
-EMBEDDING_URL = "http://192.168.100.10:8091/v1/embeddings"
+EMBEDDING_URL = os.environ.get("EMBEDDING_URL", "http://192.168.100.10:8091/v1/embeddings")
 EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
-WEAVIATE_URL = "http://192.168.100.10:8088"
-NEO4J_URI = "bolt://192.168.100.10:7689"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://10.0.0.163:7689")
 
 DATA_BASE = Path("/home/spark/data")
 CORPUS_BASE = DATA_BASE / "corpus"

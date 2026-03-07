@@ -26,10 +26,10 @@ import requests
 
 log = logging.getLogger(__name__)
 
-# Reranker endpoint — Spark 2 via NCCL fabric
+# Reranker endpoint — Spark 1 dedicated GPU (moved from Spark 2 to eliminate contention)
 RERANKER_URL = os.environ.get(
     "RERANKER_URL",
-    "http://192.168.100.11:8085"
+    "http://localhost:8085"
 )
 RERANKER_MODEL = "Qwen/Qwen3-Reranker-8B"
 

@@ -273,19 +273,31 @@ def run_query_v2(retrieval_v2, query_def: Dict[str, Any],
 
     # 6C.0 Instrumentation: include diagnostics for oracle recall analysis
     if diagnostics:
-        # Oracle recall: did expected content appear in pre-rerank candidate pool?
-        candidate_hashes = diagnostics.get("candidate_hashes", [])
         metrics["candidate_count"] = diagnostics.get("candidate_count", 0)
         metrics["v2_overlay_count"] = diagnostics.get("v2_overlay_count", 0)
         metrics["classifier_confidence"] = diagnostics.get("classifier_confidence", 0)
 
-        # Check if any expected content found in candidate pool (oracle recall)
-        if expected_content and candidate_hashes:
-            # We can't check content match without fetching candidate content,
-            # but we can record the pool size vs result size for analysis
-            metrics["candidate_pool_utilization"] = (
-                len(tiles) / max(len(candidate_hashes), 1)
-            )
+        # Oracle recall: check if expected terms appear in candidate pool at various K
+        candidate_texts = diagnostics.get("candidate_texts", [])
+        if expected_content and candidate_texts:
+            oracle = {}
+            for k in [10, 15, 18, 20, 25, 30]:
+                pool = [t.lower() for t in candidate_texts[:k]]
+                found = sum(
+                    1 for term in expected_content
+                    if any(term.lower() in text for text in pool)
+                )
+                oracle[f"oracle_R@{k}"] = round(found / len(expected_content), 4)
+            metrics["oracle_recall"] = oracle
+
+        metrics["candidate_pool_utilization"] = (
+            len(tiles) / max(len(candidate_texts), len(diagnostics.get("candidate_hashes", [])), 1)
+        )
+
+        # 6C.0: Per-step timing breakdown
+        timing = diagnostics.get("timing_ms")
+        if timing:
+            metrics["timing_ms"] = timing
 
     return metrics
 
@@ -339,7 +351,7 @@ def _agg_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         idx = int(len(arr) * p / 100)
         return round(arr[min(idx, len(arr) - 1)], 2)
 
-    return {
+    agg = {
         "count": len(results),
         "recall_5_mean": _mean("recall_5"),
         "recall_10_mean": _mean("recall_10"),
@@ -355,6 +367,16 @@ def _agg_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             sum(r["enriched_in_top10"] for r in results) / len(results), 2
         ),
     }
+
+    # Oracle recall means (if available)
+    oracle_results = [r for r in results if "oracle_recall" in r]
+    if oracle_results:
+        for k_label in ["oracle_R@10", "oracle_R@15", "oracle_R@18", "oracle_R@20", "oracle_R@25", "oracle_R@30"]:
+            vals = [r["oracle_recall"][k_label] for r in oracle_results if k_label in r["oracle_recall"]]
+            if vals:
+                agg[k_label + "_mean"] = round(sum(vals) / len(vals), 4)
+
+    return agg
 
 
 # =============================================================================
