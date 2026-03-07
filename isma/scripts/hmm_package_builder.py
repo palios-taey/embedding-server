@@ -328,90 +328,85 @@ def estimate_full_tokens(content_hash: str) -> int:
 # Direct Weaviate Fallback (for tiles not captured by theme index)
 # ============================================================================
 
-# Weaviate offset pagination cursor — persisted in Redis so multiple workers
-# don't re-fetch the same pages
-_WEAVIATE_OFFSET_KEY = f"{PFX}weaviate_sweep_offset"
-_WEAVIATE_SWEEP_PAGE = 500  # tiles per page
+# Weaviate cursor pagination — persisted in Redis so multiple workers
+# resume from where they left off
+_WEAVIATE_CURSOR_KEY = f"{PFX}weaviate_sweep_cursor"
+_WEAVIATE_SWEEP_PAGE = 10000  # tiles per page (cursor has no offset limit)
 
 
 _TRANSCRIPT_PLATFORMS = ["claude", "claude_chat", "chatgpt", "gemini", "grok"]
-_SWEEP_OFFSET_TRANSCRIPT_KEY = f"{PFX}weaviate_sweep_offset_transcript"
+_SWEEP_CURSOR_TRANSCRIPT_KEY = f"{PFX}weaviate_sweep_cursor_transcript"
 
 
 def _sweep_weaviate_direct(n: int = 2000, seen_hashes: set = None,
                            platforms: list = None) -> list:
-    """Directly paginate ISMA_Quantum for unenriched tiles not in the theme index.
+    """Paginate ISMA_Quantum for unenriched tiles not in the theme index.
 
-    Used as a fallback when the theme index is exhausted. Fetches up to `n`
-    unique content_hashes, skipping completed/in-progress ones.
+    Uses cursor-based pagination (after + limit) to scan beyond 100K offset
+    limit. Filters client-side since Weaviate cursor API doesn't support
+    where + after together.
 
     Args:
-        platforms: If set, only sweep tiles from these platforms (e.g. transcript priority).
+        platforms: If set, only include tiles from these platforms.
 
     Returns list of dicts: {content_hash, source_file, source_type, token_estimate}
     """
     r = get_redis()
     seen = seen_hashes or set()
     completed = r.smembers(f"{PFX}completed")
+    platform_set = set(platforms) if platforms else None
 
     results = []
-    # Use separate offset key for transcript-filtered sweeps
-    offset_key = _SWEEP_OFFSET_TRANSCRIPT_KEY if platforms else _WEAVIATE_OFFSET_KEY
-    offset = int(r.get(offset_key) or 0)
-    checked = 0
-    max_pages = 200  # safety cap (200 × 500 = 100K tiles checked per call)
+    cursor_key = _SWEEP_CURSOR_TRANSCRIPT_KEY if platforms else _WEAVIATE_CURSOR_KEY
+    cursor = r.get(cursor_key) or None
+    scanned = 0
+    max_scan = 1_100_000  # safety cap — slightly above total tile count
 
-    # Build platform filter operands
-    filter_operands = [
-        '{ path: ["scale"], operator: Equal, valueText: "search_512" }',
-        '{ path: ["hmm_enriched"], operator: Equal, valueBoolean: false }',
-    ]
-    if platforms:
-        platform_or = ", ".join(
-            f'{{ path: ["platform"], operator: Equal, valueText: "{p}" }}'
-            for p in platforms
-        )
-        filter_operands.append(
-            f'{{ operator: Or, operands: [{platform_or}] }}'
-        )
-    filter_block = ", ".join(filter_operands)
-
-    while len(results) < n and checked < max_pages:
+    while len(results) < n and scanned < max_scan:
+        after_clause = f', after: "{cursor}"' if cursor else ""
         q = f"""{{
             Get {{
                 {WEAVIATE_CLASS}(
-                    where: {{
-                        operator: And,
-                        operands: [{filter_block}]
-                    }}
-                    limit: {_WEAVIATE_SWEEP_PAGE}
-                    offset: {offset}
+                    limit: {_WEAVIATE_SWEEP_PAGE}{after_clause}
                 ) {{
                     content_hash source_file source_type token_count
+                    platform scale hmm_enriched
+                    _additional {{ id }}
                 }}
             }}
         }}"""
 
-        data = weaviate_gql(q, timeout=60)
+        data = weaviate_gql(q, timeout=120)
         tiles = data.get("Get", {}).get(WEAVIATE_CLASS, [])
         if not tiles:
-            # Reached end of dataset — reset offset for next round
-            log.info(f"Sweep: reached end at offset {offset}, resetting to 0")
-            r.set(offset_key, 0)
+            # Reached end of dataset — reset cursor for next round
+            log.info(f"Sweep: reached end after scanning {scanned} objects, resetting cursor")
+            r.delete(cursor_key)
             break
 
-        offset += len(tiles)
-        checked += 1
+        cursor = tiles[-1]["_additional"]["id"]
+        scanned += len(tiles)
 
-        # Batch check availability
-        page_hashes = [t["content_hash"] for t in tiles if t.get("content_hash")]
-        new_hashes = [h for h in page_hashes
-                      if h not in seen and h not in completed]
-        if new_hashes:
-            available = batch_check_available(new_hashes)
-            for t in tiles:
-                ch = t.get("content_hash", "")
-                if ch and ch in available and ch not in seen:
+        # Client-side filtering: scale=search_512, hmm_enriched=false, platform match
+        candidates = {}
+        for t in tiles:
+            ch = t.get("content_hash")
+            if not ch or ch in seen or ch in completed:
+                continue
+            if t.get("scale") != "search_512":
+                continue
+            if t.get("hmm_enriched"):
+                continue
+            if platform_set and t.get("platform") not in platform_set:
+                continue
+            if ch not in candidates:
+                candidates[ch] = t
+
+        if candidates:
+            available = batch_check_available(list(candidates.keys()))
+            for ch in candidates:
+                if ch in available:
+                    t = candidates[ch]
                     results.append({
                         "content_hash": ch,
                         "source_file": t.get("source_file", ""),
@@ -423,14 +418,13 @@ def _sweep_weaviate_direct(n: int = 2000, seen_hashes: set = None,
                     if len(results) >= n:
                         break
 
-        if len(results) < n and len(tiles) == _WEAVIATE_SWEEP_PAGE:
-            continue  # more pages available
-        else:
-            break
+        if len(tiles) < _WEAVIATE_SWEEP_PAGE:
+            break  # last page
 
-    # Persist updated offset
-    r.set(offset_key, offset)
-    log.info(f"Sweep: found {len(results)} items after checking {checked} pages (offset now {offset})")
+    # Persist updated cursor
+    if cursor:
+        r.set(cursor_key, cursor)
+    log.info(f"Sweep: found {len(results)} items after scanning {scanned} objects")
     return results
 
 
