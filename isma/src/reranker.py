@@ -1,18 +1,18 @@
 """
-ISMA Neural Reranker Client — Qwen3-Reranker-8B via vLLM score API.
+ISMA Neural Reranker — switchable backend (Qwen3-Reranker-8B or gte-modernbert-base).
 
-Replaces the hand-tuned hmm_rerank() formula (0.5*base + 0.3*rosetta + 0.2*motif)
-with a cross-encoder neural reranker that reads both query and document.
+Backends:
+  - qwen3 (default): Qwen3-Reranker-8B via vLLM /v1/score — instruction-aware, 8B params
+  - gte: gte-reranker-modernbert-base via sentence-transformers CrossEncoder — 149M params, ~2x faster
 
-The reranker runs on Spark 2 (port 8085) co-located with the embedding server.
-Uses vLLM's /v1/score endpoint with instruction-aware prompting.
+Set RERANKER_ENGINE=gte to switch. Both expose identical rerank() interface.
 
 Usage:
-    from isma.src.reranker import RerankerClient
+    from isma.src.reranker import get_reranker
 
-    client = RerankerClient()
-    if client.is_available():
-        scored = client.rerank(query, tiles, instruction="Find factual matches")
+    reranker = get_reranker()
+    if reranker.is_available():
+        scored = reranker.rerank(query, tiles, query_type="exact")
 """
 
 import logging
@@ -21,6 +21,12 @@ import threading
 import time
 from dataclasses import replace as dc_replace
 from typing import List, Optional
+
+# Disable torch.compile before ANY torch import. ModernBERT uses
+# torch.compile decorators that JIT-compile per input shape — causes
+# 5-10s first-query penalty. Eager mode is ~300-570ms (negligible diff).
+if os.environ.get("RERANKER_ENGINE") == "gte":
+    os.environ["TORCHDYNAMO_DISABLE"] = "1"
 
 import requests
 
@@ -270,16 +276,108 @@ class RerankerClient:
         return [dc_replace(tile, score=score) for tile, score in scored_tiles]
 
 
+class GteRerankerClient:
+    """Local cross-encoder reranker using gte-reranker-modernbert-base (149M params).
+
+    Runs on GPU via sentence-transformers CrossEncoder. 3-7x faster than Qwen3-8B:
+      exact: 1012ms mean (was 3529ms), temporal: 628ms, conceptual: 535ms, relational: 370ms
+    Recall is same or better (+0.017 exact, +0.009 temporal).
+    """
+
+    def __init__(self):
+        self._model = None
+        self._load_lock = threading.Lock()
+        self._available: Optional[bool] = None
+
+    def _ensure_model(self):
+        if self._model is None:
+            with self._load_lock:
+                if self._model is None:
+                    from sentence_transformers import CrossEncoder
+                    log.info("Loading gte-reranker-modernbert-base...")
+                    t0 = time.monotonic()
+                    self._model = CrossEncoder(
+                        "Alibaba-NLP/gte-reranker-modernbert-base",
+                        trust_remote_code=True,
+                    )
+                    elapsed = (time.monotonic() - t0) * 1000
+                    log.info("gte-reranker loaded in %.0fms", elapsed)
+
+    def is_available(self) -> bool:
+        if self._available is not None:
+            return self._available
+        try:
+            self._ensure_model()
+            self._available = self._model is not None
+        except Exception as e:
+            log.warning("gte-reranker load failed: %s", e)
+            self._available = False
+        return self._available
+
+    def rerank(
+        self,
+        query: str,
+        tiles: list,
+        instruction: str = "",
+        query_type: str = "default",
+    ) -> list:
+        if not tiles:
+            return tiles
+
+        self._ensure_model()
+        if self._model is None:
+            return tiles
+
+        _CONTENT_WINDOW = {
+            "exact": 3000,
+            "temporal": 2000,
+        }
+        max_chars = _CONTENT_WINDOW.get(query_type, 1500)
+
+        pairs = []
+        for tile in tiles:
+            text = tile.content or ""
+            if tile.rosetta_summary:
+                text = f"{tile.rosetta_summary}\n\n{text}"
+            pairs.append((query, text[:max_chars]))
+
+        t0 = time.monotonic()
+        try:
+            scores = self._model.predict(pairs).tolist()
+        except Exception as e:
+            log.warning("gte-reranker scoring failed: %s", e)
+            return tiles
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        log.debug("gte-reranker scored %d docs in %.0fms", len(tiles), elapsed_ms)
+
+        scored_tiles = sorted(
+            zip(tiles, scores), key=lambda x: x[1], reverse=True
+        )
+        return [dc_replace(tile, score=score) for tile, score in scored_tiles]
+
+
 # Module-level singleton (lazy init) with thread safety
-_client: Optional[RerankerClient] = None
+_client = None
 _client_lock = threading.Lock()
 
+# Engine selection: "qwen3" (default) or "gte"
+RERANKER_ENGINE = os.environ.get("RERANKER_ENGINE", "qwen3")
 
-def get_reranker() -> RerankerClient:
-    """Get the singleton RerankerClient (thread-safe)."""
+
+def get_reranker():
+    """Get the singleton reranker client (thread-safe).
+
+    Set RERANKER_ENGINE=gte to use gte-reranker-modernbert-base instead of Qwen3.
+    """
     global _client
     if _client is None:
         with _client_lock:
             if _client is None:
-                _client = RerankerClient()
+                if RERANKER_ENGINE == "gte":
+                    log.info("Using gte-reranker-modernbert-base engine")
+                    _client = GteRerankerClient()
+                else:
+                    log.info("Using Qwen3-Reranker-8B engine")
+                    _client = RerankerClient()
     return _client
