@@ -273,8 +273,9 @@ def _score_temporal(q: str) -> float:
     # Medium temporal signals (0.25 each)
     medium_temporal = [
         r"\b(before|after|since|prior\s+to|following|during)\b",
-        r"\b(evolution|evolved?)\b",
+        r"\b(evolved?)\b",
         r"\b(when\s+was|when\s+did)\b",
+        r"\b(lessons?|insights?|learnings?|takeaways?)\b",  # Retrospective review
     ]
     for pattern in medium_temporal:
         if re.search(pattern, q, re.IGNORECASE):
@@ -294,7 +295,7 @@ def _score_temporal(q: str) -> float:
     ))
 
     if has_month and has_year:
-        score += 0.50
+        score += 0.45  # Below 0.50 alone — needs another signal to be temporal
     elif has_month_day:
         score += 0.50  # "January 24" = strong temporal
     elif has_month:
