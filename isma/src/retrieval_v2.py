@@ -759,9 +759,6 @@ class ISMARetrievalV2:
                     # Blend: alpha goes from 0.3 (0% stops) to 0.65 (50%+ stops)
                     alpha = 0.3 + _stop_ratio * 0.7
                     alpha = min(alpha, 0.65)
-                    # High stop-word queries also need wider pool (BM25 noise)
-                    if _stop_ratio > 0.3:
-                        fetch_k = top_k * 4
 
         # Step 1: V1 vector + BM25 search with query-aware alpha
         # 6C.1: Pass semantic_query as vector_query for temporal token stripping
@@ -954,13 +951,12 @@ class ISMARetrievalV2:
         _t_v2_ms = (time.monotonic() - _t_v2) * 1000
 
         # 6C p95: Data-driven rerank_k per query type (oracle recall validated).
-        # Oracle R@K shows where gold docs sit in the candidate pool:
-        #   exact:      R@18=0.842 = R@30=0.842 → safe to cut at 18
-        #   temporal:   R@25=0.870, R@30=0.898 → cut at 25
-        #   conceptual: R@30=0.771 spread wide → NEVER cut (reranker finds deep gold)
-        #   relational: R@18=0.917 = R@20=0.917 → safe to cut at 20
-        # With gte reranker (1012ms/25docs), exact can afford full pool.
-        # Qwen3 was 3529ms/25docs, requiring aggressive cuts. gte at 30 docs: ~1200ms.
+        # With gte reranker (~40ms/doc), exact can afford full 30-doc pool.
+        # fetch_k=100 + RERANK_K=100 tested: +0.250 on exact_11 BUT -0.333 on exact_02
+        # (pool dilution — reranker can't reliably rank gold in 100-doc pools).
+        # Temporal: R@25=0.870, R@30=0.898 → 25 sufficient.
+        # Conceptual: R@30=0.771 spread wide → NEVER cut (reranker finds deep gold).
+        # Relational: R@18=0.917 = R@20=0.917 → 22 sufficient.
         RERANK_K = {"exact": 30, "temporal": 25, "conceptual": 30, "relational": 22}
         rerank_k = RERANK_K.get(query_type, 30)
         if len(search_result.tiles) > rerank_k:
