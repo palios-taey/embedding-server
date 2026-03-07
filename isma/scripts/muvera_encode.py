@@ -169,20 +169,21 @@ def get_content_hashes(shard: int = 0, total_shards: int = 1,
     log.info("Fetching content_hashes from %s (shard %d/%d)...",
              SOURCE_CLASS, shard + 1, total_shards)
 
-    # Get already-encoded hashes to skip
+    # Get already-encoded hashes to skip (cursor-based pagination)
     encoded = set()
     try:
-        offset = 0
+        cursor = None
         while True:
+            after_clause = f', after: "{cursor}"' if cursor else ""
             r = _gql(f'''{{ Get {{ {COLBERT_CLASS}(
-                limit: 10000, offset: {offset}
-            ) {{ content_hash }} }} }}''')
+                limit: 10000{after_clause}
+            ) {{ content_hash _additional {{ id }} }} }} }}''')
             batch = r["data"]["Get"][COLBERT_CLASS]
             if not batch:
                 break
             for obj in batch:
                 encoded.add(obj["content_hash"])
-            offset += len(batch)
+            cursor = batch[-1]["_additional"]["id"]
             if len(batch) < 10000:
                 break
     except Exception as e:
@@ -190,27 +191,35 @@ def get_content_hashes(shard: int = 0, total_shards: int = 1,
 
     log.info("Already encoded: %d hashes", len(encoded))
 
-    # Get all unique content_hashes from source (use search_512 scale for dedup)
+    # Get all unique content_hashes from source (cursor-based pagination)
+    # Note: Weaviate cursor API does not support `where` + `after` together,
+    # so we fetch ALL objects and deduplicate client-side.
+    seen = set()
     all_hashes = []
-    offset = 0
+    cursor = None
     batch_size = 10000
+    fetched = 0
 
     while True:
+        after_clause = f', after: "{cursor}"' if cursor else ""
         r = _gql(f'''{{ Get {{ {SOURCE_CLASS}(
-            limit: {batch_size}
-            offset: {offset}
-            where: {{ path: ["scale"], operator: Equal, valueText: "search_512" }}
-        ) {{ content_hash }} }} }}''')
+            limit: {batch_size}{after_clause}
+        ) {{ content_hash _additional {{ id }} }} }} }}''')
         batch = r["data"]["Get"][SOURCE_CLASS]
         if not batch:
             break
         for obj in batch:
             ch = obj.get("content_hash")
-            if ch and ch not in encoded:
+            if ch and ch not in encoded and ch not in seen:
+                seen.add(ch)
                 all_hashes.append(ch)
-        offset += len(batch)
+        fetched += len(batch)
+        cursor = batch[-1]["_additional"]["id"]
+        if fetched % 100000 == 0:
+            log.info("  Scanned %d objects, found %d new hashes...", fetched, len(all_hashes))
         if len(batch) < batch_size:
             break
+    log.info("  Scanned %d total objects", fetched)
 
     # Deduplicate (search_512 may have duplicates per content_hash)
     unique = list(dict.fromkeys(all_hashes))
@@ -375,17 +384,25 @@ def stats():
         colbert_count = 0
 
     try:
+        r = _gql(f'{{ Aggregate {{ {SOURCE_CLASS} {{ meta {{ count }} }} }} }}')
+        source_total = r["data"]["Aggregate"][SOURCE_CLASS][0]["meta"]["count"]
+    except Exception:
+        source_total = 0
+
+    try:
         r = _gql(f'''{{ Aggregate {{ {SOURCE_CLASS}(
             where: {{ path: ["scale"], operator: Equal, valueText: "search_512" }}
         ) {{ meta {{ count }} }} }} }}''')
-        source_count = r["data"]["Aggregate"][SOURCE_CLASS][0]["meta"]["count"]
+        source_512 = r["data"]["Aggregate"][SOURCE_CLASS][0]["meta"]["count"]
     except Exception:
-        source_count = 0
+        source_512 = 0
 
-    pct = (colbert_count / max(source_count, 1)) * 100
-    print(f"Source tiles (search_512): {source_count:,}")
-    print(f"ColBERT encoded:          {colbert_count:,}")
-    print(f"Progress:                 {pct:.1f}%")
+    # ColBERT encodes per content_hash (one per doc), not per tile
+    # Unique content_hashes ≈ colbert_count (each hash = 1 ColBERT object)
+    print(f"Source objects total:      {source_total:,}")
+    print(f"Source search_512 tiles:   {source_512:,}")
+    print(f"ColBERT objects:           {colbert_count:,}")
+    print(f"  (1 ColBERT obj per unique content_hash — encoding is per-document, not per-tile)")
 
 
 def main():
