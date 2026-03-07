@@ -959,7 +959,9 @@ class ISMARetrievalV2:
         #   temporal:   R@25=0.870, R@30=0.898 → cut at 25
         #   conceptual: R@30=0.771 spread wide → NEVER cut (reranker finds deep gold)
         #   relational: R@18=0.917 = R@20=0.917 → safe to cut at 20
-        RERANK_K = {"exact": 25, "temporal": 25, "conceptual": 30, "relational": 22}
+        # With gte reranker (1012ms/25docs), exact can afford full pool.
+        # Qwen3 was 3529ms/25docs, requiring aggressive cuts. gte at 30 docs: ~1200ms.
+        RERANK_K = {"exact": 30, "temporal": 25, "conceptual": 30, "relational": 22}
         rerank_k = RERANK_K.get(query_type, 30)
         if len(search_result.tiles) > rerank_k:
             search_result = SearchResult(
