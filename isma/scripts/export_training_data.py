@@ -42,7 +42,7 @@ from collections import defaultdict
 
 PARSED_DIR = Path("/home/spark/data/transcripts/parsed")
 OUTPUT_DIR = Path("/home/spark/data/training")
-NEO4J_URI = "bolt://192.168.100.10:7689"
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://192.168.100.10:7687")
 
 PLATFORMS = ["claude_code", "claude_chat", "chatgpt", "gemini", "grok", "perplexity"]
 

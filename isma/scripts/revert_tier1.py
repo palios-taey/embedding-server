@@ -5,6 +5,7 @@ Finds all tiles with hmm_enrichment_version == "tier1_1.0.0" and clears
 the HMM properties back to defaults.
 """
 
+import os
 import json
 import logging
 import time
@@ -19,7 +20,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("revert_tier1")
 
-WEAVIATE_URL = "http://192.168.100.10:8088"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
 WEAVIATE_CLASS = "ISMA_Quantum"
 PAGE_SIZE = 100
 

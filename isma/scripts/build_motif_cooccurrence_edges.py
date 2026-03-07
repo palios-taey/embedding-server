@@ -12,6 +12,7 @@ Usage:
     python3 build_motif_cooccurrence_edges.py [--dry-run] [--reset-checkpoint]
 """
 
+import os
 import argparse
 import itertools
 import json
@@ -28,7 +29,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-NEO4J_URI = "bolt://192.168.100.10:7689"
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://192.168.100.10:7687")
 RARITY_THRESHOLD_PCT = 5.0   # motifs expressed by < 5% of tiles are "rare"
 MIN_SHARED_MOTIFS = 2        # minimum shared rare motifs to create an edge
 BATCH_SIZE = 500             # edges to create per Cypher batch

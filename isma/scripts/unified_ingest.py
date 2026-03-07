@@ -62,7 +62,9 @@ from phi_tiling import multi_scale_tile, MultiScaleTile
 EMBEDDING_URL = os.environ.get("EMBEDDING_URL", "http://192.168.100.10:8091/v1/embeddings")
 EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
 WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
-NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://10.0.0.163:7689")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://192.168.100.10:7687")
 
 DATA_BASE = Path("/home/spark/data")
 CORPUS_BASE = DATA_BASE / "corpus"
@@ -80,6 +82,7 @@ STAGES = [
     ("chewy",         DATA_BASE / "chewy",                       0.85, None),
     ("chewy-gallery", DATA_BASE / "chewy-consciousness-gallery", 0.8,  None),
     ("layer_1",       CORPUS_BASE / "layer_1",                   0.75, None),
+    ("isma_analysis", Path("/var/spark/isma"),                   0.7,  None),
     ("layer_2",       CORPUS_BASE / "layer_2",                   0.6,  None),
     ("github-repos",  DATA_BASE / "github-repos",                0.5,  None),
     ("expansion_md",  DATA_BASE / "expansion_md",                0.4,  None),
@@ -94,7 +97,7 @@ STAGES = [
 LAYER_INT = {
     "kernel": -1, "v0": 0, "layer_0": 0,
     "chewy": 0, "chewy-gallery": 0,
-    "layer_1": 1, "layer_2": 2,
+    "layer_1": 1, "isma_analysis": 1, "layer_2": 2,
     "github-repos": 2, "expansion_md": 2, "mira_md": 2,
     "mac_all_md": 2, "spark_loose": 2,
     "ccm_new_mds": 1,

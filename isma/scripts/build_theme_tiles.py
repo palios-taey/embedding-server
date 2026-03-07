@@ -15,6 +15,7 @@ Usage:
     python3 build_theme_tiles.py --theme 001  # Rebuild one theme
 """
 
+import os
 import argparse
 import hashlib
 import json
@@ -32,7 +33,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 THEME_INDEX_PATH = "/var/spark/isma/theme_search_index.json"
-WEAVIATE_URL = "http://192.168.100.10:8088"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
 WEAVIATE_CLASS = "ISMA_Quantum"
 EMBEDDING_URL = "http://192.168.100.10:8091/v1/embeddings"
 EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"

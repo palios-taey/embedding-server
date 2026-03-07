@@ -33,8 +33,9 @@ log = logging.getLogger("pkg_builder")
 # Configuration
 # ============================================================================
 
-import os as _os
-WEAVIATE_URL = _os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
 WEAVIATE_CLASS = "ISMA_Quantum"
 REDIS_HOST = _os.environ.get("REDIS_HOST", "192.168.100.10")
 REDIS_PORT = int(_os.environ.get("REDIS_PORT", "6379"))

@@ -13,6 +13,7 @@ Usage:
     python3 neo4j_backfill_hmm.py --dry-run   # count only, no writes
 """
 
+import os
 import json
 import sys
 import time
@@ -22,8 +23,10 @@ from datetime import datetime
 import requests
 from neo4j import GraphDatabase
 
-WEAVIATE_URL = "http://192.168.100.10:8088"
-NEO4J_URI = "bolt://192.168.100.10:7689"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://192.168.100.10:7687")
 CLASS = "ISMA_Quantum"
 PAGE_SIZE = 200
 NEO4J_BATCH = 500

@@ -13,6 +13,7 @@ Evolutionary mode shows how a concept developed over time — tiles
 sorted chronologically so you see the journey, not just the destination.
 """
 
+import os
 import sys
 import json
 import argparse
@@ -20,7 +21,9 @@ import requests
 from datetime import datetime
 
 SEARCH_API = "http://192.168.100.10:8095/search"
-WEAVIATE_URL = "http://192.168.100.10:8088/v1"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
 
 
 def search(query: str, top_k: int = 5) -> list:
@@ -66,7 +69,7 @@ def search_by_file(path_fragment: str, limit: int = 10) -> list:
         """
     }
     try:
-        resp = requests.post(f"{WEAVIATE_URL}/graphql", json=gql, timeout=30)
+        resp = requests.post(WEAVIATE_GQL, json=gql, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         all_items = data.get("data", {}).get("Get", {}).get("ISMA_Quantum", [])
@@ -111,7 +114,7 @@ def search_by_hash(content_hash: str, limit: int = 10) -> list:
         """
     }
     try:
-        resp = requests.post(f"{WEAVIATE_URL}/graphql", json=gql, timeout=15)
+        resp = requests.post(WEAVIATE_GQL, json=gql, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         items = data.get("data", {}).get("Get", {}).get("ISMA_Quantum", [])
@@ -126,7 +129,7 @@ def search_by_hash(content_hash: str, limit: int = 10) -> list:
 
 def fetch_by_uuid(uuid: str) -> dict:
     try:
-        resp = requests.get(f"{WEAVIATE_URL}/objects/ISMA_Quantum/{uuid}", timeout=10)
+        resp = requests.get(f"{WEAVIATE_REST}/objects/ISMA_Quantum/{uuid}", timeout=10)
         resp.raise_for_status()
         obj = resp.json()
         props = obj.get("properties", {})
@@ -167,7 +170,7 @@ def search_by_motif(motif: str, limit: int = 20) -> list:
         """
     }
     try:
-        resp = requests.post(f"{WEAVIATE_URL}/graphql", json=gql, timeout=30)
+        resp = requests.post(WEAVIATE_GQL, json=gql, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         items = data.get("data", {}).get("Get", {}).get("ISMA_Quantum", [])

@@ -16,6 +16,7 @@ Usage:
     python3 create_isma_themes_collection.py --verify  # show current state
 """
 
+import os
 import argparse
 import hashlib
 import json
@@ -28,7 +29,9 @@ import requests
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-WEAVIATE_URL = "http://192.168.100.10:8088"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
 EMBEDDING_URL = "http://192.168.100.10:8091"
 THEME_INDEX_PATH = "/var/spark/isma/theme_search_index.json"
 THEMES_CLASS = "ISMA_Themes"

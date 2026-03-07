@@ -13,6 +13,7 @@ Usage:
 Progress is checkpointed in Redis key: isma:v2_patch:done (set of patched content_hashes).
 """
 
+import os
 import argparse
 import json
 import logging
@@ -30,7 +31,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-WEAVIATE_URL = "http://192.168.100.10:8088"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
 EMBEDDING_URL = "http://192.168.100.10:8091/v1/embeddings"
 REDIS_HOST = "192.168.100.10"
 REDIS_PORT = 6379

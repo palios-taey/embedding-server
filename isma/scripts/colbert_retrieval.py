@@ -14,6 +14,7 @@ Usage (as module):
     # returns list of {"content_hash": ..., "score": ...}
 """
 
+import os
 import argparse
 import json
 import logging
@@ -28,7 +29,9 @@ from transformers import AutoModel, AutoTokenizer
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-WEAVIATE_URL = "http://192.168.100.10:8088"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
 PILOT_CLASS = "ISMA_ColBERT_Pilot"
 COLBERT_MODEL = "jinaai/jina-colbert-v2"
 COLBERT_DIM = 64

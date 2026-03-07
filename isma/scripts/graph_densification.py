@@ -42,7 +42,7 @@ from neo4j import GraphDatabase
 
 log = logging.getLogger(__name__)
 
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://192.168.100.10:7689")
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://192.168.100.10:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "")
 NEO4J_PASS = os.getenv("NEO4J_PASS", "")
 

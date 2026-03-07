@@ -22,6 +22,7 @@ Usage:
     tier1_batch_classify.py --stats          # Coverage report
 """
 
+import os
 import argparse
 import json
 import logging
@@ -46,7 +47,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("tier1")
 
-WEAVIATE_URL = "http://192.168.100.10:8088"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
 WEAVIATE_CLASS = "ISMA_Quantum"
 CHECKPOINT_PATH = "/var/spark/isma/tier1_progress.json"
 ENRICHMENT_VERSION = "tier1_1.0.0"

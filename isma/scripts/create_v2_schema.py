@@ -16,13 +16,16 @@ BM25F field weighting:
 Usage:
     python3 -m isma.scripts.create_v2_schema [--delete-existing]
 """
+import os
 
 import argparse
 import json
 import requests
 import sys
 
-WEAVIATE_URL = "http://192.168.100.10:8088"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
 CLASS_NAME = "ISMA_Quantum_v2"
 VECTOR_DIM = 4096
 

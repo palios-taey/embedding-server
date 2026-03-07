@@ -34,7 +34,9 @@ from phi_tiling import phi_tile_text, Tile
 # Configuration
 NEO4J_LEGACY_URI = "bolt://10.0.0.68:7687"
 EMBEDDING_URL = "http://10.0.0.68:8090/embed"
-WEAVIATE_URL = "http://10.0.0.68:8088"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
 BATCH_SIZE = 50  # Exchanges per batch
 
 

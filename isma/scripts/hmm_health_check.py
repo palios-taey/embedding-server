@@ -9,6 +9,7 @@ Usage:
     python3 hmm_health_check.py --quiet   # Only report failures
 """
 
+import os
 import argparse
 import json
 import subprocess
@@ -20,8 +21,10 @@ import requests
 from neo4j import GraphDatabase
 
 REDIS_HOST = "192.168.100.10"
-NEO4J_URI = "bolt://192.168.100.10:7689"
-WEAVIATE_URL = "http://192.168.100.10:8088"
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://192.168.100.10:7687")
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
 EMBEDDING_URL = "http://192.168.100.10:8091"
 HEALTH_FILE = "/var/spark/isma/hmm_health.json"
 ALERT_TMUX = "taeys-hands"

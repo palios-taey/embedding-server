@@ -52,6 +52,7 @@ CORPUS_STAGES = [
     ("chewy",         DATA_BASE / "chewy",                       0.85),
     ("chewy-gallery", DATA_BASE / "chewy-consciousness-gallery", 0.8),
     ("layer_1",       CORPUS_BASE / "layer_1",                   0.75),
+    ("isma_analysis", Path("/var/spark/isma"),                   0.7),
     ("layer_2",       CORPUS_BASE / "layer_2",                   0.6),
     ("github-repos",  DATA_BASE / "github-repos",                0.5),
     ("expansion_md",  DATA_BASE / "expansion_md",                0.4),

@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -48,11 +49,11 @@ import requests
 # Configuration
 # ---------------------------------------------------------------------------
 
-WEAVIATE_URL = "http://192.168.100.10:8088"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
 WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
 WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
-NEO4J_BOLT = "bolt://192.168.100.10:7689"
-QUERY_API = "http://192.168.100.10:8095"
+NEO4J_BOLT = os.environ.get("NEO4J_URI", "bolt://192.168.100.10:7687")
+QUERY_API = os.environ.get("ISMA_QUERY_API", "http://192.168.100.10:8095")
 EMBEDDING_URL = "http://192.168.100.10:8091/v1/embeddings"
 EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
 

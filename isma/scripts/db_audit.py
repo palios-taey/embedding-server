@@ -14,6 +14,7 @@ IMPORTANT: This is the ONLY way to get database stats.
 Never run ad-hoc queries — always use this script.
 """
 
+import os
 import json
 import sys
 import time
@@ -22,8 +23,10 @@ import requests
 from datetime import datetime, timezone
 
 # Connection constants (NCCL fabric IPs)
-WEAVIATE_URL = "http://192.168.100.10:8088"
-NEO4J_URI = "bolt://192.168.100.10:7689"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://192.168.100.10:7687")
 REDIS_HOST = "192.168.100.10"
 REDIS_PORT = 6379
 WEAVIATE_CLASS = "ISMA_Quantum"

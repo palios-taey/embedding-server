@@ -69,7 +69,9 @@ logging.getLogger("neo4j").setLevel(logging.WARNING)
 # Configuration
 # =============================================================================
 
-WEAVIATE_URL = "http://192.168.100.10:8088"
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://10.0.0.163:8088")
+WEAVIATE_GQL = f"{WEAVIATE_URL}/v1/graphql"
+WEAVIATE_REST = f"{WEAVIATE_URL}/v1"
 WEAVIATE_CLASS = "ISMA_Quantum"
 STATE_FILE = "/var/spark/isma/tier2_batch_state.json"
 RESPONSE_LOG_DIR = "/var/spark/isma/hmm_responses"
