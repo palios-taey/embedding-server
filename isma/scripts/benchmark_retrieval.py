@@ -116,6 +116,27 @@ def motif_precision_at_k(tiles: List[TileResult], expected_motifs: List[str], k:
     return hits / min(k, len(tiles))
 
 
+def gold_recall_at_k(tiles: List[TileResult], gold_hash: str, k: int) -> float:
+    """Binary hit/miss for gold_content_hash in top-k results."""
+    if not gold_hash:
+        return -1.0
+    top_k = tiles[:k]
+    for tile in top_k:
+        if tile.content_hash == gold_hash:
+            return 1.0
+    return 0.0
+
+
+def gold_mrr(tiles: List[TileResult], gold_hash: str) -> float:
+    """Mean Reciprocal Rank based on gold_content_hash."""
+    if not gold_hash:
+        return -1.0
+    for i, tile in enumerate(tiles):
+        if tile.content_hash == gold_hash:
+            return 1.0 / (i + 1)
+    return 0.0
+
+
 # =============================================================================
 # QUERY RUNNER
 # =============================================================================
@@ -126,6 +147,7 @@ def run_query(retrieval: ISMARetrieval, query_def: Dict[str, Any],
     query = query_def["query"]
     category = query_def["category"]
     expected_content = query_def.get("expected_content", [])
+    gold_hash = query_def.get("gold_content_hash")
 
     # Build filter kwargs
     filters = {}
@@ -193,7 +215,9 @@ def run_query(retrieval: ISMARetrieval, query_def: Dict[str, Any],
             "num_results": len(tiles),
             "recall_5": round(recall_at_k([], expected_content, tiles, 5), 4),
             "recall_10": round(recall_at_k([], expected_content, tiles, 10), 4),
+            "gold_recall_10": round(gold_recall_at_k(tiles, gold_hash, 10), 4) if gold_hash else -1.0,
             "mrr": round(mrr(expected_content, tiles), 4),
+            "gold_mrr": round(gold_mrr(tiles, gold_hash), 4) if gold_hash else -1.0,
             "precision_5": round(precision_at_k(expected_content, tiles, 5), 4),
             "precision_10": round(precision_at_k(expected_content, tiles, 10), 4),
             "dedup_5": round(dedup_ratio(tiles, 5), 4),
@@ -212,6 +236,7 @@ def run_query_v2(retrieval_v2, query_def: Dict[str, Any],
     query = query_def["query"]
     category = query_def["category"]
     expected_content = query_def.get("expected_content", [])
+    gold_hash = query_def.get("gold_content_hash")
 
     filters = {}
     if query_def.get("platform_hint"):
@@ -261,7 +286,9 @@ def run_query_v2(retrieval_v2, query_def: Dict[str, Any],
             "num_results": len(tiles),
             "recall_5": round(recall_at_k([], expected_content, tiles, 5), 4),
             "recall_10": round(recall_at_k([], expected_content, tiles, 10), 4),
+            "gold_recall_10": round(gold_recall_at_k(tiles, gold_hash, 10), 4) if gold_hash else -1.0,
             "mrr": round(mrr(expected_content, tiles), 4),
+            "gold_mrr": round(gold_mrr(tiles, gold_hash), 4) if gold_hash else -1.0,
             "precision_5": round(precision_at_k(expected_content, tiles, 5), 4),
             "precision_10": round(precision_at_k(expected_content, tiles, 10), 4),
             "dedup_5": round(dedup_ratio(tiles, 5), 4),
@@ -342,7 +369,7 @@ def _agg_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     latencies = sorted(r["latency_ms"] for r in results)
 
     def _mean(key):
-        vals = [r[key] for r in results if r[key] >= 0]
+        vals = [r[key] for r in results if r.get(key, -1) >= 0]
         return round(sum(vals) / len(vals), 4) if vals else -1.0
 
     def _percentile(arr, p):
@@ -355,7 +382,9 @@ def _agg_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "count": len(results),
         "recall_5_mean": _mean("recall_5"),
         "recall_10_mean": _mean("recall_10"),
+        "gold_recall_10_mean": _mean("gold_recall_10"),
         "mrr_mean": _mean("mrr"),
+        "gold_mrr_mean": _mean("gold_mrr"),
         "precision_5_mean": _mean("precision_5"),
         "precision_10_mean": _mean("precision_10"),
         "dedup_5_mean": _mean("dedup_5"),
@@ -558,7 +587,8 @@ def main():
     print(f"Results saved to: {output_path}")
     print(f"\nOverall:")
     ovr = summary["overall"]
-    print(f"  Recall@10:  {ovr.get('recall_10_mean', -1):.3f}")
+    print(f"  Recall@10 (Soft): {ovr.get('recall_10_mean', -1):.3f}")
+    print(f"  Recall@10 (Gold): {ovr.get('gold_recall_10_mean', -1):.3f}")
     print(f"  MRR:        {ovr.get('mrr_mean', -1):.3f}")
     print(f"  Precision@10: {ovr.get('precision_10_mean', -1):.3f}")
     print(f"  Dedup@10:   {ovr.get('dedup_10_mean', -1):.3f}")

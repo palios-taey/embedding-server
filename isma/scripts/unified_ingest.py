@@ -82,7 +82,7 @@ STAGES = [
     ("chewy",         DATA_BASE / "chewy",                       0.85, None),
     ("chewy-gallery", DATA_BASE / "chewy-consciousness-gallery", 0.8,  None),
     ("layer_1",       CORPUS_BASE / "layer_1",                   0.75, None),
-    ("isma_analysis", Path("/var/spark/isma"),                   0.7,  None),
+    ("isma_analysis", Path("/var/spark/isma"),                   0.7,  "*.md"),
     ("layer_2",       CORPUS_BASE / "layer_2",                   0.6,  None),
     ("github-repos",  DATA_BASE / "github-repos",                0.5,  None),
     ("expansion_md",  DATA_BASE / "expansion_md",                0.4,  None),
@@ -1021,6 +1021,12 @@ def process_corpus_stage(stage_name: str, stage_dir: Path, priority: float,
         if _SHUTDOWN or _FATAL:
             break
         if not fp.is_file():
+            continue
+        if pattern == "v0*" and not fp.name.startswith("v0"):
+            continue
+        if pattern == "!v0*" and fp.name.startswith("v0"):
+            continue
+        if pattern == "*.md" and fp.suffix.lower() != ".md":
             continue
         if limit and processed >= limit:
             break

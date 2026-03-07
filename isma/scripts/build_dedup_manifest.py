@@ -351,12 +351,15 @@ def discover_corpus_files(stage_name: str, stage_dir: Path,
         if should_skip_path(str(fp)):
             continue
 
-        # v0 filter: only v0* files
+        # Stage-specific filename filters
         if pattern_filter == "v0*":
             if not fp.name.startswith("v0"):
                 continue
         elif pattern_filter == "!v0*":
             if fp.name.startswith("v0"):
+                continue
+        elif pattern_filter == "*.md":
+            if fp.suffix.lower() != ".md":
                 continue
 
         # expansion_md special filtering
@@ -398,6 +401,8 @@ def scan_corpus() -> dict:
             pattern_filter = "v0*"
         elif stage_name == "layer_0":
             pattern_filter = "!v0*"
+        elif stage_name == "isma_analysis":
+            pattern_filter = "*.md"
 
         files = discover_corpus_files(stage_name, stage_dir, pattern_filter)
         stage_count = 0
