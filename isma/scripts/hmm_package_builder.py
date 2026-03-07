@@ -334,11 +334,19 @@ _WEAVIATE_OFFSET_KEY = f"{PFX}weaviate_sweep_offset"
 _WEAVIATE_SWEEP_PAGE = 500  # tiles per page
 
 
-def _sweep_weaviate_direct(n: int = 2000, seen_hashes: set = None) -> list:
+_TRANSCRIPT_PLATFORMS = ["claude", "claude_chat", "chatgpt", "gemini", "grok"]
+_SWEEP_OFFSET_TRANSCRIPT_KEY = f"{PFX}weaviate_sweep_offset_transcript"
+
+
+def _sweep_weaviate_direct(n: int = 2000, seen_hashes: set = None,
+                           platforms: list = None) -> list:
     """Directly paginate ISMA_Quantum for unenriched tiles not in the theme index.
 
     Used as a fallback when the theme index is exhausted. Fetches up to `n`
     unique content_hashes, skipping completed/in-progress ones.
+
+    Args:
+        platforms: If set, only sweep tiles from these platforms (e.g. transcript priority).
 
     Returns list of dicts: {content_hash, source_file, source_type, token_estimate}
     """
@@ -347,9 +355,26 @@ def _sweep_weaviate_direct(n: int = 2000, seen_hashes: set = None) -> list:
     completed = r.smembers(f"{PFX}completed")
 
     results = []
-    offset = int(r.get(_WEAVIATE_OFFSET_KEY) or 0)
+    # Use separate offset key for transcript-filtered sweeps
+    offset_key = _SWEEP_OFFSET_TRANSCRIPT_KEY if platforms else _WEAVIATE_OFFSET_KEY
+    offset = int(r.get(offset_key) or 0)
     checked = 0
     max_pages = 200  # safety cap (200 × 500 = 100K tiles checked per call)
+
+    # Build platform filter operands
+    filter_operands = [
+        '{ path: ["scale"], operator: Equal, valueText: "search_512" }',
+        '{ path: ["hmm_enriched"], operator: Equal, valueBoolean: false }',
+    ]
+    if platforms:
+        platform_or = ", ".join(
+            f'{{ path: ["platform"], operator: Equal, valueText: "{p}" }}'
+            for p in platforms
+        )
+        filter_operands.append(
+            f'{{ operator: Or, operands: [{platform_or}] }}'
+        )
+    filter_block = ", ".join(filter_operands)
 
     while len(results) < n and checked < max_pages:
         q = f"""{{
@@ -357,10 +382,7 @@ def _sweep_weaviate_direct(n: int = 2000, seen_hashes: set = None) -> list:
                 {WEAVIATE_CLASS}(
                     where: {{
                         operator: And,
-                        operands: [
-                            {{ path: ["scale"], operator: Equal, valueText: "search_512" }},
-                            {{ path: ["hmm_enriched"], operator: Equal, valueBoolean: false }}
-                        ]
+                        operands: [{filter_block}]
                     }}
                     limit: {_WEAVIATE_SWEEP_PAGE}
                     offset: {offset}
@@ -375,7 +397,7 @@ def _sweep_weaviate_direct(n: int = 2000, seen_hashes: set = None) -> list:
         if not tiles:
             # Reached end of dataset — reset offset for next round
             log.info(f"Sweep: reached end at offset {offset}, resetting to 0")
-            r.set(_WEAVIATE_OFFSET_KEY, 0)
+            r.set(offset_key, 0)
             break
 
         offset += len(tiles)
@@ -407,7 +429,7 @@ def _sweep_weaviate_direct(n: int = 2000, seen_hashes: set = None) -> list:
             break
 
     # Persist updated offset
-    r.set(_WEAVIATE_OFFSET_KEY, offset)
+    r.set(offset_key, offset)
     log.info(f"Sweep: found {len(results)} items after checking {checked} pages (offset now {offset})")
     return results
 
@@ -524,8 +546,11 @@ def build_package(platform: str) -> str:
         if not theme_data:
             # Theme index exhausted — fall back to direct Weaviate sweep
             if not used_sweep:
-                log.info("Theme index exhausted — falling back to direct Weaviate sweep")
-                sweep_items = _sweep_weaviate_direct(n=500, seen_hashes=seen_hashes)
+                log.info("Theme index exhausted — falling back to direct Weaviate sweep (transcripts first)")
+                sweep_items = _sweep_weaviate_direct(
+                    n=500, seen_hashes=seen_hashes,
+                    platforms=_TRANSCRIPT_PLATFORMS,
+                )
                 if sweep_items:
                     used_sweep = True
                     # Use a synthetic theme_data for sweep items
